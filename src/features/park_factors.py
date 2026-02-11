@@ -1,0 +1,36 @@
+# HR park factors on a 100 = neutral scale.
+# Start simple: fill what you can, default to 100.
+HR_PARK_FACTOR = {
+    "ARI": 102,
+    "ATL": 108,
+    "BAL": 110,
+    "BOS": 104,
+    "CHC": 102,
+    "CIN": 115,
+    "CLE": 96,
+    "COL": 120,
+    "CWS": 101,
+    "DET": 95,
+    "HOU": 101,
+    "KCR": 97,
+    "LAA": 98,
+    "LAD": 105,
+    "MIA": 92,
+    "MIL": 103,
+    "MIN": 99,
+    "NYM": 99,
+    "NYY": 112,
+    "OAK": 88,
+    "PHI": 110,
+    "PIT": 95,
+    "SDP": 94,
+    "SEA": 90,
+    "SFG": 92,
+    "STL": 98,
+    "TBR": 97,
+    "TEX": 107,
+    "TOR": 102,
+    "WSN": 96,
+}
+
+DEFAULT_PARK_FACTOR = 100

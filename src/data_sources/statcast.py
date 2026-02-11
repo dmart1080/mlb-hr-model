@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from pybaseball import statcast
+from pybaseball.statcast import statcast
+
 
 
 # Project root is the folder that contains /src
