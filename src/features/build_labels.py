@@ -35,7 +35,10 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
 
     # A plate appearance is roughly each row here; some rows may not be true PAs,
     # but for MVP it's fine as a count proxy.
-    df["is_hr"] = (df["events"] == "home_run").astype(int)
+    df["is_hr"] = (df["events"] == "home_run").fillna(False).astype("int8")
+    df = df.copy()
+    df["events"] = df["events"].astype("string")
+
 
     # Find the most common pitcher faced per batter-game (mode)
     pitcher_mode = (

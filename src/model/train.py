@@ -5,6 +5,7 @@ from pathlib import Path
 import glob
 import joblib
 import pandas as pd
+import numpy as np
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
@@ -50,17 +51,49 @@ def train_baseline(train_path: Path) -> TrainResult:
 
     # MVP features you already built in build_features.py
     feature_cols = [
+        # Batter (14d)
         "b_pa_14",
         "b_hr_rate_14",
         "b_barrel_rate_14",
+        "b_ev_mean_14",
+        "b_la_mean_14",
+        "b_hardhit_rate_14",
+        "b_fb_rate_14",
+
+        # Batter (season)
         "b_pa_szn",
         "b_hr_rate_szn",
+        "b_barrel_rate_szn",
+        "b_ev_mean_szn",
+        "b_la_mean_szn",
+        "b_hardhit_rate_szn",
+        "b_fb_rate_szn",
+
+        # Pitcher allowed (30d)
         "p_pa_30",
         "p_hr_allowed_rate_30",
+        "p_ev_allowed_mean_30",
+        "p_hardhit_allowed_rate_30",
+        "p_fb_allowed_rate_30",
+        "p_barrel_allowed_rate_30",
+
+        # Pitcher allowed (season)
         "p_pa_szn",
         "p_hr_allowed_rate_szn",
+        "p_ev_allowed_mean_szn",
+        "p_hardhit_allowed_rate_szn",
+        "p_fb_allowed_rate_szn",
+        "p_barrel_allowed_rate_szn",
+
+        "ev_edge_14_30",
+        "hardhit_edge_14_30",
+        "fb_edge_14_30",
+        "barrel_edge_14_30",
+        "hr_rate_edge_14_30",
+        # Context
         "park_factor_hr",
     ]
+
 
     missing = [c for c in (feature_cols + ["hr_hit", "game_date"]) if c not in df.columns]
     if missing:
@@ -80,11 +113,11 @@ def train_baseline(train_path: Path) -> TrainResult:
     X_test = test_df[feature_cols].fillna(0.0)
     y_test = test_df["hr_hit"].astype(int)
 
-    # Scale features + balanced logistic regression
+    # Logistic regression (needs scaling) + class balancing
     base_pipeline = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("lr", LogisticRegression(max_iter=2000, class_weight="balanced")),
+            ("lr", LogisticRegression(max_iter=3000, class_weight="balanced")),
         ]
     )
 
@@ -98,7 +131,22 @@ def train_baseline(train_path: Path) -> TrainResult:
         cv=None,
     )
     calibrated_model.fit(X_calib, y_calib)
+
     p_test = calibrated_model.predict_proba(X_test)[:, 1]
+
+    threshold = np.quantile(p_test, 0.90)
+    top_mask = p_test >= threshold
+
+
+    top_hr_rate = y_test[top_mask].mean()
+    print("Baseline HR rate:", float(y_test.mean()))
+    print("Top 10% HR rate:", float(top_hr_rate))
+    print("Max predicted prob:", float(p_test.max()))
+    print("Top 1% HR rate:", float(y_test[p_test >= np.quantile(p_test, 0.99)].mean()))
+    top1_mask = p_test >= np.quantile(p_test, 0.99)
+    print("Top 1% count:", int(top1_mask.sum()))
+    print("Top 1% avg b_pa_14:", float(X_test.loc[top1_mask, "b_pa_14"].mean()))
+    print("Top 1% avg p_pa_30:", float(X_test.loc[top1_mask, "p_pa_30"].mean()))
 
     # Save calibrated model
     model = calibrated_model
@@ -114,7 +162,7 @@ def train_baseline(train_path: Path) -> TrainResult:
     }
 
     bundle = {"model": model, "feature_cols": feature_cols}
-    model_path = MODELS_DIR / "hr_model_logreg_baseline.joblib"
+    model_path = MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib"
     joblib.dump(bundle, model_path)
 
     return TrainResult(model_path=model_path, metrics=metrics, feature_cols=feature_cols)

@@ -21,7 +21,7 @@ def latest_train_table() -> Path:
 
 
 def load_model():
-    model_path = MODELS_DIR / "hr_model_logreg_baseline.joblib"
+    model_path = MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib"
     bundle = joblib.load(model_path)
     return bundle["model"], bundle["feature_cols"]
 

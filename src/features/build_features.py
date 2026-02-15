@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
+import numpy as np
+
+def _safe_mean(s: pd.Series) -> float:
+    v = pd.to_numeric(s, errors="coerce").astype("float64")
+    m = v.mean()
+    return 0.0 if pd.isna(m) else float(m)
+
+def _safe_rate_bool(mask) -> float:
+    if not isinstance(mask, pd.Series):
+        return 0.0 if pd.isna(mask) else float(mask)
+
+    v = mask.astype("boolean")
+    m = v.mean(skipna=True)
+    return 0.0 if pd.isna(m) else float(m)
+
 
 from src.data_sources.statcast import fetch_statcast_events
 from src.features.build_labels import build_batter_game_labels
@@ -39,23 +54,48 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         columns=[
             "game_date",
             "game_pk",
+            "at_bat_number",
             "batter",
             "pitcher",
             "events",
             "home_team",
-            "barrel",
             "launch_speed",
             "launch_angle",
         ],
     ).df.copy()
 
-    events["game_date"] = pd.to_datetime(events["game_date"])
-    events["is_hr"] = (events["events"] == "home_run").fillna(False).astype("int8")
+
+    # Force numpy-backed dtypes to avoid slow pyarrow boolean indexing
+    events = events.convert_dtypes(dtype_backend="numpy_nullable")
 
     events["game_date"] = pd.to_datetime(events["game_date"])
     events["is_hr"] = (events["events"] == "home_run").fillna(False).astype("int8")
 
-    # Manual barrel approximation using EV + LA (safe with missing values)
+    # -------------------------------
+    # COLLAPSE TO PLATE-APPEARANCE LEVEL  (ADD THIS)
+    # -------------------------------
+    # Statcast often comes pitch-level. We want 1 row per PA for correct "PA" counts.
+    events = (
+        events
+        .sort_values(["game_pk", "batter", "game_date"])
+        .groupby(["game_pk", "at_bat_number"], as_index=False)
+        .agg({
+            "game_date": "first",
+            "batter": "last",
+            "pitcher": "last",
+            "home_team": "first",
+            "events": "last",
+            "is_hr": "max",
+            "launch_speed": "max",
+            "launch_angle": "max",
+        })
+    )
+
+    events = events.sort_values("game_date").reset_index(drop=True)
+    events["game_date"] = pd.to_datetime(events["game_date"]).astype("datetime64[ns]")
+    events = events.dropna(subset=["game_date"])
+
+    # Manual barrel approximation using EV + LA (safe with missing values) AFTER collapse
     if ("launch_speed" in events.columns) and ("launch_angle" in events.columns):
         ev = pd.to_numeric(events["launch_speed"], errors="coerce")
         la = pd.to_numeric(events["launch_angle"], errors="coerce")
@@ -64,6 +104,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         events["is_barrel"] = is_barrel_bool.fillna(False).astype("int8")
     else:
         events["is_barrel"] = 0
+
+    # Pre-split by batter/pitcher to avoid scanning full events table every loop
+    events_by_batter = {k: g for k, g in events.groupby("batter", sort=False)}
+    events_by_pitcher = {k: g for k, g in events.groupby("pitcher", sort=False)}
 
 
     # Fast lookup: game_pk → home_team
@@ -101,11 +145,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         # ---------------- Batter 14-day ----------------
         b_14_start = as_of - pd.Timedelta(days=14)
 
-        batter_14 = events[
-            (events["batter"] == batter_id)
-            & (events["game_date"] > b_14_start)
-            & (events["game_date"] <= as_of)
-        ]
+        batter_all = events_by_batter.get(batter_id)
+        if batter_all is None:
+            batter_14 = events.iloc[0:0]
+        else:
+            batter_14 = batter_all[batter_all["game_date"].between(b_14_start + pd.Timedelta(days=1), as_of)]
+
 
         b_pa_14 = len(batter_14)
         b_hr_14 = int(batter_14["is_hr"].sum())
@@ -113,45 +158,104 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         
         b_barrels_14 = int(batter_14["is_barrel"].sum())
         b_barrel_rate_14 = (b_barrels_14 / b_pa_14) if b_pa_14 > 0 else 0.0
+        
+        # ---------- Batter contact-quality (14d) ----------
+        b_ev_14 = pd.to_numeric(batter_14["launch_speed"], errors="coerce")
+        b_la_14 = pd.to_numeric(batter_14["launch_angle"], errors="coerce")
+
+        b_ev_mean_14 = _safe_mean(batter_14["launch_speed"]) if b_pa_14 > 0 else 0.0
+        b_la_mean_14 = _safe_mean(batter_14["launch_angle"]) if b_pa_14 > 0 else 0.0
+
+        b_hardhit_rate_14 = _safe_rate_bool(b_ev_14 >= 95) if b_pa_14 > 0 else 0.0
+        b_fb_rate_14 = _safe_rate_bool((b_la_14 >= 20) & (b_la_14 <= 40)) if b_pa_14 > 0 else 0.0
 
         # ---------------- Batter Season ----------------
-        batter_szn = events[
-            (events["batter"] == batter_id)
-            & (events["game_date"] >= pd.Timestamp(as_of.year, 3, 1))
-            & (events["game_date"] <= as_of)
-        ]
+        if batter_all is None:
+            batter_szn = events.iloc[0:0]
+        else:
+            season_start = pd.Timestamp(as_of.year, 3, 1)
+            batter_szn = batter_all[batter_all["game_date"].between(season_start, as_of)]
+
+
 
         b_pa_szn = len(batter_szn)
         b_hr_szn = int(batter_szn["is_hr"].sum())
         b_hr_rate_szn = (b_hr_szn / b_pa_szn) if b_pa_szn > 0 else 0.0
+        
+        # ---------- Batter contact-quality (season) ----------
+        b_ev_szn = pd.to_numeric(batter_szn["launch_speed"], errors="coerce")
+        b_la_szn = pd.to_numeric(batter_szn["launch_angle"], errors="coerce")
+
+        b_ev_mean_szn = _safe_mean(batter_szn["launch_speed"]) if b_pa_szn > 0 else 0.0
+        b_la_mean_szn = _safe_mean(batter_szn["launch_angle"]) if b_pa_szn > 0 else 0.0
+
+        b_hardhit_rate_szn = _safe_rate_bool((b_ev_szn >= 95).mean()) if b_pa_szn > 0 else 0.0
+        b_fb_rate_szn = _safe_rate_bool((b_la_szn >= 20) & (b_la_szn <= 40)) if b_pa_szn > 0 else 0.0
+
+        b_barrels_szn = int(batter_szn["is_barrel"].sum())
+        b_barrel_rate_szn = (b_barrels_szn / b_pa_szn) if b_pa_szn > 0 else 0.0
+
 
         # ---------------- Pitcher 30-day ----------------
         p_30_start = as_of - pd.Timedelta(days=30)
+        pitcher_id = int(row.pitcher_mode) if pd.notna(row.pitcher_mode) else None
 
-        pitcher_30 = events[
-            (events["pitcher"] == pitcher_id)
-            & (events["game_date"] > p_30_start)
-            & (events["game_date"] <= as_of)
-        ]
+        pitcher_all = events_by_pitcher.get(pitcher_id) if pitcher_id is not None else None
+        if pitcher_all is None:
+            pitcher_30 = events.iloc[0:0]
+        else:
+            pitcher_30 = pitcher_all[pitcher_all["game_date"].between(p_30_start + pd.Timedelta(days=1), as_of)]
+
 
         p_pa_30 = len(pitcher_30)
         p_hr_allowed_30 = int(pitcher_30["is_hr"].sum())
         p_hr_allowed_rate_30 = (
             p_hr_allowed_30 / p_pa_30
         ) if p_pa_30 > 0 else 0.0
+       
+        # ---------- Pitcher contact-quality allowed (30d) ----------
+        p_ev_30 = pd.to_numeric(pitcher_30["launch_speed"], errors="coerce")
+        p_la_30 = pd.to_numeric(pitcher_30["launch_angle"], errors="coerce")
+
+        p_ev_allowed_mean_30 = _safe_mean(pitcher_30["launch_speed"]) if p_pa_30 > 0 else 0.0
+        p_hardhit_allowed_rate_30 = _safe_rate_bool(p_ev_30 >= 95) if p_pa_30 > 0 else 0.0
+        p_fb_allowed_rate_30 = _safe_rate_bool((p_la_30 >= 20) & (p_la_30 <= 40)) if p_pa_30 > 0 else 0.0
+
+        p_barrels_allowed_30 = int(pitcher_30["is_barrel"].sum())
+        p_barrel_allowed_rate_30 = (p_barrels_allowed_30 / p_pa_30) if p_pa_30 > 0 else 0.0
+
 
         # ---------------- Pitcher Season ----------------
-        pitcher_szn = events[
-            (events["pitcher"] == pitcher_id)
-            & (events["game_date"] >= pd.Timestamp(as_of.year, 3, 1))
-            & (events["game_date"] <= as_of)
-        ]
+        if pitcher_all is None:
+            pitcher_szn = events.iloc[0:0]
+        else:
+            season_start = pd.Timestamp(as_of.year, 3, 1)
+            pitcher_szn = pitcher_all[pitcher_all["game_date"].between(season_start, as_of)]
+
 
         p_pa_szn = len(pitcher_szn)
         p_hr_allowed_szn = int(pitcher_szn["is_hr"].sum())
         p_hr_allowed_rate_szn = (
             p_hr_allowed_szn / p_pa_szn
         ) if p_pa_szn > 0 else 0.0
+
+        # ---------- Pitcher contact-quality allowed (season) ----------
+        p_ev_szn = pd.to_numeric(pitcher_szn["launch_speed"], errors="coerce")
+        p_la_szn = pd.to_numeric(pitcher_szn["launch_angle"], errors="coerce")
+
+        p_ev_allowed_mean_szn = _safe_mean(pitcher_szn["launch_speed"]) if p_pa_szn > 0 else 0.0
+        p_hardhit_allowed_rate_szn = _safe_rate_bool(p_ev_szn >= 95) if p_pa_szn > 0 else 0.0
+        p_fb_allowed_rate_szn = _safe_rate_bool((p_la_szn >= 20) & (p_la_szn <= 40)) if p_pa_szn > 0 else 0.0
+
+        p_barrels_allowed_szn = int(pitcher_szn["is_barrel"].sum())
+        p_barrel_allowed_rate_szn = (p_barrels_allowed_szn / p_pa_szn) if p_pa_szn > 0 else 0.0
+
+        # Interaction / "edge" features (batter minus pitcher allowed)
+        ev_edge_14_30 = b_ev_mean_14 - p_ev_allowed_mean_30
+        hardhit_edge_14_30 = b_hardhit_rate_14 - p_hardhit_allowed_rate_30
+        fb_edge_14_30 = b_fb_rate_14 - p_fb_allowed_rate_30
+        barrel_edge_14_30 = b_barrel_rate_14 - p_barrel_allowed_rate_30
+        hr_rate_edge_14_30 = b_hr_rate_14 - p_hr_allowed_rate_30
 
         feature_rows.append(
             {
@@ -180,6 +284,33 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                 "p_hr_allowed_rate_szn": p_hr_allowed_rate_szn,
                 "b_barrel_rate_14": b_barrel_rate_14,
 
+                "b_ev_mean_14": b_ev_mean_14,
+                "b_la_mean_14": b_la_mean_14,
+                "b_hardhit_rate_14": b_hardhit_rate_14,
+                "b_fb_rate_14": b_fb_rate_14,
+
+                "b_ev_mean_szn": b_ev_mean_szn,
+                "b_la_mean_szn": b_la_mean_szn,
+                "b_hardhit_rate_szn": b_hardhit_rate_szn,
+                "b_fb_rate_szn": b_fb_rate_szn,
+                "b_barrel_rate_szn": b_barrel_rate_szn,
+
+                "p_ev_allowed_mean_30": p_ev_allowed_mean_30,
+                "p_hardhit_allowed_rate_30": p_hardhit_allowed_rate_30,
+                "p_fb_allowed_rate_30": p_fb_allowed_rate_30,
+                "p_barrel_allowed_rate_30": p_barrel_allowed_rate_30,
+
+                "p_ev_allowed_mean_szn": p_ev_allowed_mean_szn,
+                "p_hardhit_allowed_rate_szn": p_hardhit_allowed_rate_szn,
+                "p_fb_allowed_rate_szn": p_fb_allowed_rate_szn,
+                "p_barrel_allowed_rate_szn": p_barrel_allowed_rate_szn,
+
+                "ev_edge_14_30": ev_edge_14_30,    
+                "hardhit_edge_14_30": hardhit_edge_14_30,
+                "fb_edge_14_30": fb_edge_14_30,
+                "barrel_edge_14_30": barrel_edge_14_30,
+                "hr_rate_edge_14_30": hr_rate_edge_14_30,
+
             }
         )
 
@@ -195,8 +326,11 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
 
 if __name__ == "__main__":
-    result = build_features_for_range("2024-06-01", "2024-06-30")
-    print(f"Saved features to: {result.output_path}")
+    result = build_features_for_range("2024-03-20", "2024-10-01")
+    full_path = PROCESSED_DIR / "train_table_2024_full_season.parquet"
+    result.features_df.to_parquet(full_path, index=False)
+
+    print(f"Saved features to: {full_path}")
     print(f"Rows: {len(result.features_df):,}")
-    print(result.features_df.head(10))
+    print(result.features_df.head(5))
     print("\nLabel HR rate:", result.features_df["hr_hit"].mean())
