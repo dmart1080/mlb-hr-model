@@ -43,11 +43,28 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
             "pitcher",
             "events",
             "home_team",
+            "barrel",
+            "launch_speed",
+            "launch_angle",
         ],
     ).df.copy()
 
     events["game_date"] = pd.to_datetime(events["game_date"])
-    events["is_hr"] = (events["events"] == "home_run").astype(int)
+    events["is_hr"] = (events["events"] == "home_run").fillna(False).astype("int8")
+
+    events["game_date"] = pd.to_datetime(events["game_date"])
+    events["is_hr"] = (events["events"] == "home_run").fillna(False).astype("int8")
+
+    # Manual barrel approximation using EV + LA (safe with missing values)
+    if ("launch_speed" in events.columns) and ("launch_angle" in events.columns):
+        ev = pd.to_numeric(events["launch_speed"], errors="coerce")
+        la = pd.to_numeric(events["launch_angle"], errors="coerce")
+
+        is_barrel_bool = (ev >= 95) & (la.between(20, 35))
+        events["is_barrel"] = is_barrel_bool.fillna(False).astype("int8")
+    else:
+        events["is_barrel"] = 0
+
 
     # Fast lookup: game_pk → home_team
     game_pk_to_home = (
@@ -93,6 +110,9 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         b_pa_14 = len(batter_14)
         b_hr_14 = int(batter_14["is_hr"].sum())
         b_hr_rate_14 = (b_hr_14 / b_pa_14) if b_pa_14 > 0 else 0.0
+        
+        b_barrels_14 = int(batter_14["is_barrel"].sum())
+        b_barrel_rate_14 = (b_barrels_14 / b_pa_14) if b_pa_14 > 0 else 0.0
 
         # ---------------- Batter Season ----------------
         batter_szn = events[
@@ -158,6 +178,8 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                 "p_pa_szn": p_pa_szn,
                 "p_hr_allowed_szn": p_hr_allowed_szn,
                 "p_hr_allowed_rate_szn": p_hr_allowed_rate_szn,
+                "b_barrel_rate_14": b_barrel_rate_14,
+
             }
         )
 

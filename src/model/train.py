@@ -8,6 +8,10 @@ import pandas as pd
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.frozen import FrozenEstimator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -48,6 +52,7 @@ def train_baseline(train_path: Path) -> TrainResult:
     feature_cols = [
         "b_pa_14",
         "b_hr_rate_14",
+        "b_barrel_rate_14",
         "b_pa_szn",
         "b_hr_rate_szn",
         "p_pa_30",
@@ -63,16 +68,41 @@ def train_baseline(train_path: Path) -> TrainResult:
 
     train_df, test_df = time_split(df, test_size=0.2)
 
-    X_train = train_df[feature_cols].fillna(0.0)
-    y_train = train_df["hr_hit"].astype(int)
+    # Split train into core + calibration (time-aware)
+    train_core_df, calib_df = time_split(train_df, test_size=0.2)
+
+    X_train_core = train_core_df[feature_cols].fillna(0.0)
+    y_train_core = train_core_df["hr_hit"].astype(int)
+
+    X_calib = calib_df[feature_cols].fillna(0.0)
+    y_calib = calib_df["hr_hit"].astype(int)
 
     X_test = test_df[feature_cols].fillna(0.0)
     y_test = test_df["hr_hit"].astype(int)
 
-    model = LogisticRegression(max_iter=400, class_weight="balanced")
-    model.fit(X_train, y_train)
+    # Scale features + balanced logistic regression
+    base_pipeline = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ]
+    )
 
-    p_test = model.predict_proba(X_test)[:, 1]
+    # Fit on early training period
+    base_pipeline.fit(X_train_core, y_train_core)
+
+    # Calibrate using later training period (sigmoid = Platt scaling)
+    calibrated_model = CalibratedClassifierCV(
+        estimator=FrozenEstimator(base_pipeline),
+        method="sigmoid",
+        cv=None,
+    )
+    calibrated_model.fit(X_calib, y_calib)
+    p_test = calibrated_model.predict_proba(X_test)[:, 1]
+
+    # Save calibrated model
+    model = calibrated_model
+
 
     metrics = {
         "train_rows": int(len(train_df)),
