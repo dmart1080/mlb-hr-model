@@ -7,6 +7,7 @@ import joblib
 import pandas as pd
 import numpy as np
 
+from sklearn import metrics
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.calibration import CalibratedClassifierCV
@@ -19,12 +20,57 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+def pct(x: float, decimals: int = 2) -> str:
+    return f"{x*100:.{decimals}f}%"
+
+def f3(x: float) -> str:
+    return f"{x:.3f}"
+
+def f2(x: float) -> str:
+    return f"{x:.2f}"
+
+def fmt_int(x: int) -> str:
+    return f"{x:,}"
+
+def print_summary(train_path: Path, model_path: Path, feature_cols: list[str], metrics: dict, extra: dict):
+    print("\n" + "=" * 30)
+    print("MLB HR MODEL — TRAIN SUMMARY")
+    print("=" * 30)
+    print(f"Training table: {train_path.name}\n")
+    
+    print(f"Date range: train={metrics['train_start']}→{metrics['train_end']}  test={metrics['test_start']}→{metrics['test_end']}\n")
+    print(f"Rows: train={fmt_int(metrics['train_rows'])}  test={fmt_int(metrics['test_rows'])}")
+    print(f"Test HR rate (baseline): {pct(metrics['test_hr_rate'])}\n")
+
+    print("Performance (test):")
+    print(f"  ROC-AUC:   {f3(metrics['roc_auc'])}")
+    print(f"  Log loss:  {f3(metrics['log_loss'])}")
+    print(f"  Avg pred:  {pct(metrics['avg_pred_prob'])}")
+    print(f"  Max pred:  {f3(extra['max_pred_prob'])}\n")
+
+    print("Lift checks (test):")
+    print(f"  Top 10% HR rate: {pct(extra['top10_hr_rate'])}  ({extra['top10_lift']:.2f}x baseline)")
+    print(
+        f"  Top 1%  HR rate: {pct(extra['top1_hr_rate'])}  ({extra['top1_lift']:.2f}x baseline)"
+        f"  (n={fmt_int(extra['top1_count'])})"
+    )
+    print(f"  Top 1%  avg b_pa_14: {f2(extra['top1_avg_b_pa_14'])}")
+    print(f"  Top 1%  avg p_pa_30: {f2(extra['top1_avg_p_pa_30'])}\n")
+
+    print(f"Calibration delta: {extra['avg_minus_base_pp']:+.2f} pp")
+
+    print(f"\nFeatures: {len(feature_cols)}")
+    print(f"Model saved: {model_path}")
+
+    print("=" * 30 + "\n")
+
 
 @dataclass(frozen=True)
 class TrainResult:
     model_path: Path
     metrics: dict
     feature_cols: list[str]
+    extra: dict
 
 
 def latest_train_table() -> Path:
@@ -100,6 +146,11 @@ def train_baseline(train_path: Path) -> TrainResult:
         raise ValueError(f"Missing columns in training table: {missing}")
 
     train_df, test_df = time_split(df, test_size=0.2)
+    
+    train_start = str(train_df["game_date"].min().date())
+    train_end   = str(train_df["game_date"].max().date())
+    test_start  = str(test_df["game_date"].min().date())
+    test_end    = str(test_df["game_date"].max().date())
 
     # Split train into core + calibration (time-aware)
     train_core_df, calib_df = time_split(train_df, test_size=0.2)
@@ -134,48 +185,51 @@ def train_baseline(train_path: Path) -> TrainResult:
 
     p_test = calibrated_model.predict_proba(X_test)[:, 1]
 
-    threshold = np.quantile(p_test, 0.90)
-    top_mask = p_test >= threshold
+    # top bucket stats
+    q90 = np.quantile(p_test, 0.90)
+    top10_mask = p_test >= q90
+    top10_hr_rate = float(y_test[top10_mask].mean())
 
+    q99 = np.quantile(p_test, 0.99)
+    top1_mask = p_test >= q99
+    top1_hr_rate = float(y_test[top1_mask].mean())
+    
+    baseline = float(y_test.mean())
+    avg_pred = float(p_test.mean())
 
-    top_hr_rate = y_test[top_mask].mean()
-    print("Baseline HR rate:", float(y_test.mean()))
-    print("Top 10% HR rate:", float(top_hr_rate))
-    print("Max predicted prob:", float(p_test.max()))
-    print("Top 1% HR rate:", float(y_test[p_test >= np.quantile(p_test, 0.99)].mean()))
-    top1_mask = p_test >= np.quantile(p_test, 0.99)
-    print("Top 1% count:", int(top1_mask.sum()))
-    print("Top 1% avg b_pa_14:", float(X_test.loc[top1_mask, "b_pa_14"].mean()))
-    print("Top 1% avg p_pa_30:", float(X_test.loc[top1_mask, "p_pa_30"].mean()))
-
-    # Save calibrated model
-    model = calibrated_model
-
+    extra = {
+        "top10_hr_rate": top10_hr_rate,
+        "top1_hr_rate": top1_hr_rate,
+        "top1_count": int(top1_mask.sum()),
+        "top1_avg_b_pa_14": float(X_test.loc[top1_mask, "b_pa_14"].mean()),
+        "top1_avg_p_pa_30": float(X_test.loc[top1_mask, "p_pa_30"].mean()),
+        "max_pred_prob": float(p_test.max()),
+        # useful add-ons
+        "top10_lift": (top10_hr_rate / baseline) if baseline > 0 else float("nan"),
+        "top1_lift": (top1_hr_rate / baseline) if baseline > 0 else float("nan"),
+        "avg_minus_base_pp": (avg_pred - baseline) * 100.0,
+    }
 
     metrics = {
         "train_rows": int(len(train_df)),
         "test_rows": int(len(test_df)),
+        "train_start": train_start,
+        "train_end": train_end,
+        "test_start": test_start,
+        "test_end": test_end,
         "test_hr_rate": float(y_test.mean()),
         "avg_pred_prob": float(p_test.mean()),
         "log_loss": float(log_loss(y_test, p_test, labels=[0, 1])),
         "roc_auc": float(roc_auc_score(y_test, p_test)),
     }
 
-    bundle = {"model": model, "feature_cols": feature_cols}
+
     model_path = MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib"
-    joblib.dump(bundle, model_path)
+    joblib.dump({"model": calibrated_model, "feature_cols": feature_cols}, model_path)
 
-    return TrainResult(model_path=model_path, metrics=metrics, feature_cols=feature_cols)
-
+    return TrainResult(model_path=model_path, metrics=metrics, feature_cols=feature_cols, extra=extra)
 
 if __name__ == "__main__":
     train_path = latest_train_table()
-    print(f"Using training table: {train_path.name}")
-
     result = train_baseline(train_path)
-
-    print(f"Saved model: {result.model_path}")
-    print("Features:", result.feature_cols)
-    print("Metrics:")
-    for k, v in result.metrics.items():
-        print(f"  {k}: {v}")
+    print_summary(train_path, result.model_path, result.feature_cols, result.metrics, result.extra)
