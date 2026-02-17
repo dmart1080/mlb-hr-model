@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import glob
+from xml.parsers.expat import model
 import joblib
 import pandas as pd
 import numpy as np
@@ -14,6 +15,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.frozen import FrozenEstimator
+from lightgbm import LGBMClassifier
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -32,14 +34,24 @@ def f2(x: float) -> str:
 def fmt_int(x: int) -> str:
     return f"{x:,}"
 
+from datetime import datetime
+import csv
+
 def print_summary(train_path: Path, model_path: Path, feature_cols: list[str], metrics: dict, extra: dict):
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    model_name = model_path.name
+
     print("\n" + "=" * 30)
     print("MLB HR MODEL — TRAIN SUMMARY")
     print("=" * 30)
+    print(f"Run time: {run_time}")
     print(f"Training table: {train_path.name}\n")
-    
-    print(f"Date range: train={metrics['train_start']}→{metrics['train_end']}  test={metrics['test_start']}→{metrics['test_end']}\n")
-    print(f"Rows: train={fmt_int(metrics['train_rows'])}  test={fmt_int(metrics['test_rows'])}")
+
+    print(f"Date range: train={metrics['train_start']}→{metrics['train_end']}  "
+          f"test={metrics['test_start']}→{metrics['test_end']}\n")
+
+    print(f"Rows: train={fmt_int(metrics['train_rows'])}  "
+          f"test={fmt_int(metrics['test_rows'])}")
     print(f"Test HR rate (baseline): {pct(metrics['test_hr_rate'])}\n")
 
     print("Performance (test):")
@@ -49,21 +61,55 @@ def print_summary(train_path: Path, model_path: Path, feature_cols: list[str], m
     print(f"  Max pred:  {f3(extra['max_pred_prob'])}\n")
 
     print("Lift checks (test):")
-    print(f"  Top 10% HR rate: {pct(extra['top10_hr_rate'])}  ({extra['top10_lift']:.2f}x baseline)")
-    print(
-        f"  Top 1%  HR rate: {pct(extra['top1_hr_rate'])}  ({extra['top1_lift']:.2f}x baseline)"
-        f"  (n={fmt_int(extra['top1_count'])})"
-    )
+    print(f"  Top 10% HR rate: {pct(extra['top10_hr_rate'])}  "
+          f"({extra['top10_lift']:.2f}x baseline)")
+    print(f"  Top 1%  HR rate: {pct(extra['top1_hr_rate'])}  "
+          f"({extra['top1_lift']:.2f}x baseline)  "
+          f"(n={fmt_int(extra['top1_count'])})")
     print(f"  Top 1%  avg b_pa_14: {f2(extra['top1_avg_b_pa_14'])}")
     print(f"  Top 1%  avg p_pa_30: {f2(extra['top1_avg_p_pa_30'])}\n")
 
     print(f"Calibration delta: {extra['avg_minus_base_pp']:+.2f} pp")
 
     print(f"\nFeatures: {len(feature_cols)}")
-    print(f"Model saved: {model_path}")
-
+    print(f"Model saved: {model_name}")
     print("=" * 30 + "\n")
 
+    # -----------------------
+    # CSV Run Logging
+    # -----------------------
+    log_file = MODELS_DIR / "train_runs.csv"
+    write_header = not log_file.exists()
+
+    with open(log_file, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        if write_header:
+            writer.writerow([
+                "run_time",
+                "train_table",
+                "roc_auc",
+                "log_loss",
+                "baseline_hr_rate",
+                "top10_hr_rate",
+                "top1_hr_rate",
+                "top10_lift",
+                "top1_lift",
+                "features",
+            ])
+
+        writer.writerow([
+            run_time,
+            train_path.name,
+            metrics["roc_auc"],
+            metrics["log_loss"],
+            metrics["test_hr_rate"],
+            extra["top10_hr_rate"],
+            extra["top1_hr_rate"],
+            extra["top10_lift"],
+            extra["top1_lift"],
+            len(feature_cols),
+        ])
 
 @dataclass(frozen=True)
 class TrainResult:
@@ -136,10 +182,20 @@ def train_baseline(train_path: Path) -> TrainResult:
         "fb_edge_14_30",
         "barrel_edge_14_30",
         "hr_rate_edge_14_30",
+        "b_k_rate_14",
+        "b_bb_rate_14",
+        "p_k_rate_30",
+        "p_bb_rate_30",
+        "k_rate_edge_14_30",
+        "bb_rate_edge_14_30",
+        "k_rate_interaction_14_30",
+        "bb_rate_interaction_14_30",
+        "contact_pressure_14_30",
+        "discipline_balance_14_30",
+
         # Context
         "park_factor_hr",
     ]
-
 
     missing = [c for c in (feature_cols + ["hr_hit", "game_date"]) if c not in df.columns]
     if missing:
@@ -172,18 +228,67 @@ def train_baseline(train_path: Path) -> TrainResult:
         ]
     )
 
-    # Fit on early training period
+    # -----------------------------
+    # Logistic Regression (raw)
+    # -----------------------------
     base_pipeline.fit(X_train_core, y_train_core)
+    p_test_lr_raw = base_pipeline.predict_proba(X_test)[:, 1]
 
-    # Calibrate using later training period (sigmoid = Platt scaling)
-    calibrated_model = CalibratedClassifierCV(
+
+    roc_lr_raw = float(roc_auc_score(y_test, p_test_lr_raw))
+    print(f"LogReg (raw) ROC-AUC: {roc_lr_raw:.3f}")
+
+    # -----------------------------
+    # LightGBM (raw)
+    # -----------------------------
+    lgbm = LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.05,
+        num_leaves=15,
+        min_child_samples=200,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_lambda=5.0,
+        random_state=42,
+        verbosity=-1,
+    )
+
+
+    lgbm.fit(X_train_core, y_train_core)
+    p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]    
+    roc_lgbm_raw = float(roc_auc_score(y_test, p_test_lgbm_raw))
+    print(f"LightGBM (raw) ROC-AUC: {roc_lgbm_raw:.3f}")
+
+    # -----------------------------
+    # Calibrate both models
+    # -----------------------------
+    calibrated_lr = CalibratedClassifierCV(
         estimator=FrozenEstimator(base_pipeline),
         method="sigmoid",
         cv=None,
     )
-    calibrated_model.fit(X_calib, y_calib)
+    calibrated_lr.fit(X_calib, y_calib)
 
-    p_test = calibrated_model.predict_proba(X_test)[:, 1]
+    calibrated_lgbm = CalibratedClassifierCV(
+        estimator=FrozenEstimator(lgbm),
+        method="isotonic",
+        cv=None,
+    )
+    calibrated_lgbm.fit(X_calib, y_calib)
+
+    # -----------------------------
+    # Choose best model by RAW ROC
+    # -----------------------------
+    if roc_lgbm_raw > roc_lr_raw:
+        print("Chosen model: LightGBM")
+        model = calibrated_lgbm
+        p_test = calibrated_lgbm.predict_proba(X_test)[:, 1]
+        chosen_name = "lightgbm_calibrated"
+    else:
+        print("Chosen model: LogReg")
+        model = calibrated_lr
+        p_test = calibrated_lr.predict_proba(X_test)[:, 1]
+        chosen_name = "logreg_calibrated"
 
     # top bucket stats
     q90 = np.quantile(p_test, 0.90)
@@ -224,8 +329,9 @@ def train_baseline(train_path: Path) -> TrainResult:
     }
 
 
-    model_path = MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib"
-    joblib.dump({"model": calibrated_model, "feature_cols": feature_cols}, model_path)
+    model_path = MODELS_DIR / f"hr_model_{chosen_name}_2024.joblib"
+    joblib.dump({"model": model, "feature_cols": feature_cols}, model_path)
+
 
     return TrainResult(model_path=model_path, metrics=metrics, feature_cols=feature_cols, extra=extra)
 

@@ -70,6 +70,8 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     events["game_date"] = pd.to_datetime(events["game_date"])
     events["is_hr"] = (events["events"] == "home_run").fillna(False).astype("int8")
+    #events["is_so"] = (events["events"] == "strikeout").astype("int8")
+    #events["is_bb"] = (events["events"] == "walk").astype("int8")
 
     # -------------------------------
     # COLLAPSE TO PLATE-APPEARANCE LEVEL  (ADD THIS)
@@ -90,6 +92,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
             "launch_angle": "max",
         })
     )
+    # After collapse to 1 row per PA
+    ev_str = events["events"].astype("string")
+    events["is_so"] = ev_str.str.contains("strikeout", na=False).astype("int8")
+    events["is_bb"] = (ev_str == "walk").fillna(False).astype("int8")
 
     events = events.sort_values("game_date").reset_index(drop=True)
     events["game_date"] = pd.to_datetime(events["game_date"]).astype("datetime64[ns]")
@@ -153,6 +159,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
 
         b_pa_14 = len(batter_14)
+        b_so_14 = int(batter_14["is_so"].sum())
+        b_bb_14 = int(batter_14["is_bb"].sum())
+
+        b_k_rate_14 = (b_so_14 / b_pa_14) if b_pa_14 > 0 else 0.0
+        b_bb_rate_14 = (b_bb_14 / b_pa_14) if b_pa_14 > 0 else 0.0
+
         b_hr_14 = int(batter_14["is_hr"].sum())
         b_hr_rate_14 = (b_hr_14 / b_pa_14) if b_pa_14 > 0 else 0.0
         
@@ -208,6 +220,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
 
         p_pa_30 = len(pitcher_30)
+        p_so_30 = int(pitcher_30["is_so"].sum())
+        p_bb_30 = int(pitcher_30["is_bb"].sum())
+
+        p_k_rate_30 = (p_so_30 / p_pa_30) if p_pa_30 > 0 else 0.0
+        p_bb_rate_30 = (p_bb_30 / p_pa_30) if p_pa_30 > 0 else 0.0
+
         p_hr_allowed_30 = int(pitcher_30["is_hr"].sum())
         p_hr_allowed_rate_30 = (
             p_hr_allowed_30 / p_pa_30
@@ -223,8 +241,13 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
         p_barrels_allowed_30 = int(pitcher_30["is_barrel"].sum())
         p_barrel_allowed_rate_30 = (p_barrels_allowed_30 / p_pa_30) if p_pa_30 > 0 else 0.0
-
-
+        k_rate_edge_14_30 = b_k_rate_14 - p_k_rate_30
+        bb_rate_edge_14_30 = b_bb_rate_14 - p_bb_rate_30
+        k_rate_interaction_14_30 = b_k_rate_14 * p_k_rate_30
+        bb_rate_interaction_14_30 = b_bb_rate_14 * p_bb_rate_30
+        contact_pressure_14_30 = (1 - b_k_rate_14) * (1 - p_k_rate_30)
+        discipline_balance_14_30 = (b_bb_rate_14 - b_k_rate_14) - (p_bb_rate_30 - p_k_rate_30)
+        
         # ---------------- Pitcher Season ----------------
         if pitcher_all is None:
             pitcher_szn = events.iloc[0:0]
@@ -310,6 +333,18 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                 "fb_edge_14_30": fb_edge_14_30,
                 "barrel_edge_14_30": barrel_edge_14_30,
                 "hr_rate_edge_14_30": hr_rate_edge_14_30,
+
+                "b_k_rate_14": b_k_rate_14,
+                "b_bb_rate_14": b_bb_rate_14,
+                "p_k_rate_30": p_k_rate_30,
+                "p_bb_rate_30": p_bb_rate_30,
+
+                "k_rate_edge_14_30": k_rate_edge_14_30,
+                "bb_rate_edge_14_30": bb_rate_edge_14_30,
+                "k_rate_interaction_14_30": k_rate_interaction_14_30,
+                "bb_rate_interaction_14_30": bb_rate_interaction_14_30,
+                "contact_pressure_14_30": contact_pressure_14_30,
+                "discipline_balance_14_30": discipline_balance_14_30,
 
             }
         )
