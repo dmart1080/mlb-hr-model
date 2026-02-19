@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from numpy import rint
 import pandas as pd
 from pybaseball.statcast import statcast
 
@@ -72,7 +73,8 @@ def fetch_statcast_events(
             keep = [c for c in columns if c in df.columns]
             df = df[keep]
         return StatcastFetchResult(df=df, cache_path=cache_path, from_cache=True)
-
+    
+    print(f"  Downloading from Statcast: {start_date} → {end_date} ...")
     # Download via pybaseball
     df = statcast(start_dt=start_date, end_dt=end_date)
 
