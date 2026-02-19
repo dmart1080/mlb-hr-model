@@ -35,7 +35,8 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
 
     # A plate appearance is roughly each row here; some rows may not be true PAs,
     # but for MVP it's fine as a count proxy.
-    df["is_hr"] = (df["events"] == "home_run").fillna(False).astype("int8")
+    if "is_hr" not in df.columns:
+        df["is_hr"] = (df["events"] == "home_run").fillna(False).astype("int8")
     df = df.copy()
     df["events"] = df["events"].astype("string")
 

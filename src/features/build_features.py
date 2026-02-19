@@ -138,7 +138,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     for row in labels.itertuples(index=False):
         game_date = row.game_date
         batter_id = row.batter
-        pitcher_id = row.pitcher_mode
         hr_hit = row.hr_hit
         game_pk = row.game_pk
 
@@ -201,7 +200,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         b_ev_mean_szn = _safe_mean(batter_szn["launch_speed"]) if b_pa_szn > 0 else 0.0
         b_la_mean_szn = _safe_mean(batter_szn["launch_angle"]) if b_pa_szn > 0 else 0.0
 
-        b_hardhit_rate_szn = _safe_rate_bool((b_ev_szn >= 95).mean()) if b_pa_szn > 0 else 0.0
+        b_hardhit_rate_szn = _safe_rate_bool(b_ev_szn >= 95) if b_pa_szn > 0 else 0.0
         b_fb_rate_szn = _safe_rate_bool((b_la_szn >= 20) & (b_la_szn <= 40)) if b_pa_szn > 0 else 0.0
 
         b_barrels_szn = int(batter_szn["is_barrel"].sum())

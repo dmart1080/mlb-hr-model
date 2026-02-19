@@ -21,9 +21,19 @@ def latest_train_table() -> Path:
 
 
 def load_model():
-    model_path = MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib"
-    bundle = joblib.load(model_path)
-    return bundle["model"], bundle["feature_cols"]
+    def load_model():
+        candidates = sorted(
+            MODELS_DIR.glob("hr_model_*_calibrated_2024.joblib"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise FileNotFoundError("No calibrated model found in models/")
+        model_path = candidates[0]
+        bundle = joblib.load(model_path)
+        return bundle["model"], bundle["feature_cols"]
+        bundle = joblib.load(model_path)
+        return bundle["model"], bundle["feature_cols"]
 
 
 def add_player_names(df: pd.DataFrame, id_col: str, out_col: str) -> pd.DataFrame:
