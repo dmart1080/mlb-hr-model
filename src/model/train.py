@@ -19,7 +19,7 @@ from lightgbm import LGBMClassifier
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-MODELS_DIR = PROJECT_ROOT / "models"
+MODELS_DIR    = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -38,6 +38,103 @@ def f2(x: float) -> str:
 
 def fmt_int(x: int) -> str:
     return f"{x:,}"
+
+
+# ---------------------------------------------------------------------------
+# Feature columns
+# ---------------------------------------------------------------------------
+
+FEATURE_COLS = [
+    # --- Batter combined (14d) ---
+    "b_pa_14", "b_hr_rate_14", "b_barrel_rate_14",
+    "b_ev_mean_14", "b_la_mean_14", "b_hardhit_rate_14", "b_fb_rate_14",
+    "b_k_rate_14", "b_bb_rate_14",
+
+    # --- Batter platoon splits (14d) ---
+    "b_pa_14_vsL", "b_hr_rate_14_vsL", "b_barrel_rate_14_vsL",
+    "b_hardhit_rate_14_vsL", "b_fb_rate_14_vsL",
+    "b_k_rate_14_vsL", "b_bb_rate_14_vsL",
+
+    "b_pa_14_vsR", "b_hr_rate_14_vsR", "b_barrel_rate_14_vsR",
+    "b_hardhit_rate_14_vsR", "b_fb_rate_14_vsR",
+    "b_k_rate_14_vsR", "b_bb_rate_14_vsR",
+
+    # --- Batter combined (season) ---
+    "b_pa_szn", "b_hr_rate_szn", "b_barrel_rate_szn",
+    "b_ev_mean_szn", "b_la_mean_szn", "b_hardhit_rate_szn", "b_fb_rate_szn",
+    "b_k_rate_szn", "b_bb_rate_szn",
+
+    # --- Batter platoon splits (season) ---
+    "b_pa_szn_vsL", "b_hr_rate_szn_vsL", "b_barrel_rate_szn_vsL",
+    "b_hardhit_rate_szn_vsL", "b_fb_rate_szn_vsL",
+    "b_k_rate_szn_vsL", "b_bb_rate_szn_vsL",
+
+    "b_pa_szn_vsR", "b_hr_rate_szn_vsR", "b_barrel_rate_szn_vsR",
+    "b_hardhit_rate_szn_vsR", "b_fb_rate_szn_vsR",
+    "b_k_rate_szn_vsR", "b_bb_rate_szn_vsR",
+
+    # --- Batter EV trend (7d vs 8–14d) ---
+    "b_ev_mean_7", "b_hardhit_rate_7",
+    "b_ev_trend", "b_hardhit_trend", "b_barrel_trend", "b_hr_trend",
+
+    # --- Batter home/away splits (season) ---
+    "b_hr_rate_home", "b_hr_rate_away",
+    "b_hardhit_rate_home", "b_hardhit_rate_away",
+    "b_barrel_rate_home", "b_barrel_rate_away",
+    "b_hr_rate_home_edge",
+    "is_home_game",
+
+    # --- Batter rest ---
+    "b_days_rest",
+
+    # --- Pitcher combined (30d) ---
+    "p_pa_30", "p_hr_allowed_rate_30",
+    "p_ev_allowed_mean_30", "p_hardhit_allowed_rate_30",
+    "p_fb_allowed_rate_30", "p_barrel_allowed_rate_30",
+    "p_k_rate_30", "p_bb_rate_30",
+
+    # --- Pitcher platoon splits (30d) ---
+    "p_pa_30_vsL", "p_hr_allowed_rate_30_vsL",
+    "p_hardhit_allowed_rate_30_vsL", "p_fb_allowed_rate_30_vsL",
+    "p_barrel_allowed_rate_30_vsL", "p_k_rate_30_vsL", "p_bb_rate_30_vsL",
+
+    "p_pa_30_vsR", "p_hr_allowed_rate_30_vsR",
+    "p_hardhit_allowed_rate_30_vsR", "p_fb_allowed_rate_30_vsR",
+    "p_barrel_allowed_rate_30_vsR", "p_k_rate_30_vsR", "p_bb_rate_30_vsR",
+
+    # --- Pitcher combined (season) ---
+    "p_pa_szn", "p_hr_allowed_rate_szn",
+    "p_ev_allowed_mean_szn", "p_hardhit_allowed_rate_szn",
+    "p_fb_allowed_rate_szn", "p_barrel_allowed_rate_szn",
+
+    # --- Pitcher platoon splits (season) ---
+    "p_pa_szn_vsL", "p_hr_allowed_rate_szn_vsL",
+    "p_hardhit_allowed_rate_szn_vsL", "p_barrel_allowed_rate_szn_vsL",
+
+    "p_pa_szn_vsR", "p_hr_allowed_rate_szn_vsR",
+    "p_hardhit_allowed_rate_szn_vsR", "p_barrel_allowed_rate_szn_vsR",
+
+    # --- Pitcher rest + velo ---
+    "p_days_rest", "p_is_short_rest",
+    "p_fb_velo_30", "p_fb_pct_30", "p_offspeed_pct_30", "p_fb_velo_trend",
+
+    # --- Combined edge features ---
+    "ev_edge_14_30", "hardhit_edge_14_30", "fb_edge_14_30",
+    "barrel_edge_14_30", "hr_rate_edge_14_30",
+    "k_rate_edge_14_30", "bb_rate_edge_14_30",
+    "k_rate_interaction_14_30", "bb_rate_interaction_14_30",
+    "contact_pressure_14_30", "discipline_balance_14_30",
+
+    # --- Platoon edge features ---
+    "hr_rate_edge_14_30_vsL", "hardhit_edge_14_30_vsL", "barrel_edge_14_30_vsL",
+    "hr_rate_edge_14_30_vsR", "hardhit_edge_14_30_vsR", "barrel_edge_14_30_vsR",
+
+    # --- Matchup ---
+    "same_hand_matchup",
+
+    # --- Context ---
+    "park_factor_hr",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -108,30 +205,19 @@ def print_summary(
 # ---------------------------------------------------------------------------
 
 def latest_train_table() -> Path:
-    """
-    Preference order:
-    1. Any *_combined.parquet (multi-season)
-    2. Full-season single files
-    3. Any train_table_*.parquet (most recently modified)
-    """
-    # Multi-season combined
-    combined = sorted(PROCESSED_DIR.glob("train_table_*_combined.parquet"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-    if combined:
-        return combined[0]
-
-    # Single full-season
-    full = sorted(PROCESSED_DIR.glob("train_table_*_full_season.parquet"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    if full:
-        return full[0]
-
-    # Fallback: any monthly chunk
-    files = sorted(PROCESSED_DIR.glob("train_table_*.parquet"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise FileNotFoundError("No train_table_*.parquet found in data/processed/")
-    return files[0]
+    for pattern in (
+        "train_table_*_combined.parquet",
+        "train_table_*_full_season.parquet",
+        "train_table_*.parquet",
+    ):
+        files = sorted(
+            PROCESSED_DIR.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if files:
+            return files[0]
+    raise FileNotFoundError("No train_table_*.parquet found in data/processed/")
 
 
 def time_split(df: pd.DataFrame, test_size: float = 0.2):
@@ -154,44 +240,20 @@ class TrainResult:
     extra: dict
 
 
-FEATURE_COLS = [
-    # Batter 14-day
-    "b_pa_14", "b_hr_rate_14", "b_barrel_rate_14",
-    "b_ev_mean_14", "b_la_mean_14", "b_hardhit_rate_14", "b_fb_rate_14",
-
-    # Batter season
-    "b_pa_szn", "b_hr_rate_szn", "b_barrel_rate_szn",
-    "b_ev_mean_szn", "b_la_mean_szn", "b_hardhit_rate_szn", "b_fb_rate_szn",
-
-    # Pitcher 30-day allowed
-    "p_pa_30", "p_hr_allowed_rate_30",
-    "p_ev_allowed_mean_30", "p_hardhit_allowed_rate_30",
-    "p_fb_allowed_rate_30", "p_barrel_allowed_rate_30",
-
-    # Pitcher season allowed
-    "p_pa_szn", "p_hr_allowed_rate_szn",
-    "p_ev_allowed_mean_szn", "p_hardhit_allowed_rate_szn",
-    "p_fb_allowed_rate_szn", "p_barrel_allowed_rate_szn",
-
-    # Edge / interaction
-    "ev_edge_14_30", "hardhit_edge_14_30", "fb_edge_14_30",
-    "barrel_edge_14_30", "hr_rate_edge_14_30",
-    "b_k_rate_14", "b_bb_rate_14", "p_k_rate_30", "p_bb_rate_30",
-    "k_rate_edge_14_30", "bb_rate_edge_14_30",
-    "k_rate_interaction_14_30", "bb_rate_interaction_14_30",
-    "contact_pressure_14_30", "discipline_balance_14_30",
-
-    # Context
-    "park_factor_hr",
-]
-
-
 def train_baseline(train_path: Path) -> TrainResult:
     df = pd.read_parquet(train_path)
 
-    missing = [c for c in (FEATURE_COLS + ["hr_hit", "game_date"]) if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in training table: {missing}")
+    available_features = [c for c in FEATURE_COLS if c in df.columns]
+    missing_features   = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing_features:
+        print(f"  Note: {len(missing_features)} feature(s) not in table, skipping: "
+              f"{missing_features[:5]}{'...' if len(missing_features) > 5 else ''}")
+
+    for col in ["hr_hit", "game_date"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    feature_cols = available_features
 
     train_df, test_df = time_split(df, test_size=0.2)
 
@@ -200,33 +262,25 @@ def train_baseline(train_path: Path) -> TrainResult:
     test_start  = str(test_df["game_date"].min().date())
     test_end    = str(test_df["game_date"].max().date())
 
-    # Further split train → core + calibration (time-aware)
     train_core_df, calib_df = time_split(train_df, test_size=0.2)
 
-    X_train_core = train_core_df[FEATURE_COLS].fillna(0.0)
+    X_train_core = train_core_df[feature_cols].fillna(0.0)
     y_train_core = train_core_df["hr_hit"].astype(int)
+    X_calib      = calib_df[feature_cols].fillna(0.0)
+    y_calib      = calib_df["hr_hit"].astype(int)
+    X_test       = test_df[feature_cols].fillna(0.0)
+    y_test       = test_df["hr_hit"].astype(int)
 
-    X_calib = calib_df[FEATURE_COLS].fillna(0.0)
-    y_calib = calib_df["hr_hit"].astype(int)
-
-    X_test = test_df[FEATURE_COLS].fillna(0.0)
-    y_test = test_df["hr_hit"].astype(int)
-
-    # ------------------------------------------------------------------
     # Logistic Regression
-    # ------------------------------------------------------------------
     base_pipeline = Pipeline([
         ("scaler", StandardScaler()),
         ("lr", LogisticRegression(max_iter=3000, class_weight="balanced")),
     ])
     base_pipeline.fit(X_train_core, y_train_core)
-    p_test_lr_raw = base_pipeline.predict_proba(X_test)[:, 1]
-    roc_lr_raw = float(roc_auc_score(y_test, p_test_lr_raw))
+    roc_lr_raw = float(roc_auc_score(y_test, base_pipeline.predict_proba(X_test)[:, 1]))
     print(f"LogReg  (raw) ROC-AUC: {roc_lr_raw:.3f}")
 
-    # ------------------------------------------------------------------
     # LightGBM
-    # ------------------------------------------------------------------
     lgbm = LGBMClassifier(
         n_estimators=400,
         learning_rate=0.05,
@@ -239,13 +293,10 @@ def train_baseline(train_path: Path) -> TrainResult:
         verbosity=-1,
     )
     lgbm.fit(X_train_core, y_train_core)
-    p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
-    roc_lgbm_raw = float(roc_auc_score(y_test, p_test_lgbm_raw))
+    roc_lgbm_raw = float(roc_auc_score(y_test, lgbm.predict_proba(X_test)[:, 1]))
     print(f"LightGBM (raw) ROC-AUC: {roc_lgbm_raw:.3f}")
 
-    # ------------------------------------------------------------------
-    # Calibrate both, pick winner by raw ROC
-    # ------------------------------------------------------------------
+    # Calibrate both, pick winner
     calibrated_lr = CalibratedClassifierCV(
         estimator=FrozenEstimator(base_pipeline), method="sigmoid", cv=None,
     )
@@ -267,29 +318,26 @@ def train_baseline(train_path: Path) -> TrainResult:
         chosen_name  = "logreg_calibrated"
         p_test = calibrated_lr.predict_proba(X_test)[:, 1]
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
     baseline = float(y_test.mean())
     avg_pred = float(p_test.mean())
 
     q90 = np.quantile(p_test, 0.90)
-    top10_mask = p_test >= q90
+    top10_mask    = p_test >= q90
     top10_hr_rate = float(y_test[top10_mask].mean())
 
     q99 = np.quantile(p_test, 0.99)
-    top1_mask = p_test >= q99
+    top1_mask    = p_test >= q99
     top1_hr_rate = float(y_test[top1_mask].mean())
 
     extra = {
-        "top10_hr_rate":    top10_hr_rate,
-        "top1_hr_rate":     top1_hr_rate,
-        "top1_count":       int(top1_mask.sum()),
-        "top1_avg_b_pa_14": float(X_test.loc[top1_mask, "b_pa_14"].mean()),
-        "top1_avg_p_pa_30": float(X_test.loc[top1_mask, "p_pa_30"].mean()),
-        "max_pred_prob":    float(p_test.max()),
-        "top10_lift":       (top10_hr_rate / baseline) if baseline > 0 else float("nan"),
-        "top1_lift":        (top1_hr_rate  / baseline) if baseline > 0 else float("nan"),
+        "top10_hr_rate":     top10_hr_rate,
+        "top1_hr_rate":      top1_hr_rate,
+        "top1_count":        int(top1_mask.sum()),
+        "top1_avg_b_pa_14":  float(X_test.loc[top1_mask, "b_pa_14"].mean()),
+        "top1_avg_p_pa_30":  float(X_test.loc[top1_mask, "p_pa_30"].mean()),
+        "max_pred_prob":     float(p_test.max()),
+        "top10_lift":        (top10_hr_rate / baseline) if baseline > 0 else float("nan"),
+        "top1_lift":         (top1_hr_rate  / baseline) if baseline > 0 else float("nan"),
         "avg_minus_base_pp": (avg_pred - baseline) * 100.0,
     }
 
@@ -306,15 +354,14 @@ def train_baseline(train_path: Path) -> TrainResult:
         "roc_auc":       float(roc_auc_score(y_test, p_test)),
     }
 
-    # Derive year tag from the training data for the filename
-    year_tag = f"{train_df['game_date'].min().year}_{train_df['game_date'].max().year}"
+    year_tag   = f"{train_df['game_date'].min().year}_{train_df['game_date'].max().year}"
     model_path = MODELS_DIR / f"hr_model_{chosen_name}_{year_tag}.joblib"
-    joblib.dump({"model": chosen_model, "feature_cols": FEATURE_COLS}, model_path)
+    joblib.dump({"model": chosen_model, "feature_cols": feature_cols}, model_path)
 
     return TrainResult(
         model_path=model_path,
         metrics=run_metrics,
-        feature_cols=FEATURE_COLS,
+        feature_cols=feature_cols,
         extra=extra,
     )
 
