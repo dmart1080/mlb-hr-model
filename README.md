@@ -24,10 +24,13 @@ Features are computed from Statcast pitch/event data using rolling windows calcu
 
 - **Batter (14-day):** PA count, HR rate, barrel rate, EV mean, launch angle mean, hard-hit rate, FB rate, K rate, BB rate
 - **Batter (season-to-date):** same set of contact-quality metrics
-- **Pitcher allowed (30-day):** PA count, HR allowed rate, EV allowed mean, hard-hit allowed rate, FB allowed rate, barrel allowed rate, K rate, BB rate
+- **Pitcher allowed (30-day):** PA count, HR allowed rate, EV allowed mean, hard-hit allowed rate, FB allowed rate, barrel allowed rate, K rate, BB rate — computed against the **actual starting pitcher** (resolved via MLB Stats API), not a mode-pitcher proxy
 - **Pitcher allowed (season-to-date):** same set
-- **Edge features:** batter 14d minus pitcher 30d for EV, hard-hit rate, FB rate, barrel rate, HR rate, K rate, BB rate — plus interaction terms and a contact pressure composite
-- **Park factor:** HR park factor on a 100 = neutral scale (per ballpark)
+- **Edge features:** batter 14d minus starter 30d for EV, hard-hit rate, FB rate, barrel rate, HR rate, K rate, BB rate — plus interaction terms and a contact pressure composite
+- **Park factor:** HR park factor fetched dynamically from the MLB Stats API per season (cached locally, refreshed every 30 days for the current season; falls back to static 2024 values if the API is unavailable)
+- **Cold-start handling:** all rate features use empirical Bayes shrinkage toward league-average priors (batter prior = 50 PA, pitcher = 75 PA, bullpen = 100 PA) so low-PA players regress toward the mean rather than showing misleading zeros
+- **Pitcher assignment quality:** `relief_pa_pct` — fraction of in-game PAs the batter took against non-starter pitchers; signals how much the starter-based matchup features should be discounted
+- **Lineup context:** `batting_order_pos` (1–9), `is_top_of_order` (slots 1–4), `expected_pa_today` (continuous PA-volume proxy by lineup slot)
 
 ---
 
@@ -36,16 +39,21 @@ Features are computed from Statcast pitch/event data using rolling windows calcu
 ```
 mlb-hr-model/
 ├── data/
-│   ├── cache/              # Raw Statcast parquets (auto-created, gitignored)
+│   ├── cache/
+│   │   ├── statcast/       # Raw Statcast parquets (auto-created, gitignored)
+│   │   ├── schedule/       # MLB API game roster + batting order cache
+│   │   └── weather/        # MLB API weather cache
 │   └── processed/          # Feature tables and train tables
 ├── models/                 # Saved .joblib model files + train_runs.csv log
 ├── src/
 │   ├── data_sources/
-│   │   └── statcast.py     # Statcast fetch + disk cache
+│   │   ├── statcast.py         # Statcast fetch + disk cache
+│   │   ├── weather.py          # MLB Stats API weather fetch + cache
+│   │   └── mlb_schedule.py     # MLB Stats API: probable/actual starters + batting orders
 │   ├── features/
-│   │   ├── build_labels.py              # Collapse events → batter-game labels
+│   │   ├── build_labels.py              # Collapse events → batter-game labels + relief_pa_pct
 │   │   ├── build_features.py            # Rolling feature computation
-│   │   ├── build_features_season_2024.py  # Single-season build (legacy)
+│   │   ├── build_features_season.py     # Single-season build helper
 │   │   ├── build_features_multi_season.py # Multi-season build (2021–2025)
 │   │   └── park_factors.py              # HR park factor lookup table
 │   └── model/
@@ -67,7 +75,7 @@ python -m venv .venv
 # macOS/Linux
 source .venv/bin/activate
 
-pip install pybaseball lightgbm scikit-learn pandas numpy joblib pyarrow
+pip install pybaseball lightgbm scikit-learn pandas numpy joblib pyarrow requests
 ```
 
 ---
@@ -80,11 +88,11 @@ pip install pybaseball lightgbm scikit-learn pandas numpy joblib pyarrow
 ```bash
 python -m src.features.build_features_multi_season
 ```
-Builds month-by-month for 2021–2025. Resume-safe — already-built months are skipped. Expect 20–40 min on first run. Saves `data/processed/train_table_2021_2025_full.parquet`.
+Builds month-by-month for 2021–2025. Resume-safe — already-built months are skipped. Expect 20–40 min on first run (longer on first run due to MLB API roster fetches, which are then cached). Saves `data/processed/train_table_2021_2025_full.parquet`.
 
 **Single season (faster, for development):**
 ```bash
-python -m src.features.build_features_season_2024
+python -m src.features.build_features_season build --year 2024
 ```
 
 ### 2. Train
@@ -96,6 +104,8 @@ python -m src.model.train
 Uses a **hard calendar split**: train = everything before 2025-03-27, test = 2025 season (true out-of-time validation). Falls back to a 80/20 percentage split if no 2025 data is present yet.
 
 Prints a full summary and appends a row to `models/train_runs.csv`.
+
+New features (`batting_order_pos`, `is_top_of_order`, `expected_pa_today`, `relief_pa_pct`) are included automatically if present in the table. Legacy tables built without them will train on the reduced feature set with a warning.
 
 ### 3. Predict
 
@@ -109,7 +119,7 @@ Scores all batter–pitcher matchups on the latest date in the feature table and
 
 ## Data
 
-All data is sourced from [Baseball Savant](https://baseballsavant.mlb.com/) via the [pybaseball](https://github.com/jldbc/pybaseball) library. Raw Statcast event data is cached locally in `data/cache/` as parquet files keyed by date range — re-runs do not re-download.
+All pitch/event data is sourced from [Baseball Savant](https://baseballsavant.mlb.com/) via the [pybaseball](https://github.com/jldbc/pybaseball) library. Starter and batting order data is fetched from the [MLB Stats API](https://statsapi.mlb.com). All raw data is cached locally — re-runs do not re-download.
 
 `data/` and `models/` should be added to `.gitignore`.
 
@@ -128,9 +138,4 @@ The barrel approximation used in features is `EV ≥ 95 mph AND launch angle 20�
 
 ---
 
-## Known limitations
 
-- **Pitcher assignment:** uses the mode pitcher faced per batter-game as a matchup proxy. Doesn't model bullpen usage or handedness splits.
-- **No lineup context:** doesn't model batting order position or lineup protection.
-- **Park factors:** static 2024 values. Not updated intra-season.
-- **Cold-start:** batters/pitchers with fewer than ~10 PA in the rolling window get `0.0` for rate features. Model compensates via season-to-date fallbacks but early-season predictions are noisier.

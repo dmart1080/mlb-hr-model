@@ -190,7 +190,7 @@ def train_baseline(train_path: Path) -> TrainResult:
     df = pd.read_parquet(train_path)
 
     feature_cols = [
-        # Batter (14d)
+        # ---- Batter (14d) -----------------------------------------------
         "b_pa_14",
         "b_hr_rate_14",
         "b_barrel_rate_14",
@@ -199,7 +199,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "b_hardhit_rate_14",
         "b_fb_rate_14",
 
-        # Batter (season)
+        # ---- Batter (season) --------------------------------------------
         "b_pa_szn",
         "b_hr_rate_szn",
         "b_barrel_rate_szn",
@@ -208,7 +208,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "b_hardhit_rate_szn",
         "b_fb_rate_szn",
 
-        # Pitcher allowed (30d)
+        # ---- Pitcher allowed (30d) — starter only -----------------------
         "p_pa_30",
         "p_hr_allowed_rate_30",
         "p_ev_allowed_mean_30",
@@ -216,7 +216,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "p_fb_allowed_rate_30",
         "p_barrel_allowed_rate_30",
 
-        # Pitcher allowed (season)
+        # ---- Pitcher allowed (season) — starter only --------------------
         "p_pa_szn",
         "p_hr_allowed_rate_szn",
         "p_ev_allowed_mean_szn",
@@ -224,11 +224,14 @@ def train_baseline(train_path: Path) -> TrainResult:
         "p_fb_allowed_rate_szn",
         "p_barrel_allowed_rate_szn",
 
+        # ---- Edge (batter 14d vs starter 30d) ---------------------------
         "ev_edge_14_30",
         "hardhit_edge_14_30",
         "fb_edge_14_30",
         "barrel_edge_14_30",
         "hr_rate_edge_14_30",
+
+        # ---- K/BB discipline --------------------------------------------
         "b_k_rate_14",
         "b_bb_rate_14",
         "p_k_rate_30",
@@ -240,19 +243,62 @@ def train_baseline(train_path: Path) -> TrainResult:
         "contact_pressure_14_30",
         "discipline_balance_14_30",
 
-        # Context
+        # ---- Context ----------------------------------------------------
         "park_factor_hr",
+
+        # ---- Pitcher assignment quality ---------------------------------
+        # Fraction of in-game PAs the batter took against the starter.
+        # High relief_pa_pct means the starter-based matchup features are
+        # noisier (batter actually faced a lot of relievers).
+        "relief_pa_pct",
+
+        # ---- Lineup context (NEW) ---------------------------------------
+        # batting_order_pos: 1–9 raw slot; 0 when unknown.
+        # is_top_of_order:   1 if slots 1–4 (more PA, more HR opportunity).
+        # expected_pa_today: continuous proxy for plate-appearance volume
+        #                    derived from historical PA-by-lineup-slot averages.
+        "batting_order_pos",
+        "is_top_of_order",
+        "expected_pa_today",
+
+        # ---- Lineup protection (NEW) ------------------------------------
+        # OPS-proxy of the hitter directly ahead/behind in the order.
+        # Higher protection_ops_ahead → pitcher more likely to throw strikes
+        # to avoid putting runners on ahead of a dangerous hitter.
+        # lineup_ops_context → overall quality of the lineup surrounding batter.
+        "protection_ops_ahead",
+        "protection_ops_behind",
+        "lineup_ops_context",
+
+        # ---- Bullpen quality (NEW) --------------------------------------
+        # Rolling 30d stats for the opposing team's bullpen (non-starters).
+        # bp_hr_rate_x_relief_pct: interaction — bullpen quality only matters
+        # when the batter actually faces relievers (high relief_pa_pct).
+        "bp_hr_allowed_rate_30",
+        "bp_hardhit_allowed_rate_30",
+        "bp_bb_rate_30",
+        "bp_era_proxy_30",
+        "bp_hr_rate_x_relief_pct",
     ]
 
-    missing = [c for c in (feature_cols + ["hr_hit", "game_date"]) if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in training table: {missing}")
+    # Gracefully drop any feature that isn't in the table yet
+    # (allows reuse of legacy train tables built without new features).
+    available = set(df.columns)
+    missing_features = [c for c in feature_cols if c not in available]
+    if missing_features:
+        print(
+            f"⚠️  The following features are absent from the training table and "
+            f"will be excluded this run:\n    {missing_features}\n"
+            f"   Rebuild the feature table to include them."
+        )
+    feature_cols = [c for c in feature_cols if c in available]
+
+    missing_required = [c for c in ["hr_hit", "game_date"] if c not in df.columns]
+    if missing_required:
+        raise ValueError(f"Missing required columns in training table: {missing_required}")
 
     # ------------------------------------------------------------------
     # Calendar split: train=2021-2024, test=2025
-    # Falls back gracefully if the dataset is single-season (all rows
-    # predate TEST_START_DATE → test set will be empty and a warning
-    # is printed).
     # ------------------------------------------------------------------
     train_df, test_df = calendar_split(df, test_start=TEST_START_DATE)
 
@@ -330,10 +376,6 @@ def train_baseline(train_path: Path) -> TrainResult:
     )
     calibrated_lr.fit(X_calib, y_calib)
 
-    # Use sigmoid (Platt scaling) instead of isotonic for LGBM.
-    # Isotonic regression can collapse many predictions to identical probability
-    # bins when the calibration set is small (e.g. single-season ~8k rows).
-    # Sigmoid is smoother and avoids this artefact.
     calibrated_lgbm = CalibratedClassifierCV(
         estimator=FrozenEstimator(lgbm),
         method="sigmoid",
@@ -395,7 +437,7 @@ def train_baseline(train_path: Path) -> TrainResult:
     }
 
     # ------------------------------------------------------------------
-    # Save model — filename encodes training window + chosen algorithm
+    # Save model
     # ------------------------------------------------------------------
     model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2025.joblib"
     joblib.dump({"model": model, "feature_cols": feature_cols}, model_path)
