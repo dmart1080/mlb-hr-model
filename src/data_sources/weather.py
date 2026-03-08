@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import requests
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CACHE_DIR    = PROJECT_ROOT / "data" / "cache"
+WEATHER_CACHE = CACHE_DIR / "weather"
+WEATHER_CACHE.mkdir(parents=True, exist_ok=True)
+
+# Roofed / retractable-roof stadiums — weather is irrelevant for these
+INDOOR_PARKS = {
+    "MIA",  # loanDepot park (retractable)
+    "HOU",  # Minute Maid Park (retractable)
+    "SEA",  # T-Mobile Park (retractable)
+    "ARI",  # Chase Field (retractable)
+    "MIL",  # American Family Field (retractable)
+    "TOR",  # Rogers Centre (retractable)
+    "TB",   # Tropicana Field (fixed dome) — also TBR in some systems
+    "TBR",
+}
+
+# Wind direction → numeric bearing (degrees from N, clockwise)
+# MLB API returns strings like "In from CF", "Out to CF", "L to R", "R to L", "Calm"
+_WIND_DIR_TO_DEG = {
+    "in from cf":  180,   # blowing in  = bad for HRs
+    "out to cf":     0,   # blowing out = good for HRs
+    "l to r":       90,
+    "r to l":      270,
+    "in from lf":  135,
+    "in from rf":  225,
+    "out to lf":   315,
+    "out to rf":    45,
+    "calm":          0,   # treat calm as neutral
+}
+
+# HR-friendliness of wind direction (-1 to +1 scale)
+# "out" directions are positive, "in" directions are negative
+_WIND_HR_FACTOR = {
+    "out to cf":    1.0,
+    "out to lf":    0.7,
+    "out to rf":    0.7,
+    "l to r":       0.3,
+    "r to l":       0.3,
+    "calm":         0.0,
+    "in from lf":  -0.5,
+    "in from rf":  -0.5,
+    "in from cf":  -1.0,
+}
+
+
+def _cache_path(game_pk: int) -> Path:
+    return WEATHER_CACHE / f"weather_{game_pk}.json"
+
+
+def _parse_wind_speed(wind_str: str) -> float:
+    """Extract numeric mph from strings like '12 mph, Out to CF'."""
+    m = re.search(r"(\d+)\s*mph", wind_str, re.IGNORECASE)
+    return float(m.group(1)) if m else 0.0
+
+
+def _parse_wind_direction(wind_str: str) -> str:
+    """Extract direction token from wind string."""
+    wind_lower = wind_str.lower()
+    for key in _WIND_HR_FACTOR:
+        if key in wind_lower:
+            return key
+    if "calm" in wind_lower or wind_str.strip() == "0 mph":
+        return "calm"
+    return "unknown"
+
+
+def _parse_temp(temp_str: str) -> float:
+    """Extract numeric °F from strings like '72' or '72°'."""
+    m = re.search(r"(\d+)", str(temp_str))
+    return float(m.group(1)) if m else float("nan")
+
+
+def fetch_game_weather(game_pk: int, *, force_refresh: bool = False) -> dict:
+    """
+    Fetch weather for a single game from the MLB Stats API.
+    Returns a dict with keys:
+        temp_f, wind_speed_mph, wind_direction, wind_hr_factor,
+        condition, is_indoor, game_pk
+    """
+    cache = _cache_path(game_pk)
+
+    if cache.exists() and not force_refresh:
+        with open(cache) as f:
+            return json.load(f)
+
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        # Return neutral values on failure — don't crash the pipeline
+        return _neutral_weather(game_pk, error=str(e))
+
+    weather_raw = data.get("gameData", {}).get("weather", {})
+    venue_raw   = data.get("gameData", {}).get("venue",   {})
+          
+    temp_str  = str(weather_raw.get("temp",      "72"))
+    wind_str  = str(weather_raw.get("wind",      "0 mph, Calm"))
+    condition = str(weather_raw.get("condition", "Unknown"))
+
+    temp_f        = _parse_temp(temp_str)
+    wind_speed    = _parse_wind_speed(wind_str)
+    wind_dir      = _parse_wind_direction(wind_str)
+    wind_hr_fac   = _WIND_HR_FACTOR.get(wind_dir, 0.0)
+
+    result = {
+        "game_pk":         game_pk,
+        "temp_f":          temp_f if not pd.isna(temp_f) else 72.0,
+        "wind_speed_mph":  wind_speed,
+        "wind_direction":  wind_dir,
+        "wind_hr_factor":  wind_hr_fac,
+        # Effective wind impact = speed × direction factor
+        "wind_hr_impact":  wind_speed * wind_hr_fac,
+        "condition":       condition,
+        "is_indoor":       0,   # filled in below
+        "venue_name":      venue_raw.get("name", ""),
+    }
+
+    with open(cache, "w") as f:
+        json.dump(result, f)
+
+    return result
+
+
+def _neutral_weather(game_pk: int, error: str = "") -> dict:
+    return {
+        "game_pk":        game_pk,
+        "temp_f":         72.0,
+        "wind_speed_mph": 0.0,
+        "wind_direction": "unknown",
+        "wind_hr_factor": 0.0,
+        "wind_hr_impact": 0.0,
+        "condition":      "unknown",
+        "is_indoor":      0,
+        "venue_name":     "",
+        "_error":         error,
+    }
+
+
+def fetch_weather_for_games(
+    game_pks: list[int],
+    home_teams: dict[int, str],
+    *,
+    force_refresh: bool = False,
+    sleep_secs: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Fetch weather for a list of game_pks and return as a DataFrame.
+    Marks indoor parks automatically regardless of API data.
+
+    Parameters
+    ----------
+    game_pks    : list of game_pk integers
+    home_teams  : dict mapping game_pk → home_team abbreviation
+    sleep_secs  : polite delay between API calls (default 50ms)
+    """
+    rows = []
+    unique_pks = list(dict.fromkeys(game_pks))  # deduplicate, preserve order
+
+    for i, gp in enumerate(unique_pks):
+        result = fetch_game_weather(gp, force_refresh=force_refresh)
+
+        # Override is_indoor based on home team
+        home_team = home_teams.get(gp, "")
+        result["is_indoor"] = int(home_team in INDOOR_PARKS)
+
+        # For indoor parks, neutralise wind and set standard temp
+        if result["is_indoor"]:
+            result["wind_speed_mph"] = 0.0
+            result["wind_hr_factor"] = 0.0
+            result["wind_hr_impact"] = 0.0
+            result["temp_f"]         = 72.0
+
+        rows.append(result)
+
+        # Only sleep when actually hitting the API (not cached)
+        if not _cache_path(gp).exists():
+            time.sleep(sleep_secs)
+
+        if (i + 1) % 100 == 0:
+            print(f"    Weather: {i+1}/{len(unique_pks)} games fetched ...")
+
+    df = pd.DataFrame(rows)
+
+    # Derived features
+    df["temp_above_75"]   = (df["temp_f"] > 75).astype("int8")
+    df["temp_above_85"]   = (df["temp_f"] > 85).astype("int8")
+    df["wind_out_strong"] = ((df["wind_hr_factor"] > 0) & (df["wind_speed_mph"] >= 10)).astype("int8")
+    df["wind_in_strong"]  = ((df["wind_hr_factor"] < 0) & (df["wind_speed_mph"] >= 10)).astype("int8")
+
+    return df[["game_pk", "temp_f", "wind_speed_mph", "wind_hr_factor",
+               "wind_hr_impact", "is_indoor", "temp_above_75", "temp_above_85",
+               "wind_out_strong", "wind_in_strong"]]
+
+
+if __name__ == "__main__":
+    # Quick test
+    test_pks   = [745456, 745457, 745458]
+    test_homes = {745456: "NYY", 745457: "BOS", 745458: "HOU"}
+    df = fetch_weather_for_games(test_pks, test_homes)
+    print(df)

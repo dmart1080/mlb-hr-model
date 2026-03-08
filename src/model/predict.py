@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import glob
 import joblib
 import pandas as pd
 
@@ -12,54 +13,71 @@ MODELS_DIR = PROJECT_ROOT / "models"
 
 
 def latest_train_table() -> Path:
-    # Prefer combined multi-season, then full-season, then any chunk
-    for pattern in (
-        "train_table_*_combined.parquet",
-        "train_table_*_full_season.parquet",
-        "train_table_*.parquet",
-    ):
-        files = sorted(PROCESSED_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            return files[0]
-    raise FileNotFoundError("No train_table_*.parquet found in data/processed/")
+    """
+    Preference order:
+      1. 2021-2025 multi-season file
+      2. 2024 full-season file (legacy)
+      3. Most-recently-modified train_table_*.parquet
+    """
+    multi = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    if multi.exists():
+        return multi
+
+    season = PROCESSED_DIR / "train_table_2024_full_season.parquet"
+    if season.exists():
+        return season
+
+    files = sorted(
+        glob.glob(str(PROCESSED_DIR / "train_table_*.parquet")),
+        key=lambda p: Path(p).stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        raise FileNotFoundError("No train_table_*.parquet found in data/processed.")
+    return Path(files[0])
 
 
 def load_model():
-    """Load the most recently saved calibrated model."""
-    candidates = sorted(
-        MODELS_DIR.glob("hr_model_*_calibrated_*.joblib"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+    """
+    Load the best available model.  Preference order:
+      1. 2021-2025 LightGBM calibrated  (produced by new train.py)
+      2. 2021-2025 LogReg calibrated
+      3. Legacy 2024 models
+    """
+    candidates = [
+        MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2025.joblib",
+        MODELS_DIR / "hr_model_logreg_calibrated_2021_2025.joblib",
+        MODELS_DIR / "hr_model_lightgbm_calibrated_2024.joblib",
+        MODELS_DIR / "hr_model_logreg_calibrated_2024.joblib",
+        # legacy name kept for backward compatibility
+        MODELS_DIR / "hr_model_logreg_edges_calibrated_2024.joblib",
+    ]
+    for path in candidates:
+        if path.exists():
+            print(f"Loading model: {path.name}")
+            bundle = joblib.load(path)
+            return bundle["model"], bundle["feature_cols"]
+
+    raise FileNotFoundError(
+        "No trained model found in models/. Run src/model/train.py first."
     )
-    if not candidates:
-        raise FileNotFoundError(
-            "No calibrated model found in models/. Run train.py first."
-        )
-    model_path = candidates[0]
-    print(f"Loading model: {model_path.name}")
-    bundle = joblib.load(model_path)
-    return bundle["model"], bundle["feature_cols"]
 
 
 def add_player_names(df: pd.DataFrame, id_col: str, out_col: str) -> pd.DataFrame:
-    try:
-        from pybaseball.playerid_lookup import playerid_reverse_lookup
-        ids = df[id_col].dropna().astype(int).unique().tolist()
-        if not ids:
-            df[out_col] = None
-            return df
-        look = playerid_reverse_lookup(ids, key_type="mlbam")
-        look["full_name"] = (
-            look["name_first"].fillna("") + " " + look["name_last"].fillna("")
-        ).str.strip()
-        mapping = dict(zip(look["key_mlbam"].astype(int), look["full_name"]))
-        df[out_col] = df[id_col].astype("Int64").map(
-            lambda x: mapping.get(int(x)) if pd.notna(x) else None
-        )
-    except Exception:
-        # Fallback: just show the numeric ID
-        df[out_col] = df[id_col].astype(str)
+    ids = df[id_col].dropna().astype(int).unique().tolist()
+    if not ids:
+        df[out_col] = None
+        return df
+
+    look = playerid_reverse_lookup(ids, key_type="mlbam")
+    look["full_name"] = look["name_first"].fillna("") + " " + look["name_last"].fillna("")
+    mapping = dict(zip(look["key_mlbam"].astype(int), look["full_name"].str.strip()))
+
+    df[out_col] = df[id_col].astype("Int64").map(
+        lambda x: mapping.get(int(x)) if pd.notna(x) else None
+    )
     return df
+
 
 if __name__ == "__main__":
     model, feature_cols = load_model()
