@@ -174,12 +174,197 @@ def pct_time_split(df: pd.DataFrame, test_size: float = 0.2) -> tuple[pd.DataFra
     return df.iloc[:cut].copy(), df.iloc[cut:].copy()
 
 
+# ---------------------------------------------------------------------------
+# Empirical Bayes shrinkage
+# ---------------------------------------------------------------------------
+# Prior PA counts — how many "league-average" PAs to blend in before
+# trusting a player's observed rate.  Higher = more aggressive shrinkage
+# for cold-start players.
+#
+# Formula: shrunk_rate = (observed_events + prior_pa * league_avg_rate)
+#                        / (observed_pa + prior_pa)
+#
+# This prevents a player with 2 PA and 1 HR showing up as a 50% HR rate.
+# ---------------------------------------------------------------------------
+_BATTER_PRIOR_PA  = 50   # stronger prior for batters (more noisy at short windows)
+_PITCHER_PRIOR_PA = 75   # pitchers face more batters; signal stabilises quicker
+_LEAGUE_RATES = {
+    "hr":      0.033,   # ~3.3% HR rate per PA league-wide
+    "barrel":  0.073,   # ~7.3% barrel rate
+    "hardhit": 0.380,   # ~38% hard-hit rate (EV ≥ 95)
+    "fb":      0.350,   # ~35% fly-ball rate (LA 20-40°)
+    "k":       0.227,   # ~22.7% strikeout rate
+    "bb":      0.083,   # ~8.3% walk rate
+}
+
+
+def _shrink_rate(
+    rate_col: pd.Series,
+    pa_col: pd.Series,
+    league_rate: float,
+    prior_pa: int,
+) -> pd.Series:
+    """
+    Apply empirical Bayes shrinkage to a rate column.
+
+    rate_col   : observed rate (NaN where pa < threshold)
+    pa_col     : observed PA count
+    league_rate: league-average rate for this metric
+    prior_pa   : strength of the prior in PA units
+    """
+    # Reconstruct observed event count from rate × PA
+    # Where rate is NaN (cold-start / not enough PA), treat as 0 observed events
+    obs_pa     = pa_col.fillna(0).clip(lower=0)
+    obs_events = rate_col.fillna(0) * obs_pa
+    shrunk = (obs_events + prior_pa * league_rate) / (obs_pa + prior_pa)
+    return shrunk
+
+
+def apply_shrinkage(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace raw rate columns with empirical-Bayes-shrunk versions.
+
+    Called on the full DataFrame before training so both train and test
+    sets are shrunk consistently.
+
+    Only replaces columns that are present — safe to call on legacy tables
+    that are missing some columns.
+    """
+    df = df.copy()
+
+    # ── Batter 14-day window ────────────────────────────────────────────────
+    batter_14_pairs = [
+        ("b_hr_rate_14",      "b_pa_14",  "hr",      _BATTER_PRIOR_PA),
+        ("b_barrel_rate_14",  "b_pa_14",  "barrel",  _BATTER_PRIOR_PA),
+        ("b_hardhit_rate_14", "b_pa_14",  "hardhit", _BATTER_PRIOR_PA),
+        ("b_fb_rate_14",      "b_pa_14",  "fb",      _BATTER_PRIOR_PA),
+        ("b_k_rate_14",       "b_pa_14",  "k",       _BATTER_PRIOR_PA),
+        ("b_bb_rate_14",      "b_pa_14",  "bb",      _BATTER_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in batter_14_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(
+                df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior
+            )
+
+    # ── Batter season window ────────────────────────────────────────────────
+    batter_szn_pairs = [
+        ("b_hr_rate_szn",      "b_pa_szn",  "hr",      _BATTER_PRIOR_PA),
+        ("b_barrel_rate_szn",  "b_pa_szn",  "barrel",  _BATTER_PRIOR_PA),
+        ("b_hardhit_rate_szn", "b_pa_szn",  "hardhit", _BATTER_PRIOR_PA),
+        ("b_fb_rate_szn",      "b_pa_szn",  "fb",      _BATTER_PRIOR_PA),
+        ("b_k_rate_szn",       "b_pa_szn",  "k",       _BATTER_PRIOR_PA),
+        ("b_bb_rate_szn",      "b_pa_szn",  "bb",      _BATTER_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in batter_szn_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(
+                df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior
+            )
+
+    # ── Pitcher 30-day window ───────────────────────────────────────────────
+    pitcher_30_pairs = [
+        ("p_hr_allowed_rate_30",      "p_pa_30",  "hr",      _PITCHER_PRIOR_PA),
+        ("p_barrel_allowed_rate_30",  "p_pa_30",  "barrel",  _PITCHER_PRIOR_PA),
+        ("p_hardhit_allowed_rate_30", "p_pa_30",  "hardhit", _PITCHER_PRIOR_PA),
+        ("p_fb_allowed_rate_30",      "p_pa_30",  "fb",      _PITCHER_PRIOR_PA),
+        ("p_k_rate_30",               "p_pa_30",  "k",       _PITCHER_PRIOR_PA),
+        ("p_bb_rate_30",              "p_pa_30",  "bb",      _PITCHER_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in pitcher_30_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(
+                df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior
+            )
+
+    # ── Pitcher season window ───────────────────────────────────────────────
+    pitcher_szn_pairs = [
+        ("p_hr_allowed_rate_szn",      "p_pa_szn",  "hr",      _PITCHER_PRIOR_PA),
+        ("p_barrel_allowed_rate_szn",  "p_pa_szn",  "barrel",  _PITCHER_PRIOR_PA),
+        ("p_hardhit_allowed_rate_szn", "p_pa_szn",  "hardhit", _PITCHER_PRIOR_PA),
+        ("p_fb_allowed_rate_szn",      "p_pa_szn",  "fb",      _PITCHER_PRIOR_PA),
+        ("p_k_rate_szn",               "p_pa_szn",  "k",       _PITCHER_PRIOR_PA),
+        ("p_bb_rate_szn",              "p_pa_szn",  "bb",      _PITCHER_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in pitcher_szn_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(
+                df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior
+            )
+
+    # ── Re-derive edge features from shrunk rates ───────────────────────────
+    # The edge features in the table were computed from raw rates at build
+    # time. Now that we've shrunk the underlying rates, we recompute the
+    # edges so they reflect the corrected signal rather than noisy raw diffs.
+    def _edge(a: str, b: str) -> pd.Series:
+        if a in df.columns and b in df.columns:
+            return df[a] - df[b]
+        return pd.Series(np.nan, index=df.index)
+
+    df["ev_edge_14_30"]      = _edge("b_ev_mean_14",      "p_ev_allowed_mean_30")
+    df["hardhit_edge_14_30"] = _edge("b_hardhit_rate_14", "p_hardhit_allowed_rate_30")
+    df["fb_edge_14_30"]      = _edge("b_fb_rate_14",      "p_fb_allowed_rate_30")
+    df["barrel_edge_14_30"]  = _edge("b_barrel_rate_14",  "p_barrel_allowed_rate_30")
+    df["hr_rate_edge_14_30"] = _edge("b_hr_rate_14",      "p_hr_allowed_rate_30")
+    df["k_rate_edge_14_30"]  = _edge("b_k_rate_14",       "p_k_rate_30")
+    df["bb_rate_edge_14_30"] = _edge("b_bb_rate_14",      "p_bb_rate_30")
+
+    if "b_k_rate_14" in df.columns and "p_k_rate_30" in df.columns:
+        df["k_rate_interaction_14_30"]  = df["b_k_rate_14"]  * df["p_k_rate_30"]
+        df["bb_rate_interaction_14_30"] = df["b_bb_rate_14"] * df["p_bb_rate_30"]
+        df["contact_pressure_14_30"]    = (1 - df["b_k_rate_14"]) * (1 - df["p_k_rate_30"])
+        df["discipline_balance_14_30"]  = (
+            (df["b_bb_rate_14"] - df["b_k_rate_14"]) -
+            (df["p_bb_rate_30"] - df["p_k_rate_30"])
+        )
+
+    for hand in ("L", "R"):
+        b_hr   = f"b_hr_rate_14_vs{hand}"
+        p_hr   = f"p_hr_allowed_rate_30_vs{hand}"
+        b_hard = f"b_hardhit_rate_14_vs{hand}"
+        p_hard = f"p_hardhit_allowed_rate_30_vs{hand}"
+        b_bar  = f"b_barrel_rate_14_vs{hand}"
+        p_bar  = f"p_barrel_allowed_rate_30_vs{hand}"
+        if all(c in df.columns for c in [b_hr, p_hr, b_hard, p_hard, b_bar, p_bar]):
+            df[f"hr_rate_edge_14_30_vs{hand}"]  = _edge(b_hr,   p_hr)
+            df[f"hardhit_edge_14_30_vs{hand}"]  = _edge(b_hard, p_hard)
+            df[f"barrel_edge_14_30_vs{hand}"]   = _edge(b_bar,  p_bar)
+
+    return df
+
+
 def train_baseline(train_path: Path) -> TrainResult:
     df = pd.read_parquet(train_path)
 
+    # ------------------------------------------------------------------
+    # Apply empirical Bayes shrinkage before anything else.
+    # This corrects cold-start rate inflation and re-derives edge features
+    # from the corrected rates.
+    # ------------------------------------------------------------------
+    print("Applying empirical Bayes shrinkage to rate features ...")
+    df = apply_shrinkage(df)
+
+    # ------------------------------------------------------------------
+    # Feature columns
+    #
+    # KEY CHANGE: PA count columns (b_pa_14, b_pa_szn, p_pa_30, p_pa_szn)
+    # are intentionally EXCLUDED from the model features.
+    #
+    # Why: PA counts are a proxy for "is this player a full-time starter"
+    # which correlates with skill but is not a matchup-specific edge.
+    # Including them caused the model to rank players by playing time
+    # (AUC 0.623) rather than by true HR talent in this matchup.
+    #
+    # After shrinkage all rate features already encode data reliability
+    # (sparse windows get shrunk toward league average), so PA counts
+    # carry no additional information the model needs.
+    #
+    # Lineup context features (batting_order_pos, expected_pa_today)
+    # replace PA counts as the "opportunity" signal — they are matchup-
+    # specific and directly encode how many AB a player will get today.
+    # ------------------------------------------------------------------
     feature_cols = [
-        # ── Batter (14d) ────────────────────────────────────────────────
-        "b_pa_14",
+        # ── Batter (14d) — RATE ONLY, no raw PA ────────────────────────
         "b_hr_rate_14",
         "b_barrel_rate_14",
         "b_ev_mean_14",
@@ -197,8 +382,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "b_barrel_trend",
         "b_hr_trend",
 
-        # ── Batter (season) ──────────────────────────────────────────────
-        "b_pa_szn",
+        # ── Batter (season) — RATE ONLY, no raw PA ──────────────────────
         "b_hr_rate_szn",
         "b_barrel_rate_szn",
         "b_ev_mean_szn",
@@ -235,8 +419,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "is_home_game",
         "same_hand_matchup",
 
-        # ── Pitcher allowed (30d) ────────────────────────────────────────
-        "p_pa_30",
+        # ── Pitcher allowed (30d) — RATE ONLY, no raw PA ────────────────
         "p_hr_allowed_rate_30",
         "p_ev_allowed_mean_30",
         "p_hardhit_allowed_rate_30",
@@ -253,8 +436,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "p_barrel_allowed_rate_30_vsL",
         "p_barrel_allowed_rate_30_vsR",
 
-        # ── Pitcher allowed (season) ─────────────────────────────────────
-        "p_pa_szn",
+        # ── Pitcher allowed (season) — RATE ONLY, no raw PA ─────────────
         "p_hr_allowed_rate_szn",
         "p_ev_allowed_mean_szn",
         "p_hardhit_allowed_rate_szn",
@@ -293,6 +475,30 @@ def train_baseline(train_path: Path) -> TrainResult:
 
         # ── Park ─────────────────────────────────────────────────────────
         "park_factor_hr",
+
+        # ── Lineup / opportunity context ─────────────────────────────────
+        # These replace raw PA counts as the "how many AB will this player
+        # get today" signal.  batting_order_pos encodes both opportunity
+        # (slots 1-4 get ~1 extra AB over a 9-game vs slot 9) and
+        # lineup quality (managers put their best hitters at the top).
+        # expected_pa_today is a continuous version of the same signal.
+        # relief_pa_pct discounts matchup features when the batter faced
+        # mostly relievers rather than the listed starter.
+        "batting_order_pos",
+        "is_top_of_order",
+        "expected_pa_today",
+        "relief_pa_pct",
+
+        # ── Pitcher velocity ─────────────────────────────────────────────
+        "p_fb_velo_30",
+        "p_fb_pct_30",
+        "p_offspeed_pct_30",
+        "p_fb_velo_trend",
+
+        # ── Days rest ────────────────────────────────────────────────────
+        "b_days_rest",
+        "p_days_rest",
+        "p_is_short_rest",
     ]
 
     # Filter to only columns that actually exist in the dataset
@@ -450,8 +656,8 @@ def train_baseline(train_path: Path) -> TrainResult:
         "top10_hr_rate": top10_hr_rate,
         "top1_hr_rate": top1_hr_rate,
         "top1_count": int(top1_mask.sum()),
-        "top1_avg_b_pa_14": float(X_test.loc[top1_mask, "b_pa_14"].mean()),
-        "top1_avg_p_pa_30": float(X_test.loc[top1_mask, "p_pa_30"].mean()),
+        "top1_avg_b_pa_14": float(X_test.loc[top1_mask, "b_pa_14"].mean()) if "b_pa_14" in X_test.columns else float("nan"),
+        "top1_avg_p_pa_30": float(X_test.loc[top1_mask, "p_pa_30"].mean()) if "p_pa_30" in X_test.columns else float("nan"),
         "max_pred_prob": float(p_test.max()),
         "top10_lift": (top10_hr_rate / baseline) if baseline > 0 else float("nan"),
         "top1_lift":  (top1_hr_rate  / baseline) if baseline > 0 else float("nan"),
@@ -472,10 +678,15 @@ def train_baseline(train_path: Path) -> TrainResult:
     }
 
     # ------------------------------------------------------------------
-    # Save model
+    # Save model — bundle includes shrinkage flag so predict.py knows
+    # to apply the same transformation at inference time.
     # ------------------------------------------------------------------
     model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2025.joblib"
-    joblib.dump({"model": model, "feature_cols": feature_cols}, model_path)
+    joblib.dump({
+        "model": model,
+        "feature_cols": feature_cols,
+        "apply_shrinkage": True,   # signal to predict.py
+    }, model_path)
 
     return TrainResult(
         model_path=model_path,

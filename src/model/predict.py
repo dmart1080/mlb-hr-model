@@ -12,9 +12,6 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 # Maximum IDs to resolve in a single playerid_reverse_lookup call.
-# The pybaseball implementation fetches a static CSV from Chadwick Bureau;
-# splitting into chunks avoids hitting any implicit request-size limits while
-# still keeping the total number of HTTP round-trips low.
 _LOOKUP_CHUNK_SIZE = 500
 
 
@@ -46,7 +43,7 @@ def latest_train_table() -> Path:
 def load_model():
     """
     Load the best available model.  Preference order:
-      1. 2021-2025 LightGBM calibrated  (produced by new train.py)
+      1. 2021-2025 LightGBM calibrated
       2. 2021-2025 LogReg calibrated
       3. Legacy 2024 models
     """
@@ -61,7 +58,7 @@ def load_model():
         if path.exists():
             print(f"Loading model: {path.name}")
             bundle = joblib.load(path)
-            return bundle["model"], bundle["feature_cols"]
+            return bundle["model"], bundle["feature_cols"], bundle.get("apply_shrinkage", False)
 
     raise FileNotFoundError(
         "No trained model found in models/. Run src/model/train.py first."
@@ -71,12 +68,7 @@ def load_model():
 def _build_id_name_map(ids: list[int]) -> dict[int, str]:
     """
     Resolve a list of MLBAM IDs to full names using playerid_reverse_lookup.
-
-    FIX: the original code called playerid_reverse_lookup once per column,
-    which is fine, but the underlying pybaseball function downloads the full
-    Chadwick register CSV on every cold call (~3 MB).  This helper de-dupes
-    across both batter and pitcher columns and chunks large ID lists so a
-    single large slate (~300 matchups) doesn't trigger multiple full downloads.
+    De-dupes across both batter and pitcher columns to minimise HTTP calls.
     """
     if not ids:
         return {}
@@ -95,7 +87,6 @@ def _build_id_name_map(ids: list[int]) -> dict[int, str]:
                 dict(zip(look["key_mlbam"].astype(int), look["full_name"]))
             )
         except Exception as exc:
-            # Non-fatal — prediction still works without display names
             print(f"  ⚠️  playerid_reverse_lookup failed for chunk: {exc}")
 
     return mapping
@@ -115,20 +106,37 @@ def add_player_names(
 
 
 if __name__ == "__main__":
-    model, feature_cols = load_model()
+    model, feature_cols, apply_shrinkage = load_model()
     train_path = latest_train_table()
 
     df = pd.read_parquet(train_path)
     df["game_date"] = pd.to_datetime(df["game_date"])
 
+    # Apply the same empirical Bayes shrinkage used at training time.
+    # This ensures the feature distribution at inference matches what
+    # the model was calibrated on.  Without this, cold-start players
+    # would appear with inflated raw rates and get over-scored.
+    if apply_shrinkage:
+        from src.model.train import apply_shrinkage as _apply_shrinkage
+        print("Applying empirical Bayes shrinkage ...")
+        df = _apply_shrinkage(df)
+
     target_date = df["game_date"].max()
     today_df = df[df["game_date"] == target_date].copy()
+
+    # Keep only feature columns that exist in the current table
+    available_features = [c for c in feature_cols if c in today_df.columns]
+    missing = [c for c in feature_cols if c not in today_df.columns]
+    if missing:
+        print(f"⚠️  {len(missing)} feature(s) missing at inference — filling with 0:")
+        for c in missing:
+            print(f"     - {c}")
+            today_df[c] = 0.0
 
     X = today_df[feature_cols].fillna(0.0)
     today_df["hr_prob"] = model.predict_proba(X)[:, 1]
 
-    # FIX: collect ALL unique IDs from both columns in one pass, then build
-    # the name map once — avoids downloading the Chadwick CSV twice.
+    # Collect ALL unique IDs from both columns in one pass
     all_ids: list[int] = []
     for col in ("batter", "pitcher"):
         if col in today_df.columns:
@@ -143,8 +151,14 @@ if __name__ == "__main__":
 
     ranked = today_df.sort_values("hr_prob", ascending=False)
 
-    cols = ["batter_name", "pitcher_name", "hr_prob", "batter", "pitcher"]
-    cols = [c for c in cols if c in ranked.columns]
+    # Show lineup position alongside predictions so the impact of the
+    # batting_order_pos feature is transparent in the output.
+    display_cols = [
+        "batter_name", "pitcher_name", "hr_prob",
+        "batting_order_pos", "expected_pa_today",
+        "batter", "pitcher",
+    ]
+    cols = [c for c in display_cols if c in ranked.columns]
 
     print(f"\nTop HR candidates for {target_date.date()}:\n")
     print(ranked[cols].head(15).to_string(index=False))

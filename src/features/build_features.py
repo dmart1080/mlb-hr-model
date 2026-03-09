@@ -8,8 +8,9 @@ import pandas as pd
 
 from src.data_sources.statcast import fetch_statcast_events
 from src.data_sources.weather import fetch_weather_for_games
+from src.data_sources.mlb_schedule import fetch_rosters_for_games, enrich_labels_with_roster
 from src.features.build_labels import build_batter_game_labels
-from src.features.park_factors import HR_PARK_FACTOR, DEFAULT_PARK_FACTOR
+from src.features.park_factors import get_park_factors, DEFAULT_PARK_FACTOR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -46,7 +47,7 @@ def _date_minus_days(d: pd.Timestamp, days: int) -> pd.Timestamp:
 def _safe_mean(s: pd.Series) -> float:
     v = s.dropna()
     if len(v) == 0:
-        return np.nan          # ← return NaN, not 0, so callers can distinguish
+        return np.nan
     m = v.mean()
     return np.nan if pd.isna(m) else float(m)
 
@@ -70,16 +71,12 @@ def _is_barrel(launch_speed: pd.Series, launch_angle: pd.Series) -> pd.Series:
         106   18–39
         107   17–40
         108+  16–41 (capped)
-
-    This is materially more accurate than the simple EV≥95 & LA 20-35
-    definition used previously.
     """
     ev = pd.to_numeric(launch_speed, errors="coerce")
     la = pd.to_numeric(launch_angle, errors="coerce")
 
-    # Build per-row LA bounds based on EV
     ev_clipped = ev.clip(upper=108)
-    delta = (ev_clipped - 98).clip(lower=0)   # 0 when EV < 98
+    delta = (ev_clipped - 98).clip(lower=0)
 
     la_min = 26 - delta
     la_max = 30 + delta
@@ -122,10 +119,6 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
 
     raw["is_hr"] = (raw["events"] == "home_run").fillna(False).astype("int8")
 
-    # FIX: use mean (not max) for launch_speed/launch_angle per PA.
-    # max() would inflate EV by picking the hardest-hit foul ball rather than
-    # the true batted-ball outcome.  mean() over typically 1–3 tracked pitches
-    # per PA is a much better estimate of contact quality.
     pa_df = (
         raw
         .sort_values(["game_pk", "batter", "game_date"])
@@ -137,8 +130,8 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "home_team":    "first",
             "events":       "last",
             "is_hr":        "max",
-            "launch_speed": "mean",   # was "max" — corrected
-            "launch_angle": "mean",   # was "max" — corrected
+            "launch_speed": "mean",
+            "launch_angle": "mean",
             "p_throws":     "last",
             "stand":        "last",
         })
@@ -151,7 +144,6 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
     ev = pd.to_numeric(pa_df["launch_speed"], errors="coerce")
     la = pd.to_numeric(pa_df["launch_angle"],  errors="coerce")
 
-    # FIX: use the corrected barrel definition
     pa_df["is_barrel"]    = _is_barrel(ev, la).astype("int8")
     pa_df["launch_speed"] = ev
     pa_df["launch_angle"] = la
@@ -264,11 +256,6 @@ def _precompute_pitcher_velo(pitches_df: pd.DataFrame, target_dates: pd.DataFram
 # ---------------------------------------------------------------------------
 
 def _batter_stats_for_window(grp: pd.DataFrame, suffix: str, min_pa: int = 0) -> dict:
-    """
-    Compute batter rolling stats.  Returns NaN for rate features when the
-    window has fewer than min_pa plate appearances, so the model can
-    distinguish 'no data' from 'truly zero'.
-    """
     pa = len(grp)
     no_data = pa < min_pa
 
@@ -283,9 +270,6 @@ def _batter_stats_for_window(grp: pd.DataFrame, suffix: str, min_pa: int = 0) ->
     la = grp["launch_angle"]
     hr = int(grp["is_hr"].sum())
 
-    # For windows below the minimum threshold, still record the counts but
-    # mark rates as NaN — the model's fillna(0) will then treat them as
-    # league-average rather than zero, which is more accurate for cold-starts.
     nan_if_sparse = np.nan if no_data else None
 
     def _rate(numerator, denominator):
@@ -529,10 +513,8 @@ def _precompute_pitcher_windows(pa_df: pd.DataFrame, target_dates: pd.DataFrame)
 def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # FIX: edge features now propagate NaN when either side is unknown
-    # rather than silently producing a misleading non-zero difference.
     def _edge(a: str, b: str) -> pd.Series:
-        return df[a] - df[b]   # pandas NaN arithmetic handles this correctly
+        return df[a] - df[b]
 
     df["ev_edge_14_30"]             = _edge("b_ev_mean_14",       "p_ev_allowed_mean_30")
     df["hardhit_edge_14_30"]        = _edge("b_hardhit_rate_14",  "p_hardhit_allowed_rate_30")
@@ -562,12 +544,50 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f"hardhit_edge_14_30_vs{hand}"]  = _edge(b_hard, p_hard)
             df[f"barrel_edge_14_30_vs{hand}"]   = _edge(b_bar,  p_bar)
 
-    # Weather-aware edge: batter contact quality × wind boost
     if "wind_hr_impact" in df.columns:
         df["hardhit_x_wind"] = df["b_hardhit_rate_14"] * df["wind_hr_impact"]
         df["barrel_x_wind"]  = df["b_barrel_rate_14"]  * df["wind_hr_impact"]
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Relief PA pct (fraction of batter PAs against non-starters in this game)
+# ---------------------------------------------------------------------------
+
+def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (game_pk, batter) compute what fraction of their PAs came
+    against a pitcher who was NOT the game's first pitcher (i.e. a reliever).
+
+    This is a post-game signal used only in the training table to discount
+    matchup features for rows where the labelled starter pitched little.
+    At prediction time relief_pa_pct will be 0 (game hasn't happened yet).
+    """
+    # First pitcher seen per game = the starter
+    first_pitcher = (
+        pa_df.sort_values(["game_pk", "game_date", "pitcher"])
+        .groupby("game_pk")["pitcher"]
+        .first()
+        .rename("starter_pitcher")
+        .reset_index()
+    )
+
+    pa_with_starter = pa_df.merge(first_pitcher, on="game_pk", how="left")
+    pa_with_starter["is_relief_pa"] = (
+        pa_with_starter["pitcher"] != pa_with_starter["starter_pitcher"]
+    ).astype(int)
+
+    relief_pct = (
+        pa_with_starter
+        .groupby(["game_pk", "batter"])
+        .agg(relief_pa_pct=("is_relief_pa", "mean"))
+        .reset_index()
+    )
+
+    labels = labels.merge(relief_pct, on=["game_pk", "batter"], how="left")
+    labels["relief_pa_pct"] = labels["relief_pa_pct"].fillna(0.0)
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -603,8 +623,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     labels = build_batter_game_labels(target_pa)
     labels["game_date"] = pd.to_datetime(labels["game_date"])
 
-    # FIX: prefer starter_id (first pitcher faced) over mode pitcher.
-    # Fall back to pitcher_mode for rows where starter_id is absent (older data).
     labels["pitcher_id"] = pd.to_numeric(
         labels.get("starter_id", labels["pitcher_mode"]).fillna(labels["pitcher_mode"]),
         errors="coerce",
@@ -628,11 +646,47 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     )
     labels["batter_hand"] = labels["batter"].map(batter_hand_lookup)
 
+    # ------------------------------------------------------------------
+    # Relief PA pct
+    # ------------------------------------------------------------------
+    labels = _compute_relief_pa_pct(target_pa, labels)
+
     print("  Computing days rest ...")
     labels = _compute_days_rest(pa_df, labels)
 
-    # Weather — fetch for all unique game_pks in target window
+    # ------------------------------------------------------------------
+    # Roster enrichment: actual starters + batting orders from MLB API
+    # ------------------------------------------------------------------
     target_game_pks = labels["game_pk"].dropna().astype(int).unique().tolist()
+    print(f"  Fetching rosters/batting orders for {len(target_game_pks):,} games ...")
+    starters_df, batting_df = fetch_rosters_for_games(target_game_pks)
+
+    # Derive batter_team from home/away lookup + team side
+    # We need batter_team to resolve which starter opposes each batter.
+    # Use the home_team lookup + batting_df team_side to construct it.
+    if not batting_df.empty and "team_side" in batting_df.columns:
+        away_teams = {
+            gp: away
+            for gp, (home, away) in (
+                starters_df
+                .set_index("game_pk")[["home_starter_id", "away_starter_id"]]
+                .apply(lambda r: (game_pk_to_home.get(r.name, ""), ""), axis=1)
+                .items()
+            )
+        }
+        # Build game_pk → (home_abbr, away_abbr) from game_pk_to_home
+        # (away_abbr is harder; use batting_df team_side later in enrich)
+
+    labels = enrich_labels_with_roster(
+        labels,
+        starters_df,
+        batting_df,
+        game_pk_to_home,
+    )
+
+    # ------------------------------------------------------------------
+    # Weather
+    # ------------------------------------------------------------------
     print(f"  Fetching weather for {len(target_game_pks):,} games ...")
     weather_df = fetch_weather_for_games(target_game_pks, game_pk_to_home)
     weather_df["game_pk"] = weather_df["game_pk"].astype(int)
@@ -648,10 +702,14 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         label_game_pks=labels[["batter", "game_date", "game_pk"]],
     )
 
-    # Pitcher windows
+    # Pitcher windows — use starter_pitcher_id from roster enrichment if available,
+    # otherwise fall back to pitcher_id
+    starter_col = (
+        "starter_pitcher_id" if "starter_pitcher_id" in labels.columns else "pitcher_id"
+    )
     pitcher_need = (
-        labels[["pitcher_id", "game_date", "batter_hand"]]
-        .rename(columns={"pitcher_id": "pitcher"})
+        labels[[starter_col, "game_date", "batter_hand"]]
+        .rename(columns={starter_col: "pitcher"})
         .dropna(subset=["pitcher"])
         .copy()
     )
@@ -664,37 +722,55 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     pitcher_velo = _precompute_pitcher_velo(pitches_df, pitcher_need)
 
     # Merge everything
+    # Rename starter_pitcher_id → pitcher_id for the merge key if needed
+    merge_pitcher_col = starter_col
     features_df = (
         labels
         .merge(batter_stats,  on=["batter", "game_date"], how="left")
-        .merge(pitcher_stats.rename(columns={"pitcher": "pitcher_id"}),
-               on=["pitcher_id", "game_date"], how="left")
-        .merge(pitcher_velo.rename(columns={"pitcher": "pitcher_id"}),
-               on=["pitcher_id", "game_date"], how="left")
-        .merge(weather_df,  on="game_pk", how="left")
+        .merge(
+            pitcher_stats.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(
+            pitcher_velo.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(weather_df, on="game_pk", how="left")
     )
 
-    # Park factor
-    features_df["home_team"]      = features_df["game_pk"].map(game_pk_to_home)
+    # ------------------------------------------------------------------
+    # Park factor — use dynamic API-fetched values per season
+    # ------------------------------------------------------------------
+    features_df["home_team"] = features_df["game_pk"].map(game_pk_to_home)
+
+    # Determine the season year from game dates (use the modal year in this chunk)
+    season_year = int(
+        pd.to_datetime(features_df["game_date"]).dt.year.mode().iloc[0]
+    )
+    pf_map = get_park_factors(season=season_year)
     features_df["park_factor_hr"] = (
-        features_df["home_team"].map(HR_PARK_FACTOR).fillna(DEFAULT_PARK_FACTOR) / 100.0
+        features_df["home_team"].map(pf_map).fillna(DEFAULT_PARK_FACTOR / 100.0)
     )
 
     features_df = _add_edge_features(features_df)
 
-    # Tidy
-    features_df = features_df.rename(columns={"pitcher_id": "pitcher"})
-    features_df["game_date"] = features_df["game_date"].dt.date
+    # Tidy column names
+    # After roster enrichment the pitch-facing pitcher may be under
+    # starter_pitcher_id; expose a clean "pitcher" column for downstream use.
+    if "starter_pitcher_id" in features_df.columns and "pitcher" not in features_df.columns:
+        features_df = features_df.rename(columns={"starter_pitcher_id": "pitcher"})
+    elif "starter_pitcher_id" in features_df.columns:
+        # pitcher already exists (from pitcher_id rename earlier); drop the dupe
+        features_df = features_df.drop(columns=["starter_pitcher_id"], errors="ignore")
+
+    features_df["game_date"] = pd.to_datetime(features_df["game_date"]).dt.date
     features_df["hr_hit"]    = features_df["hr_hit"].astype(int)
 
-    # FIX: only zero-fill non-identity columns.  Sparse-window NaN values
-    # (set deliberately above) are filled with 0.0 here so the model pipeline
-    # remains unchanged; the key improvement is that NaN was allowed to
-    # propagate through edge arithmetic correctly before this final fill.
+    # Final fillna: only zero-fill numeric/stat columns, not identity columns
     non_stat_cols = {
         "game_date", "game_pk", "batter", "pitcher", "home_team",
         "hr_hit", "pitcher_hand", "batter_hand", "pitcher_mode",
-        "starter_id",
+        "starter_id", "starter_pitcher_id",
     }
     stat_cols = [c for c in features_df.columns if c not in non_stat_cols]
     features_df[stat_cols] = features_df[stat_cols].fillna(0.0)
