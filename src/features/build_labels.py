@@ -17,18 +17,33 @@ class LabelsBuildResult:
     output_path: Path
 
 
+def _identify_starter(group: pd.DataFrame) -> int | None:
+    """
+    Return the pitcher_id of the probable starter for a batter-game group.
+
+    Strategy: the starter is the pitcher who appeared earliest in the game
+    (lowest at_bat_number) among pitchers who faced this batter.  We use
+    at_bat_number as a proxy for inning/sequencing order.
+
+    If at_bat_number is unavailable we fall back to the mode (old behaviour).
+    """
+    if "at_bat_number" in group.columns and group["at_bat_number"].notna().any():
+        first_row = group.sort_values("at_bat_number").iloc[0]
+        return first_row["pitcher"]
+    # fallback
+    mode = group["pitcher"].mode()
+    return mode.iloc[0] if not mode.empty else group["pitcher"].iloc[0]
+
+
 def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert Statcast event-level rows into batter-game labels.
 
     Output: one row per (game_date, game_pk, batter) with:
-      - hr_hit          : 1 if batter hit at least one HR in that game
-      - pitcher_mode    : most-common pitcher faced (legacy fallback proxy)
-      - pa_count        : number of PAs observed for that batter in that game
-      - relief_pa_pct   : fraction of PAs faced against non-starter pitchers.
-                          Requires pitcher_is_starter to be set downstream
-                          (via enrich_labels_with_roster); defaults to 0.0
-                          until then and is recomputed in build_features.py.
+      - hr_hit       : 1 if the batter hit at least one HR in that game
+      - starter_id   : pitcher_id of the first pitcher faced (true starter proxy)
+      - pitcher_mode : pitcher faced most often (kept for back-compat)
+      - pa_count     : number of PAs observed for that batter in that game
     """
     required = {"game_date", "game_pk", "batter", "pitcher", "events"}
     missing = required - set(events_df.columns)
@@ -41,7 +56,7 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
         df["is_hr"] = (df["events"] == "home_run").fillna(False).astype("int8")
     df["events"] = df["events"].astype("string")
 
-    # Most common pitcher faced per batter-game (kept as fallback)
+    # --- pitcher_mode (legacy) ---
     pitcher_mode = (
         df.groupby(["game_date", "game_pk", "batter"])["pitcher"]
         .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[0])
@@ -49,7 +64,15 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Aggregate to one row per batter-game
+    # --- starter_id (new, preferred) ---
+    starter_id = (
+        df.groupby(["game_date", "game_pk", "batter"])
+        .apply(_identify_starter, include_groups=False)
+        .rename("starter_id")
+        .reset_index()
+    )
+
+    # --- aggregate to batter-game level ---
     labels = (
         df.groupby(["game_date", "game_pk", "batter"], as_index=False)
         .agg(
@@ -57,79 +80,8 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
             pa_count=("pitcher", "size"),
         )
         .merge(pitcher_mode, on=["game_date", "game_pk", "batter"], how="left")
+        .merge(starter_id,   on=["game_date", "game_pk", "batter"], how="left")
     )
-
-    # relief_pa_pct placeholder — will be filled properly in build_features.py
-    # once we know which pitcher is the starter for each game
-    labels["relief_pa_pct"] = 0.0
-
-    return labels
-
-
-def compute_relief_pa_pct(
-    labels: pd.DataFrame,
-    pa_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    For each batter-game, compute the fraction of plate appearances taken
-    against pitchers who are NOT the game's starting pitcher.
-
-    Parameters
-    ----------
-    labels : DataFrame
-        Must contain game_pk, batter, starter_pitcher_id columns.
-    pa_df  : DataFrame
-        Plate-appearance level data with game_pk, batter, pitcher columns.
-
-    Returns
-    -------
-    labels with relief_pa_pct filled in (0.0 where data is unavailable).
-    """
-    required_label_cols = {"game_pk", "batter", "starter_pitcher_id"}
-    if not required_label_cols.issubset(labels.columns):
-        return labels  # can't compute yet
-
-    pa = pa_df[["game_pk", "batter", "pitcher"]].copy()
-    pa["game_pk"] = pa["game_pk"].astype(int)
-    pa["batter"]  = pa["batter"].astype(int)
-    pa["pitcher"] = pa["pitcher"].astype(int)
-
-    merged = pa.merge(
-        labels[["game_pk", "batter", "starter_pitcher_id"]].dropna(
-            subset=["starter_pitcher_id"]
-        ).assign(
-            game_pk=lambda d: d["game_pk"].astype(int),
-            batter=lambda d: d["batter"].astype(int),
-            starter_pitcher_id=lambda d: d["starter_pitcher_id"].astype(int),
-        ),
-        on=["game_pk", "batter"],
-        how="inner",
-    )
-
-    merged["is_vs_starter"] = (
-        merged["pitcher"] == merged["starter_pitcher_id"]
-    ).astype(int)
-
-    relief_pct = (
-        merged.groupby(["game_pk", "batter"])
-        .agg(
-            total_pa=("pitcher", "size"),
-            starter_pa=("is_vs_starter", "sum"),
-        )
-        .assign(relief_pa_pct=lambda d: 1.0 - d["starter_pa"] / d["total_pa"])
-        .reset_index()[["game_pk", "batter", "relief_pa_pct"]]
-    )
-
-    labels = labels.copy()
-    labels["game_pk"] = labels["game_pk"].astype(int)
-    labels["batter"]  = labels["batter"].astype(int)
-
-    # Drop old placeholder and replace
-    if "relief_pa_pct" in labels.columns:
-        labels = labels.drop(columns=["relief_pa_pct"])
-
-    labels = labels.merge(relief_pct, on=["game_pk", "batter"], how="left")
-    labels["relief_pa_pct"] = labels["relief_pa_pct"].fillna(0.0)
 
     return labels
 
@@ -138,7 +90,10 @@ def run_build_labels(start_date: str, end_date: str) -> LabelsBuildResult:
     events = fetch_statcast_events(
         start_date=start_date,
         end_date=end_date,
-        columns=["game_date", "game_pk", "batter", "pitcher", "events"],
+        columns=[
+            "game_date", "game_pk", "batter", "pitcher",
+            "events", "at_bat_number",
+        ],
     ).df
 
     labels_df = build_batter_game_labels(events)

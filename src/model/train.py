@@ -158,15 +158,6 @@ def calendar_split(
     df: pd.DataFrame,
     test_start: str = TEST_START_DATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Hard calendar-based train/test split.
-
-    All rows with game_date < test_start  → train
-    All rows with game_date >= test_start → test
-
-    This is the correct split for a multi-year dataset: train on 2021-2024,
-    test on 2025 (out-of-time validation).
-    """
     df = df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"])
     cut = pd.Timestamp(test_start)
@@ -176,9 +167,6 @@ def calendar_split(
 
 
 def pct_time_split(df: pd.DataFrame, test_size: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Percentage-based time split (kept for internal calibration sub-split).
-    """
     df = df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"])
     df = df.sort_values("game_date").reset_index(drop=True)
@@ -190,7 +178,7 @@ def train_baseline(train_path: Path) -> TrainResult:
     df = pd.read_parquet(train_path)
 
     feature_cols = [
-        # ---- Batter (14d) -----------------------------------------------
+        # ── Batter (14d) ────────────────────────────────────────────────
         "b_pa_14",
         "b_hr_rate_14",
         "b_barrel_rate_14",
@@ -198,8 +186,18 @@ def train_baseline(train_path: Path) -> TrainResult:
         "b_la_mean_14",
         "b_hardhit_rate_14",
         "b_fb_rate_14",
+        "b_k_rate_14",
+        "b_bb_rate_14",
 
-        # ---- Batter (season) --------------------------------------------
+        # ── Batter (7d trend) ────────────────────────────────────────────
+        "b_ev_mean_7",
+        "b_hardhit_rate_7",
+        "b_ev_trend",
+        "b_hardhit_trend",
+        "b_barrel_trend",
+        "b_hr_trend",
+
+        # ── Batter (season) ──────────────────────────────────────────────
         "b_pa_szn",
         "b_hr_rate_szn",
         "b_barrel_rate_szn",
@@ -208,15 +206,54 @@ def train_baseline(train_path: Path) -> TrainResult:
         "b_hardhit_rate_szn",
         "b_fb_rate_szn",
 
-        # ---- Pitcher allowed (30d) — starter only -----------------------
+        # ── Batter platoon splits (14d) ──────────────────────────────────
+        "b_hr_rate_14_vsL",
+        "b_hr_rate_14_vsR",
+        "b_hardhit_rate_14_vsL",
+        "b_hardhit_rate_14_vsR",
+        "b_barrel_rate_14_vsL",
+        "b_barrel_rate_14_vsR",
+
+        # ── Batter platoon splits (season) ───────────────────────────────
+        "b_hr_rate_szn_vsL",
+        "b_hr_rate_szn_vsR",
+        "b_hardhit_rate_szn_vsL",
+        "b_hardhit_rate_szn_vsR",
+        "b_barrel_rate_szn_vsL",
+        "b_barrel_rate_szn_vsR",
+
+        # ── Batter home/away splits ──────────────────────────────────────
+        "b_hr_rate_home",
+        "b_hr_rate_away",
+        "b_hr_rate_home_edge",
+        "b_hardhit_rate_home",
+        "b_hardhit_rate_away",
+        "b_barrel_rate_home",
+        "b_barrel_rate_away",
+
+        # ── Game context ─────────────────────────────────────────────────
+        "is_home_game",
+        "same_hand_matchup",
+
+        # ── Pitcher allowed (30d) ────────────────────────────────────────
         "p_pa_30",
         "p_hr_allowed_rate_30",
         "p_ev_allowed_mean_30",
         "p_hardhit_allowed_rate_30",
         "p_fb_allowed_rate_30",
         "p_barrel_allowed_rate_30",
+        "p_k_rate_30",
+        "p_bb_rate_30",
 
-        # ---- Pitcher allowed (season) — starter only --------------------
+        # ── Pitcher platoon splits (30d) ─────────────────────────────────
+        "p_hr_allowed_rate_30_vsL",
+        "p_hr_allowed_rate_30_vsR",
+        "p_hardhit_allowed_rate_30_vsL",
+        "p_hardhit_allowed_rate_30_vsR",
+        "p_barrel_allowed_rate_30_vsL",
+        "p_barrel_allowed_rate_30_vsR",
+
+        # ── Pitcher allowed (season) ─────────────────────────────────────
         "p_pa_szn",
         "p_hr_allowed_rate_szn",
         "p_ev_allowed_mean_szn",
@@ -224,18 +261,12 @@ def train_baseline(train_path: Path) -> TrainResult:
         "p_fb_allowed_rate_szn",
         "p_barrel_allowed_rate_szn",
 
-        # ---- Edge (batter 14d vs starter 30d) ---------------------------
+        # ── Edge features (batter 14d vs pitcher 30d) ────────────────────
         "ev_edge_14_30",
         "hardhit_edge_14_30",
         "fb_edge_14_30",
         "barrel_edge_14_30",
         "hr_rate_edge_14_30",
-
-        # ---- K/BB discipline --------------------------------------------
-        "b_k_rate_14",
-        "b_bb_rate_14",
-        "p_k_rate_30",
-        "p_bb_rate_30",
         "k_rate_edge_14_30",
         "bb_rate_edge_14_30",
         "k_rate_interaction_14_30",
@@ -243,59 +274,40 @@ def train_baseline(train_path: Path) -> TrainResult:
         "contact_pressure_14_30",
         "discipline_balance_14_30",
 
-        # ---- Context ----------------------------------------------------
+        # ── Platoon-aware edge features ──────────────────────────────────
+        "hr_rate_edge_14_30_vsL",
+        "hr_rate_edge_14_30_vsR",
+        "hardhit_edge_14_30_vsL",
+        "hardhit_edge_14_30_vsR",
+        "barrel_edge_14_30_vsL",
+        "barrel_edge_14_30_vsR",
+
+        # ── Weather ──────────────────────────────────────────────────────
+        "temp_f",
+        "wind_hr_impact",
+        "wind_out_strong",
+        "wind_in_strong",
+        "temp_above_75",
+        "temp_above_85",
+        "is_indoor",
+
+        # ── Park ─────────────────────────────────────────────────────────
         "park_factor_hr",
-
-        # ---- Pitcher assignment quality ---------------------------------
-        # Fraction of in-game PAs the batter took against the starter.
-        # High relief_pa_pct means the starter-based matchup features are
-        # noisier (batter actually faced a lot of relievers).
-        "relief_pa_pct",
-
-        # ---- Lineup context (NEW) ---------------------------------------
-        # batting_order_pos: 1–9 raw slot; 0 when unknown.
-        # is_top_of_order:   1 if slots 1–4 (more PA, more HR opportunity).
-        # expected_pa_today: continuous proxy for plate-appearance volume
-        #                    derived from historical PA-by-lineup-slot averages.
-        "batting_order_pos",
-        "is_top_of_order",
-        "expected_pa_today",
-
-        # ---- Lineup protection (NEW) ------------------------------------
-        # OPS-proxy of the hitter directly ahead/behind in the order.
-        # Higher protection_ops_ahead → pitcher more likely to throw strikes
-        # to avoid putting runners on ahead of a dangerous hitter.
-        # lineup_ops_context → overall quality of the lineup surrounding batter.
-        "protection_ops_ahead",
-        "protection_ops_behind",
-        "lineup_ops_context",
-
-        # ---- Bullpen quality (NEW) --------------------------------------
-        # Rolling 30d stats for the opposing team's bullpen (non-starters).
-        # bp_hr_rate_x_relief_pct: interaction — bullpen quality only matters
-        # when the batter actually faces relievers (high relief_pa_pct).
-        "bp_hr_allowed_rate_30",
-        "bp_hardhit_allowed_rate_30",
-        "bp_bb_rate_30",
-        "bp_era_proxy_30",
-        "bp_hr_rate_x_relief_pct",
     ]
 
-    # Gracefully drop any feature that isn't in the table yet
-    # (allows reuse of legacy train tables built without new features).
+    # Filter to only columns that actually exist in the dataset
     available = set(df.columns)
     missing_features = [c for c in feature_cols if c not in available]
     if missing_features:
-        print(
-            f"⚠️  The following features are absent from the training table and "
-            f"will be excluded this run:\n    {missing_features}\n"
-            f"   Rebuild the feature table to include them."
-        )
+        print(f"⚠️  Dropping {len(missing_features)} feature(s) not found in table:")
+        for c in missing_features:
+            print(f"     - {c}")
     feature_cols = [c for c in feature_cols if c in available]
 
-    missing_required = [c for c in ["hr_hit", "game_date"] if c not in df.columns]
-    if missing_required:
-        raise ValueError(f"Missing required columns in training table: {missing_required}")
+    required_cols = feature_cols + ["hr_hit", "game_date"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in training table: {missing}")
 
     # ------------------------------------------------------------------
     # Calendar split: train=2021-2024, test=2025
@@ -333,6 +345,8 @@ def train_baseline(train_path: Path) -> TrainResult:
     X_test = test_df[feature_cols].fillna(0.0)
     y_test = test_df["hr_hit"].astype(int)
 
+    print(f"\nFeature count: {len(feature_cols)}")
+
     # ------------------------------------------------------------------
     # Logistic Regression
     # ------------------------------------------------------------------
@@ -351,17 +365,27 @@ def train_baseline(train_path: Path) -> TrainResult:
     # LightGBM
     # ------------------------------------------------------------------
     lgbm = LGBMClassifier(
-        n_estimators=400,
-        learning_rate=0.05,
-        num_leaves=15,
-        min_child_samples=200,
-        subsample=0.7,
-        colsample_bytree=0.7,
-        reg_lambda=5.0,
+        n_estimators=1000,
+        learning_rate=0.02,
+        num_leaves=31,
+        min_child_samples=300,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.6,
+        reg_alpha=0.1,
+        reg_lambda=10.0,
+        min_split_gain=0.01,
         random_state=42,
         verbosity=-1,
     )
-    lgbm.fit(X_train_core, y_train_core)
+    from lightgbm import early_stopping, log_evaluation
+    lgbm.fit(
+        X_train_core, y_train_core,
+        eval_set=[(X_calib, y_calib)],
+        eval_metric="auc",
+        callbacks=[early_stopping(50, verbose=False), log_evaluation(period=-1)],
+    )
+    print(f"LightGBM best iteration: {lgbm.best_iteration_}")
     p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
     roc_lgbm_raw = float(roc_auc_score(y_test, p_test_lgbm_raw))
     print(f"LightGBM (raw) ROC-AUC: {roc_lgbm_raw:.3f}")
@@ -391,11 +415,22 @@ def train_baseline(train_path: Path) -> TrainResult:
         model = calibrated_lgbm
         p_test = calibrated_lgbm.predict_proba(X_test)[:, 1]
         chosen_name = "lightgbm_calibrated"
+
+        # Print top 20 feature importances
+        importances = pd.Series(lgbm.feature_importances_, index=feature_cols)
+        print("\nTop 20 features by importance:")
+        print(importances.sort_values(ascending=False).head(20).to_string())
     else:
         print("Chosen model: LogReg")
         model = calibrated_lr
         p_test = calibrated_lr.predict_proba(X_test)[:, 1]
         chosen_name = "logreg_calibrated"
+
+        # Print top 20 LR coefficients by absolute value
+        lr_model = base_pipeline.named_steps["lr"]
+        coefs = pd.Series(np.abs(lr_model.coef_[0]), index=feature_cols)
+        print("\nTop 20 features by |coefficient|:")
+        print(coefs.sort_values(ascending=False).head(20).to_string())
 
     # ------------------------------------------------------------------
     # Lift / bucket stats

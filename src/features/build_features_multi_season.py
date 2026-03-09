@@ -33,7 +33,7 @@ SEASONS = [
 #   TEST_MODE = True   → builds 2025-03-27 → 2025-04-30 only
 #   TEST_MODE = False  → builds all seasons defined in SEASONS above
 # ---------------------------------------------------------------------------
-TEST_MODE = True
+TEST_MODE = False
 TEST_RANGE = ("2025-03-27", "2025-04-30")
 
 
