@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import glob
 import joblib
 import pandas as pd
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from pybaseball.playerid_lookup import playerid_reverse_lookup
 
@@ -105,6 +109,116 @@ def add_player_names(
     return df
 
 
+def _format_american_odds(odds_val) -> str:
+    """Format American odds for display, handling NaN gracefully."""
+    try:
+        v = int(odds_val)
+        return f"{v:+d}" if v > 0 else str(v)
+    except (TypeError, ValueError):
+        return "  n/a"
+
+
+def _format_pct(val, decimals: int = 1) -> str:
+    """Format a 0-1 probability as a percentage string."""
+    try:
+        return f"{float(val)*100:.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "   n/a"
+
+
+def _format_edge(val) -> str:
+    """Format edge as signed percentage points."""
+    try:
+        pp = float(val) * 100
+        sign = "+" if pp >= 0 else ""
+        return f"{sign}{pp:.1f}pp"
+    except (TypeError, ValueError):
+        return "    n/a"
+
+
+def print_ranked_table(ranked: pd.DataFrame, has_odds: bool) -> None:
+    """
+    Pretty-print the top HR candidates.
+
+    Without odds:  batter | pitcher | model_prob | lineup pos
+    With odds:     above + market_over_price | market_fair_prob | edge
+    """
+    TOP_N = 20
+
+    if has_odds:
+        # Sort by edge (model edge over market) for value-focused view.
+        # Separate batters with/without odds lines so no-line players
+        # don't pollute the edge-sorted view.
+        has_line   = ranked[ranked["edge"].notna()].copy()
+        no_line    = ranked[ranked["edge"].isna()].copy()
+
+        has_line = has_line.sort_values("edge", ascending=False)
+        no_line  = no_line.sort_values("hr_prob", ascending=False)
+
+        print(f"\n{'='*85}")
+        print(f"  TOP HR CANDIDATES WITH ODDS EDGE")
+        print(f"{'='*85}")
+        print(
+            f"  {'Batter':<24} {'Pitcher':<22} "
+            f"{'Model':>7} {'Market':>8} {'Fair':>7} {'Edge':>8}  {'Book':>4}"
+        )
+        print(f"  {'-'*24} {'-'*22} {'-'*7} {'-'*8} {'-'*7} {'-'*8}  {'-'*4}")
+
+        shown = 0
+        for _, row in has_line.head(TOP_N).iterrows():
+            batter  = str(row.get("batter_name", ""))[:24]
+            pitcher = str(row.get("pitcher_name", ""))[:22]
+            model   = _format_pct(row.get("hr_prob"))
+            mkt     = _format_american_odds(row.get("market_over_price"))
+            fair    = _format_pct(row.get("market_fair_prob"))
+            edge    = _format_edge(row.get("edge"))
+            book    = str(row.get("odds_bookmaker", ""))[:4].upper()
+            print(
+                f"  {batter:<24} {pitcher:<22} "
+                f"{model:>7} {mkt:>8} {fair:>7} {edge:>8}  {book:<4}"
+            )
+            shown += 1
+
+        remaining = TOP_N - shown
+        if remaining > 0 and len(no_line) > 0:
+            print(f"\n  — No line available (model rank only) —")
+            for _, row in no_line.head(remaining).iterrows():
+                batter  = str(row.get("batter_name", ""))[:24]
+                pitcher = str(row.get("pitcher_name", ""))[:22]
+                model   = _format_pct(row.get("hr_prob"))
+                pos     = row.get("batting_order_pos", 0)
+                print(f"  {batter:<24} {pitcher:<22} {model:>7}   (slot {pos})")
+
+        print(f"{'='*85}")
+        print(
+            "  Edge = model probability minus fair market probability (vig-removed).\n"
+            "  Positive edge = model more bullish than market.\n"
+            "  Market line is 0.5 HRs over/under unless noted."
+        )
+
+    else:
+        # Original display — no odds available
+        print(f"\n{'='*70}")
+        print(f"  TOP HR CANDIDATES (no odds data)")
+        print(f"{'='*70}")
+        print(
+            f"  {'Batter':<26} {'Pitcher':<24} "
+            f"{'Model':>7}  {'Slot':>4}  {'xPA':>5}"
+        )
+        print(f"  {'-'*26} {'-'*24} {'-'*7}  {'-'*4}  {'-'*5}")
+
+        top = ranked.sort_values("hr_prob", ascending=False).head(TOP_N)
+        for _, row in top.iterrows():
+            batter  = str(row.get("batter_name", ""))[:26]
+            pitcher = str(row.get("pitcher_name", ""))[:24]
+            model   = _format_pct(row.get("hr_prob"))
+            pos     = int(row.get("batting_order_pos", 0))
+            xpa     = f"{float(row.get('expected_pa_today', 0)):.1f}"
+            print(f"  {batter:<26} {pitcher:<24} {model:>7}  {pos:>4}  {xpa:>5}")
+
+        print(f"{'='*70}")
+
+
 if __name__ == "__main__":
     model, feature_cols, apply_shrinkage = load_model()
     train_path = latest_train_table()
@@ -113,9 +227,6 @@ if __name__ == "__main__":
     df["game_date"] = pd.to_datetime(df["game_date"])
 
     # Apply the same empirical Bayes shrinkage used at training time.
-    # This ensures the feature distribution at inference matches what
-    # the model was calibrated on.  Without this, cold-start players
-    # would appear with inflated raw rates and get over-scored.
     if apply_shrinkage:
         from src.model.train import apply_shrinkage as _apply_shrinkage
         print("Applying empirical Bayes shrinkage ...")
@@ -125,7 +236,6 @@ if __name__ == "__main__":
     today_df = df[df["game_date"] == target_date].copy()
 
     # Keep only feature columns that exist in the current table
-    available_features = [c for c in feature_cols if c in today_df.columns]
     missing = [c for c in feature_cols if c not in today_df.columns]
     if missing:
         print(f"⚠️  {len(missing)} feature(s) missing at inference — filling with 0:")
@@ -136,29 +246,57 @@ if __name__ == "__main__":
     X = today_df[feature_cols].fillna(0.0)
     today_df["hr_prob"] = model.predict_proba(X)[:, 1]
 
-    # Collect ALL unique IDs from both columns in one pass
+    # Resolve player names
     all_ids: list[int] = []
     for col in ("batter", "pitcher"):
         if col in today_df.columns:
-            all_ids.extend(
-                today_df[col].dropna().astype(int).unique().tolist()
-            )
+            all_ids.extend(today_df[col].dropna().astype(int).unique().tolist())
     id_name_map = _build_id_name_map(all_ids)
 
     today_df = add_player_names(today_df, id_name_map, "batter",  "batter_name")
     if "pitcher" in today_df.columns:
         today_df = add_player_names(today_df, id_name_map, "pitcher", "pitcher_name")
 
-    ranked = today_df.sort_values("hr_prob", ascending=False)
+    ranked = today_df.sort_values("hr_prob", ascending=False).reset_index(drop=True)
 
-    # Show lineup position alongside predictions so the impact of the
-    # batting_order_pos feature is transparent in the output.
-    display_cols = [
-        "batter_name", "pitcher_name", "hr_prob",
-        "batting_order_pos", "expected_pa_today",
-        "batter", "pitcher",
-    ]
-    cols = [c for c in display_cols if c in ranked.columns]
+    # ------------------------------------------------------------------
+    # Odds enrichment — gracefully skipped if key is missing or API is down
+    # ------------------------------------------------------------------
+    date_str = str(target_date.date())
+    has_odds = False
 
-    print(f"\nTop HR candidates for {target_date.date()}:\n")
-    print(ranked[cols].head(15).to_string(index=False))
+    odds_api_key = os.environ.get("ODDS_API_KEY")
+    if odds_api_key:
+        try:
+            from src.data_sources.odds import enrich_predictions_with_odds
+            ranked = enrich_predictions_with_odds(
+                ranked,
+                date_str,
+                api_key=odds_api_key,
+            )
+            has_odds = ranked["edge"].notna().any()
+        except Exception as e:
+            print(f"⚠️  Odds enrichment failed: {e}")
+    else:
+        print(
+            "ℹ️  No ODDS_API_KEY found — running without odds data.\n"
+            "   Set the env var to enable edge detection:\n"
+            "     export ODDS_API_KEY=your_key_here"
+        )
+
+    print(f"\nPredictions for {date_str}:")
+    print_ranked_table(ranked, has_odds=has_odds)
+
+    # ------------------------------------------------------------------
+    # Save today's predictions to CSV for later odds-vs-outcome analysis
+    # ------------------------------------------------------------------
+    save_cols = ["batter_name", "pitcher_name", "hr_prob", "batter", "pitcher",
+                 "batting_order_pos", "expected_pa_today"]
+    if has_odds:
+        save_cols += ["market_over_price", "market_fair_prob", "edge", "odds_bookmaker"]
+
+    out_dir = PROJECT_ROOT / "data" / "predictions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"predictions_{date_str}.csv"
+    ranked[[c for c in save_cols if c in ranked.columns]].to_csv(out_path, index=False)
+    print(f"\n  Saved: {out_path.relative_to(PROJECT_ROOT)}")
