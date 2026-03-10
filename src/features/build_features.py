@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math as _math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,8 @@ from src.features.build_features_fast import (
     precompute_pitcher_windows_fast,
     precompute_pitcher_velo_fast,
 )
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -118,6 +122,10 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
     )
     pa_df["game_date"] = pa_df["game_date"].astype("datetime64[ns]")
 
+    logger.info(
+        "Events loaded: %d pitches, %d PAs (start=%s end=%s)",
+        len(pitches_df), len(pa_df), start_date, end_date,
+    )
     return pitches_df, pa_df
 
 
@@ -165,7 +173,7 @@ def fetch_weather_for_games_fast(
     """
     Parallel replacement for weather.fetch_weather_for_games.
     Only un-cached games are fetched concurrently; cached reads stay in the
-    main thread.  Removes the sequential sleep(0.05)/game dead time.
+    main thread.
     """
     import json
     from src.data_sources.weather import (
@@ -183,6 +191,11 @@ def fetch_weather_for_games_fast(
     ]
     fetch_pks = [gp for gp in unique_pks if gp not in set(cached_pks)]
 
+    logger.info(
+        "Weather fetch (parallel): %d games (%d cached, %d to fetch)",
+        len(unique_pks), len(cached_pks), len(fetch_pks),
+    )
+
     results: dict[int, dict] = {}
 
     for gp in cached_pks:
@@ -190,6 +203,7 @@ def fetch_weather_for_games_fast(
             results[gp] = json.load(f)
 
     if fetch_pks:
+        failed: list[int] = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_pk = {
                 pool.submit(
@@ -205,12 +219,22 @@ def fetch_weather_for_games_fast(
                 gp = future_to_pk[future]
                 try:
                     results[gp] = future.result()
+                    if results[gp].get("_error"):
+                        failed.append(gp)
                 except Exception as e:
+                    logger.error("Weather future failed game_pk=%d: %s", gp, e)
                     results[gp] = _neutral_weather(gp, error=str(e))
+                    failed.append(gp)
                 done += 1
                 if done % 100 == 0:
-                    print(f"    Weather: {done}/{len(fetch_pks)} games fetched ...")
-        print(f"    Weather: {len(fetch_pks)}/{len(fetch_pks)} games fetched ...")
+                    logger.info("Weather: %d/%d fetched ...", done, len(fetch_pks))
+
+        logger.info("Weather: %d/%d fetched", len(fetch_pks), len(fetch_pks))
+        if failed:
+            logger.warning(
+                "Weather unavailable for %d game(s) — neutral values used: %s",
+                len(failed), failed[:10],
+            )
 
     rows = []
     for gp in unique_pks:
@@ -244,13 +268,6 @@ def fetch_weather_for_games_fast(
 def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     """
     Fraction of each batter's PAs in a game against non-starters.
-
-    Uses the per-batter starter_pitcher_id from enrich_labels_with_roster,
-    which already resolves the correct opposing starter for each batter.
-    We join on (game_pk, batter) so each batter is compared against their
-    own opposing starter — not a single game-level starter that would be
-    wrong for half the batters.
-
     Must be called AFTER enrich_labels_with_roster.
     """
     labels = labels.copy()
@@ -263,8 +280,6 @@ def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.Data
     pa["pitcher"] = pa["pitcher"].astype(int)
 
     if "starter_pitcher_id" in labels.columns:
-        # Per-batter starter: join on (game_pk, batter) so each batter
-        # gets their own opposing starter, not a shared game-level value
         batter_starter = (
             labels[["game_pk", "batter", "starter_pitcher_id"]]
             .dropna(subset=["starter_pitcher_id"])
@@ -278,7 +293,9 @@ def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.Data
             (pa["pitcher"] != pa["starter_pitcher_id"]).astype("boolean").fillna(False).astype(int),
         )
     else:
-        # Fallback: first pitcher by at_bat_number as game-level starter
+        logger.warning(
+            "starter_pitcher_id not found in labels — using first pitcher as game-level starter"
+        )
         first_pitcher = (
             pa.sort_values(["game_pk", "at_bat_number"])
             .groupby("game_pk")["pitcher"]
@@ -359,7 +376,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     end_dt   = _to_date(end_date)
     history_start = _date_minus_days(start_dt, 60)
 
-    print(f"  Loading events {history_start.date()} → {end_dt.date()} ...")
+    logger.info(
+        "build_features_for_range: %s -> %s (history from %s)",
+        start_date, end_date, history_start.date(),
+    )
+
+    logger.info("Loading events %s -> %s ...", history_start.date(), end_dt.date())
     pitches_df, pa_df = _load_and_clean_events(
         start_date=history_start.strftime("%Y-%m-%d"),
         end_date=end_dt.strftime("%Y-%m-%d"),
@@ -372,11 +394,16 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .to_dict()
     )
 
-    batter_team_lookup: dict = {}  # populated after roster enrichment below
+    batter_team_lookup: dict[int, str] = {}
 
     target_pa = pa_df[pa_df["game_date"].between(start_dt, end_dt)]
     labels = build_batter_game_labels(target_pa)
     labels["game_date"] = pd.to_datetime(labels["game_date"])
+
+    logger.info(
+        "Labels built: %d batter-game rows, HR rate=%.4f",
+        len(labels), labels["hr_hit"].mean(),
+    )
 
     labels["pitcher_id"] = pd.to_numeric(
         labels.get("starter_id", labels["pitcher_mode"]).fillna(labels["pitcher_mode"]),
@@ -401,21 +428,16 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     )
     labels["batter_hand"] = labels["batter"].map(batter_hand_lookup)
 
-    print("  Computing days rest ...")
+    logger.info("Computing days rest ...")
     labels = _compute_days_rest(pa_df, labels)
 
     # ------------------------------------------------------------------
     # Roster enrichment
     # ------------------------------------------------------------------
     target_game_pks = labels["game_pk"].dropna().astype(int).unique().tolist()
-    print(f"  Fetching rosters/batting orders for {len(target_game_pks):,} games ...")
+    logger.info("Fetching rosters/batting orders for %d games ...", len(target_game_pks))
     starters_df, batting_df = fetch_rosters_for_games(target_game_pks)
-    # ------------------------------------------------------------------
-    # Build batter_team_lookup from batting_df["team_side"] — the only
-    # reliable source. pa_df["home_team"] is the game's home team for ALL
-    # rows regardless of which side the batter plays for, so the old modal
-    # heuristic assigned every batter to the home team.
-    # ------------------------------------------------------------------
+
     if not batting_df.empty and "team_side" in batting_df.columns:
         home_games_per_batter = (
             pa_df[pa_df["game_date"].between(start_dt, end_dt)]
@@ -437,17 +459,14 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                 if t and t != home_abbr:
                     batter_team_lookup[row.batter] = t
 
-    # Now that batter_team_lookup is populated, assign batter_team to labels
-    # so _resolve_starter can pick the correct opposing starter per batter.
+    logger.debug("batter_team_lookup populated for %d batters", len(batter_team_lookup))
+
     labels["batter_team"] = labels["batter"].map(batter_team_lookup)
-
     labels = enrich_labels_with_roster(labels, starters_df, batting_df, game_pk_to_home)
-
-    # relief_pa_pct — must come after roster enrichment so starter_pitcher_id exists
     labels = _compute_relief_pa_pct(target_pa, labels)
 
     # ------------------------------------------------------------------
-    # Weather — parallelised
+    # Weather
     # ------------------------------------------------------------------
     game_dates_map = (
         labels.drop_duplicates("game_pk")
@@ -455,7 +474,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .apply(lambda d: str(pd.Timestamp(d).date()))
         .to_dict()
     )
-    print(f"  Fetching weather for {len(target_game_pks):,} games ...")
     weather_df = fetch_weather_for_games_fast(
         target_game_pks,
         game_pk_to_home,
@@ -464,10 +482,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     weather_df["game_pk"] = weather_df["game_pk"].astype(int)
 
     # ------------------------------------------------------------------
-    # Batter windows — vectorised
+    # Batter windows
     # ------------------------------------------------------------------
     n_b = labels[["batter", "game_date"]].drop_duplicates().shape[0]
-    print(f"  Precomputing batter windows for {n_b:,} (batter, date) pairs ...")
+    logger.info("Precomputing batter windows for %d (batter, date) pairs ...", n_b)
     batter_stats = precompute_batter_windows_fast(
         pa_df,
         labels[["batter", "game_date", "pitcher_hand"]],
@@ -477,7 +495,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     )
 
     # ------------------------------------------------------------------
-    # Pitcher windows — vectorised
+    # Pitcher windows
     # ------------------------------------------------------------------
     starter_col = (
         "starter_pitcher_id" if "starter_pitcher_id" in labels.columns else "pitcher_id"
@@ -491,10 +509,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     pitcher_need["pitcher"] = pitcher_need["pitcher"].astype(int)
     n_p = pitcher_need[["pitcher", "game_date"]].drop_duplicates().shape[0]
 
-    print(f"  Precomputing pitcher PA windows for {n_p:,} (pitcher, date) pairs ...")
+    logger.info("Precomputing pitcher PA windows for %d (pitcher, date) pairs ...", n_p)
     pitcher_stats = precompute_pitcher_windows_fast(pa_df, pitcher_need)
 
-    print(f"  Precomputing pitcher velo windows for {n_p:,} (pitcher, date) pairs ...")
+    logger.info("Precomputing pitcher velo windows for %d (pitcher, date) pairs ...", n_p)
     pitcher_velo = precompute_pitcher_velo_fast(pitches_df, pitcher_need)
 
     # ------------------------------------------------------------------
@@ -517,9 +535,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     # Park factor
     features_df["home_team"] = features_df["game_pk"].map(game_pk_to_home)
-    # Clean up string columns — replace float NaNs with None so
-    # pyarrow can serialise the object column to parquet.
-    import math as _math
     for _str_col in ("batter_team", "home_team", "pitcher_hand", "batter_hand"):
         if _str_col in features_df.columns:
             features_df[_str_col] = features_df[_str_col].apply(
@@ -529,6 +544,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                     or str(v) in ("nan", "None", "<NA>", "0.0", "0")
                 ) else str(v)
             )
+
     season_year = int(pd.to_datetime(features_df["game_date"]).dt.year.mode().iloc[0])
     pf_map = get_park_factors(season=season_year)
     features_df["park_factor_hr"] = (
@@ -537,7 +553,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     features_df = _add_edge_features(features_df)
 
-    # Tidy pitcher column
     if "starter_pitcher_id" in features_df.columns and "pitcher" not in features_df.columns:
         features_df = features_df.rename(columns={"starter_pitcher_id": "pitcher"})
     elif "starter_pitcher_id" in features_df.columns:
@@ -548,9 +563,8 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     non_stat_cols = {
         "game_date", "game_pk", "batter", "pitcher", "home_team",
-        "batter_team",  # string — must not be zero-filled
-        "hr_hit", "pitcher_hand", "batter_hand", "pitcher_mode",
-        "starter_id", "starter_pitcher_id",
+        "batter_team", "hr_hit", "pitcher_hand", "batter_hand",
+        "pitcher_mode", "starter_id", "starter_pitcher_id",
     }
     stat_cols = [c for c in features_df.columns if c not in non_stat_cols]
     features_df[stat_cols] = features_df[stat_cols].fillna(0.0)
@@ -558,13 +572,24 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     out_path = PROCESSED_DIR / f"train_table_{start_date}_to_{end_date}.parquet"
     features_df.to_parquet(out_path, index=False)
 
+    logger.info(
+        "Saved: %s | rows=%d | hr_rate=%.4f | dates=%s -> %s",
+        out_path.name,
+        len(features_df),
+        features_df["hr_hit"].mean(),
+        pd.to_datetime(features_df["game_date"]).min().date(),
+        pd.to_datetime(features_df["game_date"]).max().date(),
+    )
+
     return FeaturesBuildResult(features_df=features_df, output_path=out_path)
 
 
 if __name__ == "__main__":
+    from src.logging_config import configure_logging
+    configure_logging()
+
     result = build_features_for_range("2024-03-20", "2024-10-01")
     full_path = PROCESSED_DIR / "train_table_2024_full_season.parquet"
     result.features_df.to_parquet(full_path, index=False)
-    print(f"\nSaved: {full_path}")
-    print(f"Rows: {len(result.features_df):,}")
-    print("\nLabel HR rate:", result.features_df["hr_hit"].mean())
+    logger.info("Saved full season: %s | rows=%d", full_path.name, len(result.features_df))
+    logger.info("HR rate: %.4f", result.features_df["hr_hit"].mean())

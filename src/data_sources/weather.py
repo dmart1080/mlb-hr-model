@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -10,55 +11,31 @@ from typing import Optional
 import pandas as pd
 import requests
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CACHE_DIR    = PROJECT_ROOT / "data" / "cache"
 WEATHER_CACHE = CACHE_DIR / "weather"
 WEATHER_CACHE.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Cache TTL configuration
-# ---------------------------------------------------------------------------
-# Pre-game forecasts change frequently; re-fetch if cached more than this
-# many hours ago AND the game hasn't happened yet.  Post-game weather is
-# stable, so completed games are never re-fetched (their data is final).
 _PREFETCH_TTL_HOURS = 6
 
-# Roofed / retractable-roof stadiums — weather is irrelevant for these
 INDOOR_PARKS = {
-    "MIA",  # loanDepot park (retractable)
-    "HOU",  # Minute Maid Park (retractable)
-    "SEA",  # T-Mobile Park (retractable)
-    "ARI",  # Chase Field (retractable)
-    "MIL",  # American Family Field (retractable)
-    "TOR",  # Rogers Centre (retractable)
-    "TB",   # Tropicana Field (fixed dome) — also TBR in some systems
-    "TBR",
+    "MIA", "HOU", "SEA", "ARI", "MIL", "TOR", "TB", "TBR",
 }
 
-# Wind direction → numeric bearing (degrees from N, clockwise)
 _WIND_DIR_TO_DEG = {
-    "in from cf":  180,
-    "out to cf":     0,
-    "l to r":       90,
-    "r to l":      270,
-    "in from lf":  135,
-    "in from rf":  225,
-    "out to lf":   315,
-    "out to rf":    45,
+    "in from cf":  180, "out to cf":     0,
+    "l to r":       90, "r to l":      270,
+    "in from lf":  135, "in from rf":  225,
+    "out to lf":   315, "out to rf":    45,
     "calm":          0,
 }
 
-# HR-friendliness of wind direction (-1 to +1 scale)
 _WIND_HR_FACTOR = {
-    "out to cf":    1.0,
-    "out to lf":    0.7,
-    "out to rf":    0.7,
-    "l to r":       0.3,
-    "r to l":       0.3,
-    "calm":         0.0,
-    "in from lf":  -0.5,
-    "in from rf":  -0.5,
-    "in from cf":  -1.0,
+    "out to cf":    1.0, "out to lf":    0.7, "out to rf":    0.7,
+    "l to r":       0.3, "r to l":       0.3, "calm":         0.0,
+    "in from lf":  -0.5, "in from rf":  -0.5, "in from cf":  -1.0,
 }
 
 
@@ -67,14 +44,6 @@ def _cache_path(game_pk: int) -> Path:
 
 
 def _cache_is_stale(cache: Path, game_date: Optional[str] = None) -> bool:
-    """
-    Return True if the cached file should be re-fetched.
-
-    Rules:
-      - If game_date is provided and is in the past (i.e. game is complete),
-        the cache is never stale — historical weather does not change.
-      - Otherwise re-fetch if the file is older than _PREFETCH_TTL_HOURS.
-    """
     if not cache.exists():
         return True
 
@@ -83,10 +52,9 @@ def _cache_is_stale(cache: Path, game_date: Optional[str] = None) -> bool:
             gd = datetime.strptime(game_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             now = datetime.now(tz=timezone.utc)
             if gd.date() < now.date():
-                # Game already played — cached data is final
                 return False
         except ValueError:
-            pass  # bad date string, fall through to TTL check
+            pass
 
     mtime = datetime.fromtimestamp(cache.stat().st_mtime, tz=timezone.utc)
     age_hours = (datetime.now(tz=timezone.utc) - mtime).total_seconds() / 3600
@@ -127,8 +95,6 @@ def fetch_game_weather(
     game_pk       : MLB game primary key
     force_refresh : bypass all cache checks
     game_date     : YYYY-MM-DD string used to determine cache staleness.
-                    Pass this whenever available so completed games are never
-                    re-fetched unnecessarily.
 
     Returns a dict with keys:
         temp_f, wind_speed_mph, wind_direction, wind_hr_factor,
@@ -136,7 +102,6 @@ def fetch_game_weather(
     """
     cache = _cache_path(game_pk)
 
-    # FIX: respect TTL for upcoming games; never re-fetch completed games.
     if not force_refresh and not _cache_is_stale(cache, game_date=game_date):
         with open(cache) as f:
             return json.load(f)
@@ -146,8 +111,17 @@ def fetch_game_weather(
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+    except requests.Timeout as e:
+        logger.warning("Weather fetch timeout game_pk=%d: %s", game_pk, e)
+        return _neutral_weather(game_pk, error=f"timeout:{e}")
+    except requests.HTTPError as e:
+        logger.warning(
+            "Weather HTTP error %d game_pk=%d",
+            e.response.status_code, game_pk,
+        )
+        return _neutral_weather(game_pk, error=f"http:{e.response.status_code}")
     except Exception as e:
-        # Return neutral values on failure — don't crash the pipeline
+        logger.warning("Weather fetch failed game_pk=%d: %s", game_pk, e)
         return _neutral_weather(game_pk, error=str(e))
 
     weather_raw = data.get("gameData", {}).get("weather", {})
@@ -172,7 +146,6 @@ def fetch_game_weather(
         "condition":       condition,
         "is_indoor":       0,
         "venue_name":      venue_raw.get("name", ""),
-        # Store fetch timestamp so staleness can be computed later
         "_fetched_at":     datetime.now(tz=timezone.utc).isoformat(),
     }
 
@@ -208,29 +181,29 @@ def fetch_weather_for_games(
     """
     Fetch weather for a list of game_pks and return as a DataFrame.
     Marks indoor parks automatically regardless of API data.
-
-    Parameters
-    ----------
-    game_pks    : list of game_pk integers
-    home_teams  : dict mapping game_pk → home_team abbreviation
-    force_refresh : re-fetch all games regardless of cache
-    sleep_secs  : polite delay between live API calls (default 50 ms)
-    game_dates  : optional dict mapping game_pk → 'YYYY-MM-DD' string.
-                  When provided, completed games are never re-fetched.
     """
     rows = []
-    unique_pks = list(dict.fromkeys(game_pks))  # deduplicate, preserve order
+    unique_pks = list(dict.fromkeys(game_pks))
     game_dates = game_dates or {}
 
+    cached_count = sum(
+        1 for gp in unique_pks
+        if not _cache_is_stale(_cache_path(gp), game_date=game_dates.get(gp))
+    )
+    logger.info(
+        "Weather fetch: %d games (%d cached, %d to fetch)",
+        len(unique_pks), cached_count, len(unique_pks) - cached_count,
+    )
+
+    synthetic_count = 0
     for i, gp in enumerate(unique_pks):
         gdate = game_dates.get(gp)
         was_cached = not _cache_is_stale(_cache_path(gp), game_date=gdate)
 
-        result = fetch_game_weather(
-            gp,
-            force_refresh=force_refresh,
-            game_date=gdate,
-        )
+        result = fetch_game_weather(gp, force_refresh=force_refresh, game_date=gdate)
+
+        if result.get("_error"):
+            synthetic_count += 1
 
         home_team = home_teams.get(gp, "")
         result["is_indoor"] = int(home_team in INDOOR_PARKS)
@@ -247,10 +220,15 @@ def fetch_weather_for_games(
             time.sleep(sleep_secs)
 
         if (i + 1) % 100 == 0:
-            print(f"    Weather: {i+1}/{len(unique_pks)} games fetched ...")
+            logger.info("Weather: %d/%d games processed ...", i + 1, len(unique_pks))
+
+    if synthetic_count:
+        logger.warning(
+            "Weather unavailable for %d/%d games — neutral values used",
+            synthetic_count, len(unique_pks),
+        )
 
     df = pd.DataFrame(rows)
-
     df["temp_above_75"]   = (df["temp_f"] > 75).astype("int8")
     df["temp_above_85"]   = (df["temp_f"] > 85).astype("int8")
     df["wind_out_strong"] = ((df["wind_hr_factor"] > 0) & (df["wind_speed_mph"] >= 10)).astype("int8")
@@ -262,6 +240,9 @@ def fetch_weather_for_games(
 
 
 if __name__ == "__main__":
+    from src.logging_config import configure_logging
+    configure_logging()
+
     test_pks   = [745456, 745457, 745458]
     test_homes = {745456: "NYY", 745457: "BOS", 745458: "HOU"}
     df = fetch_weather_for_games(test_pks, test_homes)

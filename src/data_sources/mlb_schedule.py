@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -9,12 +10,13 @@ from typing import Optional
 import pandas as pd
 import requests
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CACHE_DIR = PROJECT_ROOT / "data" / "cache"
 SCHEDULE_CACHE = CACHE_DIR / "schedule"
 SCHEDULE_CACHE.mkdir(parents=True, exist_ok=True)
 
-# Max parallel workers for roster fetches.
 _MAX_WORKERS = 20
 _MAX_RETRIES = 3
 
@@ -41,7 +43,7 @@ def _get(url: str, timeout: int = 15) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Probable starters: fetch by date (unchanged — called once per date, not hot path)
+# Probable starters
 # ---------------------------------------------------------------------------
 
 def fetch_probable_starters_for_date(
@@ -49,14 +51,13 @@ def fetch_probable_starters_for_date(
     *,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """
-    Fetch probable starters for all games on a given date.
-    """
+    """Fetch probable starters for all games on a given date."""
     cache = _date_cache_path(date_str)
 
     if cache.exists() and not force_refresh:
         with open(cache) as f:
             data = json.load(f)
+        logger.debug("Schedule cache hit for %s", date_str)
         return pd.DataFrame(data)
 
     url = (
@@ -66,7 +67,7 @@ def fetch_probable_starters_for_date(
     try:
         data = _get(url)
     except Exception as e:
-        print(f"  [mlb_schedule] Failed to fetch schedule for {date_str}: {e}")
+        logger.error("Failed to fetch schedule for %s: %s", date_str, e)
         return pd.DataFrame(columns=["game_pk", "home_team", "away_team",
                                      "home_starter_id", "away_starter_id"])
 
@@ -90,6 +91,7 @@ def fetch_probable_starters_for_date(
     with open(cache, "w") as f:
         json.dump(rows, f)
 
+    logger.debug("Fetched %d games for %s", len(rows), date_str)
     return pd.DataFrame(rows)
 
 
@@ -136,10 +138,16 @@ def fetch_game_roster(
             break
         except Exception as e:
             last_err = e
+            logger.warning(
+                "Roster fetch failed game_pk=%d attempt=%d/%d: %s",
+                game_pk, attempt, _MAX_RETRIES, e,
+            )
             if attempt < _MAX_RETRIES:
                 time.sleep(2)
     else:
-        print(f"  [mlb_schedule] Failed to fetch game {game_pk} after {_MAX_RETRIES} attempts: {last_err}")
+        logger.error(
+            "Roster fetch exhausted retries game_pk=%d: %s", game_pk, last_err
+        )
         return _empty_roster(game_pk)
 
     box = data.get("liveData", {}).get("boxscore", {})
@@ -199,7 +207,7 @@ def _empty_roster(game_pk: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Bulk fetch: starters + batting orders for a list of game_pks — PARALLELIZED
+# Bulk fetch — parallelised
 # ---------------------------------------------------------------------------
 
 def fetch_rosters_for_games(
@@ -221,20 +229,23 @@ def fetch_rosters_for_games(
     """
     unique_pks = list(dict.fromkeys(game_pks))
 
-    # Split cached vs uncached
     cached_pks = [gp for gp in unique_pks if _game_cache_path(gp).exists() and not force_refresh]
     fetch_pks  = [gp for gp in unique_pks if gp not in set(cached_pks)]
 
+    logger.info(
+        "Roster fetch: %d games total (%d cached, %d to fetch)",
+        len(unique_pks), len(cached_pks), len(fetch_pks),
+    )
+
     rosters: dict[int, dict] = {}
 
-    # Load cached entries
     for gp in cached_pks:
         with open(_game_cache_path(gp)) as f:
             rosters[gp] = json.load(f)
 
-    # Fetch uncached in parallel
     if fetch_pks:
         completed = 0
+        failed: list[int] = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_pk = {
                 pool.submit(fetch_game_roster, gp, force_refresh=force_refresh): gp
@@ -245,15 +256,20 @@ def fetch_rosters_for_games(
                 try:
                     rosters[gp] = future.result()
                 except Exception as e:
-                    print(f"  [mlb_schedule] game {gp} failed: {e}")
+                    logger.error("Roster future failed game_pk=%d: %s", gp, e)
                     rosters[gp] = _empty_roster(gp)
+                    failed.append(gp)
                 completed += 1
                 if completed % 100 == 0:
-                    print(f"    Rosters: {completed}/{len(fetch_pks)} games fetched ...")
+                    logger.info("Rosters: %d/%d fetched ...", completed, len(fetch_pks))
 
-        print(f"    Rosters: {len(fetch_pks)}/{len(fetch_pks)} games fetched ...")
+        logger.info("Rosters: %d/%d fetched", len(fetch_pks), len(fetch_pks))
+        if failed:
+            logger.warning(
+                "Roster fetch failed for %d game(s): %s", len(failed), failed[:10]
+            )
 
-    # Assemble output DataFrames in original order
+    # Assemble output DataFrames
     starter_rows: list[dict] = []
     batting_rows: list[dict] = []
 
@@ -284,7 +300,7 @@ def fetch_rosters_for_games(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: resolve starter for each batter-game row (unchanged)
+# Convenience: enrich labels with roster data
 # ---------------------------------------------------------------------------
 
 _EXPECTED_PA = {
@@ -300,9 +316,7 @@ def enrich_labels_with_roster(
     batting_df: pd.DataFrame,
     game_pk_home_lookup: dict[int, str],
 ) -> pd.DataFrame:
-    """
-    Merge starter and batting order information into the labels DataFrame.
-    """
+    """Merge starter and batting order information into the labels DataFrame."""
     labels = labels.copy()
     labels["game_pk"] = labels["game_pk"].astype(int)
 
@@ -310,10 +324,6 @@ def enrich_labels_with_roster(
     starters["game_pk"] = starters["game_pk"].astype(int)
 
     home_lookup = {int(k): v for k, v in game_pk_home_lookup.items()}
-
-    starter_map: dict[int, tuple] = {}
-    for _, r in starters.iterrows():
-        starter_map[int(r["game_pk"])] = (r["home_starter_id"], r["away_starter_id"])
 
     def _resolve_starter(row) -> int | None:
         gp  = row["game_pk"]
@@ -331,7 +341,12 @@ def enrich_labels_with_roster(
     labels["starter_pitcher_id"] = labels.apply(_resolve_starter, axis=1)
 
     fallback_mask = labels["starter_pitcher_id"].isna()
-    if fallback_mask.any() and "pitcher_mode" in labels.columns:
+    fallback_count = fallback_mask.sum()
+    if fallback_count > 0 and "pitcher_mode" in labels.columns:
+        logger.debug(
+            "starter_pitcher_id missing for %d rows — falling back to pitcher_mode",
+            fallback_count,
+        )
         labels.loc[fallback_mask, "starter_pitcher_id"] = (
             pd.to_numeric(labels.loc[fallback_mask, "pitcher_mode"], errors="coerce")
         )
@@ -347,6 +362,7 @@ def enrich_labels_with_roster(
         batting = batting[["game_pk", "batter", "batting_order", "is_starter_batter"]]
         labels = labels.merge(batting, on=["game_pk", "batter"], how="left")
     else:
+        logger.warning("batting_df is empty — batting_order features will be missing")
         labels["batting_order"]     = pd.NA
         labels["is_starter_batter"] = pd.NA
 
@@ -370,6 +386,9 @@ def enrich_labels_with_roster(
 
 
 if __name__ == "__main__":
+    from src.logging_config import configure_logging
+    configure_logging()
+
     starters_df, batting_df = fetch_rosters_for_games([745456, 745457])
     print("Starters:")
     print(starters_df)
