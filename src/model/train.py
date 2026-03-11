@@ -70,6 +70,7 @@ def print_summary(
         "Rows: train=%s  test=%s",
         fmt_int(metrics["train_rows"]), fmt_int(metrics["test_rows"]),
     )
+    logger.info("Split type: %s", metrics.get("split_type", "calendar"))
     logger.info("Test HR rate (baseline): %s", pct(metrics["test_hr_rate"]))
     logger.info("Performance (test):")
     logger.info("  ROC-AUC:   %s", f3(metrics["roc_auc"]))
@@ -92,19 +93,19 @@ def print_summary(
     logger.info("Model saved: %s", model_name)
     logger.info("=" * 30)
 
-    # CSV run log
     log_file = MODELS_DIR / "train_runs.csv"
     write_header = not log_file.exists()
     with open(log_file, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
             writer.writerow([
-                "run_time", "train_table", "roc_auc", "log_loss",
+                "run_time", "train_table", "split_type", "roc_auc", "log_loss",
                 "baseline_hr_rate", "top10_hr_rate", "top1_hr_rate",
                 "top10_lift", "top1_lift", "features",
             ])
         writer.writerow([
             run_time, train_path.name,
+            metrics.get("split_type", "calendar"),
             metrics["roc_auc"], metrics["log_loss"], metrics["test_hr_rate"],
             extra["top10_hr_rate"], extra["top1_hr_rate"],
             extra["top10_lift"], extra["top1_lift"],
@@ -339,7 +340,11 @@ def train_baseline(train_path: Path) -> TrainResult:
     if missing:
         raise ValueError(f"Missing required columns in training table: {missing}")
 
+    # ------------------------------------------------------------------
+    # Train / test split
+    # ------------------------------------------------------------------
     train_df, test_df = calendar_split(df, test_start=TEST_START_DATE)
+    split_type = "calendar"
 
     if len(test_df) == 0:
         logger.warning(
@@ -347,6 +352,26 @@ def train_baseline(train_path: Path) -> TrainResult:
             TEST_START_DATE,
         )
         train_df, test_df = pct_time_split(df, test_size=0.2)
+        split_type = "pct_80_20_fallback"
+
+    elif len(train_df) == 0:
+        # All data falls on/after TEST_START_DATE. This happens when running
+        # on TEST MODE output (single month of 2025) before the full
+        # multi-season build. Fall back to a chronological 80/20 split so
+        # the pipeline completes and produces a usable (if overfit) model
+        # for smoke-testing purposes.
+        logger.warning(
+            "Train set is empty — all %d rows are on/after %s. "
+            "This usually means you are running on TEST MODE data only "
+            "(build_features_multi_season.py with TEST_MODE=True). "
+            "Falling back to an 80/20 chronological split within available data. "
+            "ROC-AUC will be optimistic — this model is for pipeline "
+            "validation only. Set TEST_MODE=False and rebuild for real training.",
+            len(df), TEST_START_DATE,
+        )
+        train_df, test_df = pct_time_split(df, test_size=0.2)
+        split_type = "pct_80_20_fallback_empty_train"
+
     else:
         logger.info(
             "Calendar split: train=%d rows (%s -> %s)  test=%d rows (%s -> %s)",
@@ -371,6 +396,10 @@ def train_baseline(train_path: Path) -> TrainResult:
     y_test       = test_df["hr_hit"].astype(int)
 
     logger.info("Feature count: %d", len(feature_cols))
+    logger.info(
+        "Split sizes — train_core: %d  calib: %d  test: %d",
+        len(X_train_core), len(X_calib), len(X_test),
+    )
 
     # Logistic Regression
     base_pipeline = Pipeline([
@@ -465,6 +494,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "avg_pred_prob": float(p_test.mean()),
         "log_loss":      float(log_loss(y_test, p_test, labels=[0, 1])),
         "roc_auc":       float(roc_auc_score(y_test, p_test)),
+        "split_type":    split_type,
     }
 
     model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2025.joblib"

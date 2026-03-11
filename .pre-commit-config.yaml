@@ -3,4 +3,4 @@ repos:
     rev: v1.4.0
     hooks:
       - id: detect-secrets
-        args: ['--baseline', '.secrets.baseline']
+        args: ['--baseline', 'C:/Users/dylan/Documents/projects/mlb-hr-model/.secrets.baseline']

@@ -10,6 +10,8 @@ Import chain (no cycles):
 
 import numpy as np
 import pandas as pd
+import logging
+logger = logging.getLogger(__name__)
 
 from src.features.build_features_common import (
     MIN_PA_BATTER_SZN,
@@ -21,6 +23,9 @@ from src.features.build_features_common import (
     _batter_trend_stats,
 )
 
+_PITCHER_VELO_COLS = [
+    "p_fb_velo_30", "p_fb_pct_30", "p_offspeed_pct_30", "p_fb_velo_trend"
+]
 
 # ---------------------------------------------------------------------------
 # Core merge helper
@@ -37,8 +42,15 @@ def _window_merge(
     Return pa_df rows inside the look-back window for each
     (player, target_date) pair in *need*.
 
-    Window: [target_date - days_back, target_date)   ← strictly < target_date
-    Leakage: right bound is STRICT so same-day PA never leaks into features.
+    Window: [lower_bound, target_date)   ← strictly less-than on BOTH sides.
+
+    Leakage notes
+    -------------
+    - Right bound is STRICT (<) so same-day PA never leaks into features.
+    - FIX 3: Season window lower bound is also STRICT (>) so a game played
+      exactly on March 1 (season start) is not included in its own features.
+      Previously >= was used which could include same-day data for the very
+      first day of the season.
     """
     merged = pa_df.merge(
         need[[player_col, "game_date"]].rename(columns={"game_date": "target_date"}),
@@ -46,13 +58,18 @@ def _window_merge(
         how="inner",
     )
 
+    # Right bound: strictly before target date (no same-day leakage)
     in_window = merged["game_date"] < merged["target_date"]
 
     if season_window:
+        # Season start = March 1 of the target year.
+        # FIX 3: use strict > so March 1 games are NOT included in March 1
+        # features.  The original code used >= which let same-day data leak
+        # on the opening day of the season.
         szn_start = pd.to_datetime(
             merged["target_date"].dt.year.astype(str) + "-03-01"
         )
-        in_window &= merged["game_date"] >= szn_start
+        in_window &= merged["game_date"] > szn_start
     else:
         lower = merged["target_date"] - pd.Timedelta(days=days_back)
         in_window &= merged["game_date"] >= lower
@@ -343,6 +360,31 @@ def precompute_batter_windows_fast(
 # Pitcher windows
 # ---------------------------------------------------------------------------
 
+_PITCHER_STAT_COLS: list[str] = [
+    # 30-day overall
+    "p_pa_30", "p_hr_allowed_30", "p_hr_allowed_rate_30",
+    "p_barrel_allowed_rate_30", "p_ev_allowed_mean_30", "p_la_allowed_mean_30",
+    "p_hardhit_allowed_rate_30", "p_fb_allowed_rate_30", "p_k_rate_30", "p_bb_rate_30",
+    # season overall
+    "p_pa_szn", "p_hr_allowed_szn", "p_hr_allowed_rate_szn",
+    "p_barrel_allowed_rate_szn", "p_ev_allowed_mean_szn", "p_la_allowed_mean_szn",
+    "p_hardhit_allowed_rate_szn", "p_fb_allowed_rate_szn", "p_k_rate_szn", "p_bb_rate_szn",
+    # platoon splits
+    "p_pa_30_vsL", "p_hr_allowed_30_vsL", "p_hr_allowed_rate_30_vsL",
+    "p_barrel_allowed_rate_30_vsL", "p_hardhit_allowed_rate_30_vsL",
+    "p_fb_allowed_rate_30_vsL", "p_k_rate_30_vsL", "p_bb_rate_30_vsL",
+    "p_pa_30_vsR", "p_hr_allowed_30_vsR", "p_hr_allowed_rate_30_vsR",
+    "p_barrel_allowed_rate_30_vsR", "p_hardhit_allowed_rate_30_vsR",
+    "p_fb_allowed_rate_30_vsR", "p_k_rate_30_vsR", "p_bb_rate_30_vsR",
+    "p_pa_szn_vsL", "p_hr_allowed_szn_vsL", "p_hr_allowed_rate_szn_vsL",
+    "p_barrel_allowed_rate_szn_vsL", "p_hardhit_allowed_rate_szn_vsL",
+    "p_fb_allowed_rate_szn_vsL", "p_k_rate_szn_vsL", "p_bb_rate_szn_vsL",
+    "p_pa_szn_vsR", "p_hr_allowed_szn_vsR", "p_hr_allowed_rate_szn_vsR",
+    "p_barrel_allowed_rate_szn_vsR", "p_hardhit_allowed_rate_szn_vsR",
+    "p_fb_allowed_rate_szn_vsR", "p_k_rate_szn_vsR", "p_bb_rate_szn_vsR",
+]
+
+
 def precompute_pitcher_windows_fast(
     pa_df: pd.DataFrame,
     target_dates: pd.DataFrame,
@@ -352,6 +394,23 @@ def precompute_pitcher_windows_fast(
         .drop_duplicates(subset=["pitcher", "game_date"])
         .reset_index(drop=True)
     )
+
+    # Guard: if need is empty (all starter_pitcher_id values were NaN and were
+    # dropped), return a zero-row frame with the full expected column schema so
+    # that the left-merge in build_features_for_range adds the columns (as NaN)
+    # rather than silently omitting them — which would cause KeyErrors later in
+    # _add_edge_features.
+    if need.empty:
+        logger.warning(
+            "precompute_pitcher_windows_fast: target_dates is empty after "
+            "deduplication (all starter_pitcher_id values may be NaN). "
+            "Returning zero-row frame with full pitcher stat schema — all "
+            "pitcher features will be NaN for this date range."
+        )
+        empty_cols = ["pitcher", "game_date"] + _PITCHER_STAT_COLS
+        empty_df = pd.DataFrame(columns=empty_cols)
+        empty_df['game_date'] = pd.to_datetime(empty_df['game_date'])
+        return empty_df
 
     # ── 30-day overall ──────────────────────────────────────────────────────
     w30 = _window_merge(pa_df, need, "pitcher", days_back=30)
@@ -393,7 +452,21 @@ def precompute_pitcher_windows_fast(
     def _plat(windowed, hand, suffix, min_pa):
         sub = windowed[windowed["stand"] == hand]
         if sub.empty:
-            return pd.DataFrame(columns=["pitcher", "game_date"])
+            # Return a DataFrame with all expected columns (filled with NaN)
+            plat_cols = [
+                "pitcher", "game_date",
+                f"p_pa_{suffix}_vs{hand}",
+                f"p_hr_allowed_{suffix}_vs{hand}",
+                f"p_hr_allowed_rate_{suffix}_vs{hand}",
+                f"p_barrel_allowed_rate_{suffix}_vs{hand}",
+                f"p_hardhit_allowed_rate_{suffix}_vs{hand}",
+                f"p_fb_allowed_rate_{suffix}_vs{hand}",
+                f"p_k_rate_{suffix}_vs{hand}",
+                f"p_bb_rate_{suffix}_vs{hand}",
+            ]
+            empty_plat = pd.DataFrame(columns=plat_cols)
+            empty_plat['game_date'] = pd.to_datetime(empty_plat['game_date'])
+            return empty_plat
         return _agg_pa_stats(
             sub, ["pitcher", "target_date"], min_pa=min_pa,
             prefix="p_", drop_means=True,
@@ -441,7 +514,11 @@ def precompute_pitcher_velo_fast(
         .drop_duplicates(subset=["pitcher", "game_date"])
         .reset_index(drop=True)
     )
-
+    if need.empty:
+        empty_cols = ["pitcher", "game_date"] + _PITCHER_VELO_COLS
+        empty_df = pd.DataFrame(columns=empty_cols)
+        empty_df['game_date'] = pd.to_datetime(empty_df['game_date'])
+        return empty_df
     # ── 30-day FB velo / mix ────────────────────────────────────────────────
     w30 = _window_merge(pitches_df, need, "pitcher", days_back=30)
 

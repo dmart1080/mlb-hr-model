@@ -26,7 +26,7 @@ SEASONS = [
 # Set to True to build only one month of 2025 data and verify the full
 # pipeline before committing to a full multi-season rebuild.
 # ---------------------------------------------------------------------------
-TEST_MODE = True
+TEST_MODE = False
 TEST_RANGE = ("2025-03-27", "2025-04-30")
 
 

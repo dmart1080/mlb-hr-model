@@ -172,7 +172,13 @@ def fetch_game_roster(
                 except (ValueError, TypeError):
                     order_int = 0
 
-                is_starter = game_status.get("isOnBench", True) is False
+                # FIX 2: isOnBench=True means the player IS on the bench
+                # (substitute), so is_starter = NOT isOnBench.
+                # The previous default of True meant that when the key was
+                # absent we incorrectly treated the player as a bench player.
+                # Default to False (assume starter) when the key is missing.
+                is_on_bench = game_status.get("isOnBench", False)
+                is_starter  = not is_on_bench
 
                 batting_orders[int(pid)] = {
                     "batting_order": order_int,

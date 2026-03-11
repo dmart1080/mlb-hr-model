@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
 
-from src.data_sources.statcast import fetch_statcast_events
+from src.data_sources.statcast import fetch_statcast_events, REGULAR_SEASON_GAME_TYPE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -15,24 +15,6 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 class LabelsBuildResult:
     labels_df: pd.DataFrame
     output_path: Path
-
-
-def _identify_starter(group: pd.DataFrame) -> int | None:
-    """
-    Return the pitcher_id of the probable starter for a batter-game group.
-
-    Strategy: the starter is the pitcher who appeared earliest in the game
-    (lowest at_bat_number) among pitchers who faced this batter.  We use
-    at_bat_number as a proxy for inning/sequencing order.
-
-    If at_bat_number is unavailable we fall back to the mode (old behaviour).
-    """
-    if "at_bat_number" in group.columns and group["at_bat_number"].notna().any():
-        first_row = group.sort_values("at_bat_number").iloc[0]
-        return first_row["pitcher"]
-    # fallback
-    mode = group["pitcher"].mode()
-    return mode.iloc[0] if not mode.empty else group["pitcher"].iloc[0]
 
 
 def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -65,9 +47,19 @@ def build_batter_game_labels(events_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # --- starter_id (new, preferred) ---
+    # Use sort + groupby().first() instead of apply() — this avoids a pandas
+    # version inconsistency where groupby().apply() can return a DataFrame
+    # instead of a Series (causing TypeError on .rename("starter_id")).
+    # Sort by at_bat_number when available so we pick the first pitcher faced.
+    _sort_cols = (
+        ["game_date", "game_pk", "batter", "at_bat_number"]
+        if "at_bat_number" in df.columns
+        else ["game_date", "game_pk", "batter"]
+    )
     starter_id = (
-        df.groupby(["game_date", "game_pk", "batter"])
-        .apply(_identify_starter, include_groups=False)
+        df.sort_values(_sort_cols, na_position="last")
+        .groupby(["game_date", "game_pk", "batter"], sort=False)["pitcher"]
+        .first()
         .rename("starter_id")
         .reset_index()
     )
@@ -93,7 +85,9 @@ def run_build_labels(start_date: str, end_date: str) -> LabelsBuildResult:
         columns=[
             "game_date", "game_pk", "batter", "pitcher",
             "events", "at_bat_number",
+            "game_type",          # required for regular_season_only filter
         ],
+        regular_season_only=True,
     ).df
 
     labels_df = build_batter_game_labels(events)

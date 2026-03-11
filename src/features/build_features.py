@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.data_sources.statcast import fetch_statcast_events
+from src.data_sources.statcast import fetch_statcast_events, REGULAR_SEASON_GAME_TYPE
 from src.data_sources.mlb_schedule import fetch_rosters_for_games, enrich_labels_with_roster
 from src.features.build_labels import build_batter_game_labels
 from src.features.park_factors import get_park_factors, DEFAULT_PARK_FACTOR
@@ -59,14 +59,35 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
     raw = fetch_statcast_events(
         start_date=start_date,
         end_date=end_date,
+        # game_type is fetched so regular_season_only filter runs inside
+        # fetch_statcast_events, and we apply a second hard filter below
+        # as a belt-and-suspenders guard against old cache files.
         columns=[
             "game_date", "game_pk", "at_bat_number",
             "batter", "pitcher", "events",
             "home_team", "launch_speed", "launch_angle",
             "p_throws", "stand",
             "release_speed", "pitch_type",
+            "game_type",
         ],
+        regular_season_only=True,
     ).df.copy()
+
+    # Hard filter — catches old cache files pre-dating the game_type column.
+    if "game_type" in raw.columns:
+        before = len(raw)
+        raw = raw[raw["game_type"] == REGULAR_SEASON_GAME_TYPE].copy()
+        removed = before - len(raw)
+        if removed:
+            logger.info(
+                "Hard regular-season filter: removed %d non-RS rows "
+                "(spring training / postseason / All-Star).", removed,
+            )
+    else:
+        logger.warning(
+            "game_type column absent from cache — delete cache and re-run "
+            "to exclude spring training and postseason games."
+        )
 
     raw = raw.convert_dtypes(dtype_backend="numpy_nullable")
     raw["game_date"]     = pd.to_datetime(raw["game_date"])
@@ -85,6 +106,10 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
 
     raw["is_hr"] = (raw["events"] == "home_run").fillna(False).astype("int8")
 
+    # FIX 1 (part a): preserve at_bat_number in pa_df so _compute_relief_pa_pct
+    # can identify which pitcher each PA was against.  We keep the raw pitch-level
+    # pitcher column; the PA-level pitcher is taken as the LAST pitcher seen in
+    # that at-bat (closer to the actual outcome).
     pa_df = (
         raw
         .sort_values(["game_pk", "batter", "game_date"])
@@ -102,6 +127,8 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "stand":        "last",
         })
     )
+    # at_bat_number survives as a groupby key — confirm it's present
+    assert "at_bat_number" in pa_df.columns, "at_bat_number missing from pa_df"
 
     ev_str = pa_df["events"].astype("string")
     pa_df["is_so"] = ev_str.str.contains("strikeout", na=False).astype("int8")
@@ -184,6 +211,14 @@ def fetch_weather_for_games_fast(
     unique_pks = list(dict.fromkeys(game_pks))
     game_dates = game_dates or {}
 
+    # If no games, return an empty DataFrame with the expected columns
+    if not unique_pks:
+        return pd.DataFrame(columns=[
+            "game_pk", "temp_f", "wind_speed_mph", "wind_hr_factor",
+            "wind_hr_impact", "is_indoor", "temp_above_75", "temp_above_85",
+            "wind_out_strong", "wind_in_strong"
+        ])
+
     cached_pks = [
         gp for gp in unique_pks
         if not _cache_is_stale(_cache_path(gp), game_date=game_dates.get(gp))
@@ -260,7 +295,6 @@ def fetch_weather_for_games_fast(
         "wind_out_strong", "wind_in_strong",
     ]]
 
-
 # ---------------------------------------------------------------------------
 # Relief PA pct
 # ---------------------------------------------------------------------------
@@ -268,7 +302,13 @@ def fetch_weather_for_games_fast(
 def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     """
     Fraction of each batter's PAs in a game against non-starters.
-    Must be called AFTER enrich_labels_with_roster.
+
+    FIX 1 (part b): This function now correctly receives the full pitch-level
+    pa_df (which retains one row per PA with the actual pitcher column).
+    Previously it was called with target_pa — a filtered slice — which had
+    already lost at_bat_number in some code paths.
+
+    Must be called AFTER enrich_labels_with_roster so starter_pitcher_id exists.
     """
     labels = labels.copy()
     labels["game_pk"] = labels["game_pk"].astype(int)
@@ -330,7 +370,22 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def _edge(a: str, b: str) -> pd.Series:
+        # Return NaN series if either column is absent (e.g. pitcher_need was
+        # empty and no pitcher stat columns were added to features_df).
+        if a not in df.columns or b not in df.columns:
+            missing = [c for c in (a, b) if c not in df.columns]
+            logger.warning(
+                "_add_edge_features: skipping edge %s - %s, missing columns: %s",
+                a, b, missing,
+            )
+            return pd.Series(np.nan, index=df.index)
         return df[a] - df[b]
+
+    def _col(c: str) -> pd.Series:
+        """Return column or NaN series if absent."""
+        if c not in df.columns:
+            return pd.Series(np.nan, index=df.index)
+        return df[c]
 
     df["ev_edge_14_30"]             = _edge("b_ev_mean_14",       "p_ev_allowed_mean_30")
     df["hardhit_edge_14_30"]        = _edge("b_hardhit_rate_14",  "p_hardhit_allowed_rate_30")
@@ -340,12 +395,12 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     df["k_rate_edge_14_30"]         = _edge("b_k_rate_14",        "p_k_rate_30")
     df["bb_rate_edge_14_30"]        = _edge("b_bb_rate_14",       "p_bb_rate_30")
 
-    df["k_rate_interaction_14_30"]  = df["b_k_rate_14"]  * df["p_k_rate_30"]
-    df["bb_rate_interaction_14_30"] = df["b_bb_rate_14"] * df["p_bb_rate_30"]
-    df["contact_pressure_14_30"]    = (1 - df["b_k_rate_14"]) * (1 - df["p_k_rate_30"])
+    df["k_rate_interaction_14_30"]  = _col("b_k_rate_14")  * _col("p_k_rate_30")
+    df["bb_rate_interaction_14_30"] = _col("b_bb_rate_14") * _col("p_bb_rate_30")
+    df["contact_pressure_14_30"]    = (1 - _col("b_k_rate_14")) * (1 - _col("p_k_rate_30"))
     df["discipline_balance_14_30"]  = (
-        (df["b_bb_rate_14"] - df["b_k_rate_14"]) -
-        (df["p_bb_rate_30"] - df["p_k_rate_30"])
+        (_col("b_bb_rate_14") - _col("b_k_rate_14")) -
+        (_col("p_bb_rate_30") - _col("p_k_rate_30"))
     )
 
     for hand in ("L", "R"):
@@ -361,8 +416,8 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f"barrel_edge_14_30_vs{hand}"]   = _edge(b_bar,  p_bar)
 
     if "wind_hr_impact" in df.columns:
-        df["hardhit_x_wind"] = df["b_hardhit_rate_14"] * df["wind_hr_impact"]
-        df["barrel_x_wind"]  = df["b_barrel_rate_14"]  * df["wind_hr_impact"]
+        df["hardhit_x_wind"] = _col("b_hardhit_rate_14") * df["wind_hr_impact"]
+        df["barrel_x_wind"]  = _col("b_barrel_rate_14")  * df["wind_hr_impact"]
 
     return df
 
@@ -405,10 +460,16 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         len(labels), labels["hr_hit"].mean(),
     )
 
-    labels["pitcher_id"] = pd.to_numeric(
-        labels.get("starter_id", labels["pitcher_mode"]).fillna(labels["pitcher_mode"]),
-        errors="coerce",
-    ).astype("Int64")
+    # FIX 4: Consolidate pitcher identity to a single column called
+    # `pitcher_id` used consistently throughout the pipeline.
+    # starter_id (earliest at_bat_number) is preferred; pitcher_mode is the
+    # fallback.  The column is renamed to `pitcher` only at the very end,
+    # once all merges that key on it are complete.
+    labels["pitcher_id"] = (
+        pd.to_numeric(labels["starter_id"], errors="coerce")
+        .fillna(pd.to_numeric(labels["pitcher_mode"], errors="coerce"))
+        .astype("Int64")
+    )
 
     pitcher_hand_lookup = (
         pa_df.dropna(subset=["pitcher", "p_throws"])
@@ -463,7 +524,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     labels["batter_team"] = labels["batter"].map(batter_team_lookup)
     labels = enrich_labels_with_roster(labels, starters_df, batting_df, game_pk_to_home)
-    labels = _compute_relief_pa_pct(target_pa, labels)
+
+    # FIX 1 (part b): pass full pa_df (not target_pa) so at_bat_number is
+    # present and the starter_pitcher_id join works correctly.
+    labels = _compute_relief_pa_pct(pa_df, labels)
 
     # ------------------------------------------------------------------
     # Weather
@@ -497,12 +561,18 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     # ------------------------------------------------------------------
     # Pitcher windows
     # ------------------------------------------------------------------
-    starter_col = (
-        "starter_pitcher_id" if "starter_pitcher_id" in labels.columns else "pitcher_id"
-    )
+    # FIX 4: use starter_pitcher_id when available (set by
+    # enrich_labels_with_roster), fall back to pitcher_id.  A single
+    # merge_pitcher_col is used for ALL downstream merges — no more
+    # ambiguity between starter_pitcher_id and pitcher_id.
+    if "starter_pitcher_id" in labels.columns:
+        merge_pitcher_col = "starter_pitcher_id"
+    else:
+        merge_pitcher_col = "pitcher_id"
+
     pitcher_need = (
-        labels[[starter_col, "game_date", "batter_hand"]]
-        .rename(columns={starter_col: "pitcher"})
+        labels[[merge_pitcher_col, "game_date", "batter_hand"]]
+        .rename(columns={merge_pitcher_col: "pitcher"})
         .dropna(subset=["pitcher"])
         .copy()
     )
@@ -518,7 +588,6 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     # ------------------------------------------------------------------
     # Merge everything
     # ------------------------------------------------------------------
-    merge_pitcher_col = starter_col
     features_df = (
         labels
         .merge(batter_stats,  on=["batter", "game_date"], how="left")
@@ -533,7 +602,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(weather_df, on="game_pk", how="left")
     )
 
-    # Park factor
+   # Park factor
     features_df["home_team"] = features_df["game_pk"].map(game_pk_to_home)
     for _str_col in ("batter_team", "home_team", "pitcher_hand", "batter_hand"):
         if _str_col in features_df.columns:
@@ -545,18 +614,27 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
                 ) else str(v)
             )
 
-    season_year = int(pd.to_datetime(features_df["game_date"]).dt.year.mode().iloc[0])
-    pf_map = get_park_factors(season=season_year)
-    features_df["park_factor_hr"] = (
-        features_df["home_team"].map(pf_map).fillna(DEFAULT_PARK_FACTOR / 100.0)
-    )
+    # Handle park factor for empty DataFrame
+    if not features_df.empty:
+        season_year = int(pd.to_datetime(features_df["game_date"]).dt.year.mode().iloc[0])
+        pf_map = get_park_factors(season=season_year)
+        features_df["park_factor_hr"] = (
+            features_df["home_team"].map(pf_map).fillna(DEFAULT_PARK_FACTOR / 100.0)
+        )
+    else:
+        # Add column with NaN to maintain schema consistency
+        features_df["park_factor_hr"] = np.nan
 
     features_df = _add_edge_features(features_df)
 
-    if "starter_pitcher_id" in features_df.columns and "pitcher" not in features_df.columns:
-        features_df = features_df.rename(columns={"starter_pitcher_id": "pitcher"})
-    elif "starter_pitcher_id" in features_df.columns:
-        features_df = features_df.drop(columns=["starter_pitcher_id"], errors="ignore")
+    # FIX 4: Normalise the pitcher column to a single name `pitcher`.
+    # Drop starter_pitcher_id and pitcher_id; keep one clean `pitcher` column.
+    if merge_pitcher_col in features_df.columns:
+        features_df = features_df.rename(columns={merge_pitcher_col: "pitcher"})
+    # Remove any redundant pitcher identity columns that would confuse downstream
+    for _drop in ("starter_pitcher_id", "pitcher_id", "starter_id"):
+        if _drop in features_df.columns and _drop != "pitcher":
+            features_df = features_df.drop(columns=[_drop], errors="ignore")
 
     features_df["game_date"] = pd.to_datetime(features_df["game_date"]).dt.date
     features_df["hr_hit"]    = features_df["hr_hit"].astype(int)
@@ -564,7 +642,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     non_stat_cols = {
         "game_date", "game_pk", "batter", "pitcher", "home_team",
         "batter_team", "hr_hit", "pitcher_hand", "batter_hand",
-        "pitcher_mode", "starter_id", "starter_pitcher_id",
+        "pitcher_mode",
     }
     stat_cols = [c for c in features_df.columns if c not in non_stat_cols]
     features_df[stat_cols] = features_df[stat_cols].fillna(0.0)

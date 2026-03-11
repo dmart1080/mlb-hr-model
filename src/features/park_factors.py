@@ -25,6 +25,11 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_DAYS = 30
 DEFAULT_PARK_FACTOR = 100
 
+# Minimum number of teams required to consider an API response valid.
+# The MLB has 30 teams; if fewer than this are returned the response is
+# treated as partial/broken and we fall through to the static table.
+_MIN_TEAMS_REQUIRED = 20
+
 HR_PARK_FACTOR: dict[str, int] = {
     "ARI": 102, "ATL": 108, "BAL": 110, "BOS": 104, "CHC": 102,
     "CIN": 115, "CLE":  96, "COL": 120, "CWS": 101, "DET":  95,
@@ -62,7 +67,19 @@ def _cache_is_fresh(season: int) -> bool:
 def _fetch_from_api(season: int) -> dict[str, float] | None:
     """
     Fetch HR park factors for a season from the MLB Stats API.
-    Returns None if the API call fails or returns no usable data.
+
+    FIX 5: Added explicit validation that:
+      (a) the response structure contains the expected keys,
+      (b) at least one split contains a non-null `parkFactor` field, and
+      (c) the result covers at least _MIN_TEAMS_REQUIRED teams.
+
+    Previously, if the sabermetrics endpoint returned splits without a
+    `parkFactor` key (which happens for some season/gameType combinations),
+    the function returned an empty dict that was written to cache and then
+    used silently — masking the fallback to the static table.
+
+    Returns None on any validation failure so callers fall through to the
+    static table and we never cache a broken result.
     """
     url = (
         "https://statsapi.mlb.com/api/v1/stats"
@@ -86,9 +103,32 @@ def _fetch_from_api(season: int) -> dict[str, float] | None:
         logger.error("Park factors API fetch failed season=%d: %s", season, e)
         return None
 
-    splits = data.get("stats", [{}])[0].get("splits", [])
+    # FIX 5a: validate top-level structure
+    stats_list = data.get("stats")
+    if not stats_list or not isinstance(stats_list, list):
+        logger.warning(
+            "Park factors: unexpected response structure for season=%d "
+            "(missing 'stats' key or wrong type)",
+            season,
+        )
+        return None
+
+    splits = stats_list[0].get("splits", [])
     if not splits:
         logger.warning("Park factors: no splits returned for season=%d", season)
+        return None
+
+    # FIX 5b: check that at least one split actually has a parkFactor field
+    sample_pf_keys = {
+        k for split in splits[:5]
+        for k in split.get("stat", {}).keys()
+    }
+    if "parkFactor" not in sample_pf_keys:
+        logger.warning(
+            "Park factors: 'parkFactor' key absent from stat fields for "
+            "season=%d — available stat keys: %s",
+            season, sorted(sample_pf_keys),
+        )
         return None
 
     result: dict[str, float] = {}
@@ -107,8 +147,14 @@ def _fetch_from_api(season: int) -> dict[str, float] | None:
 
         result[abbr] = pf
 
-    if not result:
-        logger.warning("Park factors: empty result parsed for season=%d", season)
+    # FIX 5c: reject partial results — fewer teams than expected means the
+    # endpoint returned something but it's not reliable enough to cache.
+    if len(result) < _MIN_TEAMS_REQUIRED:
+        logger.warning(
+            "Park factors: only %d/%d teams parsed for season=%d — "
+            "result too sparse, falling back to static table",
+            len(result), _MIN_TEAMS_REQUIRED, season,
+        )
         return None
 
     logger.info("Park factors: fetched %d teams for season=%d", len(result), season)
@@ -122,7 +168,7 @@ def get_park_factors(season: int) -> dict[str, float]:
 
     Resolution order:
       1. Fresh disk cache
-      2. MLB Stats API -> write to cache
+      2. MLB Stats API -> write to cache only if response passes validation
       3. Static 2024 hardcoded table
       4. DEFAULT_PARK_FACTOR (1.0) for any missing team
     """
@@ -136,10 +182,12 @@ def get_park_factors(season: int) -> dict[str, float]:
 
     fetched = _fetch_from_api(season)
     if fetched:
+        # Only write to cache when validation passed (non-None, sufficient teams)
         with open(cache, "w") as f:
             json.dump(fetched, f)
         return {k: v / 100.0 for k, v in fetched.items()}
 
+    # API failed or returned bad data — try stale cache before static fallback
     if cache.exists():
         logger.warning("Park factors: using stale cache for season=%d", season)
         with open(cache) as f:
