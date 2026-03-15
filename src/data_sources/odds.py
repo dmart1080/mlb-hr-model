@@ -405,6 +405,39 @@ def compute_edge(model_prob: float, fair_prob: float) -> float:
     return round(model_prob - fair_prob, 4)
 
 
+def kelly_fraction(
+    model_prob: float,
+    american_odds: float,
+    kelly_mult: float = 0.25,
+) -> float:
+    """
+    Fractional Kelly stake as a fraction of bankroll.
+
+    Uses a conservative 0.25× multiplier by default to account for model
+    uncertainty.  Returns 0.0 when there is no edge.
+
+    Parameters
+    ----------
+    model_prob   : model's estimated probability of the bet winning (0–1)
+    american_odds: market over price in American format (e.g. -130, +110)
+    kelly_mult   : fraction of full Kelly to use (default 0.25)
+
+    Example
+    -------
+        model_prob=0.18, american_odds=-130  →  ~3.5% of bankroll
+    """
+    if american_odds < 0:
+        b = 100 / abs(american_odds)
+    else:
+        b = american_odds / 100
+    p = model_prob
+    q = 1.0 - p
+    if b <= 0:
+        return 0.0
+    f_full = (b * p - q) / b
+    return max(0.0, round(f_full * kelly_mult, 4))
+
+
 # ---------------------------------------------------------------------------
 # DataFrame enrichment (called from predict.py)
 # ---------------------------------------------------------------------------
@@ -415,6 +448,7 @@ def enrich_predictions_with_odds(
     *,
     api_key: Optional[str] = None,
     name_col: str = "batter_name",
+    force_refresh: bool = False,
 ) -> "pd.DataFrame":
     """
     Attach odds columns to the ranked predictions DataFrame.
@@ -430,12 +464,13 @@ def enrich_predictions_with_odds(
     """
     import pandas as pd
 
-    props = fetch_hr_props(date_str, api_key=api_key)
+    props = fetch_hr_props(date_str, api_key=api_key, force_refresh=force_refresh)
 
     if not props:
         logger.warning("No odds available for %s — skipping odds enrichment", date_str)
         for col in ("market_line", "market_over_price", "market_under_price",
-                    "market_implied_prob", "market_fair_prob", "edge", "odds_bookmaker"):
+                    "market_implied_prob", "market_fair_prob", "edge",
+                    "odds_bookmaker", "kelly_stake"):
             ranked[col] = float("nan")
         return ranked
 
@@ -445,7 +480,8 @@ def enrich_predictions_with_odds(
     result = ranked.copy()
 
     for col in ("market_line", "market_over_price", "market_under_price",
-                "market_implied_prob", "market_fair_prob", "edge", "odds_bookmaker"):
+                "market_implied_prob", "market_fair_prob", "edge",
+                "odds_bookmaker", "kelly_stake"):
         result[col] = float("nan") if col != "odds_bookmaker" else None
 
     for idx, row in result.iterrows():
@@ -464,6 +500,9 @@ def enrich_predictions_with_odds(
             float(row["hr_prob"]), float(prop["fair_prob_over"])
         )
         result.at[idx, "odds_bookmaker"]      = prop["bookmaker"]
+        result.at[idx, "kelly_stake"]         = kelly_fraction(
+            float(row["hr_prob"]), float(prop["over_price"])
+        )
         rows_matched += 1
 
     logger.info(

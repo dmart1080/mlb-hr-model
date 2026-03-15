@@ -1,6 +1,40 @@
+"""
+MLB HR Model — Daily Predictions
+==================================
+Loads the trained model, scores today's batters, prints ranked HR candidates,
+enriches with odds/edge data, and saves a CSV for backtest analysis.
+
+Usage
+-----
+    # Manual one-off run (auto-detects latest date in train table):
+    python -m src.model.predict
+
+    # Morning pass — probable starters, early lines:
+    python -m src.model.predict --run-type morning
+
+    # Final pass — confirmed lineups, final lines (bypasses caches):
+    python -m src.model.predict --run-type final --force-refresh
+
+    # Score a specific date:
+    python -m src.model.predict --date 2026-04-01
+
+    # Force-refresh all caches (schedule + odds) without a run-type label:
+    python -m src.model.predict --force-refresh
+
+Output
+------
+    data/predictions/predictions_YYYY-MM-DD.csv              ← manual / canonical
+    data/predictions/predictions_YYYY-MM-DD_morning.csv      ← morning pass
+    data/predictions/predictions_YYYY-MM-DD_final.csv        ← final pass
+    (final pass also overwrites the canonical un-stamped file)
+"""
+
 from __future__ import annotations
 
+import argparse
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 import glob
 import joblib
@@ -11,13 +45,18 @@ load_dotenv()
 
 from pybaseball.playerid_lookup import playerid_reverse_lookup
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT  = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-MODELS_DIR = PROJECT_ROOT / "models"
+MODELS_DIR    = PROJECT_ROOT / "models"
+PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 
-# Maximum IDs to resolve in a single playerid_reverse_lookup call.
 _LOOKUP_CHUNK_SIZE = 500
+TOP_N = 20
 
+
+# ---------------------------------------------------------------------------
+# Model + table loading
+# ---------------------------------------------------------------------------
 
 def latest_train_table() -> Path:
     """
@@ -69,30 +108,28 @@ def load_model():
     )
 
 
+# ---------------------------------------------------------------------------
+# Player name resolution
+# ---------------------------------------------------------------------------
+
 def _build_id_name_map(ids: list[int]) -> dict[int, str]:
     """
     Resolve a list of MLBAM IDs to full names using playerid_reverse_lookup.
-    De-dupes across both batter and pitcher columns to minimise HTTP calls.
+    Chunked to avoid API limits.
     """
-    if not ids:
-        return {}
-
     unique_ids = list(set(ids))
     mapping: dict[int, str] = {}
-
-    for start in range(0, len(unique_ids), _LOOKUP_CHUNK_SIZE):
-        chunk = unique_ids[start : start + _LOOKUP_CHUNK_SIZE]
+    for i in range(0, len(unique_ids), _LOOKUP_CHUNK_SIZE):
+        chunk = unique_ids[i : i + _LOOKUP_CHUNK_SIZE]
         try:
             look = playerid_reverse_lookup(chunk, key_type="mlbam")
             look["full_name"] = (
                 look["name_first"].fillna("") + " " + look["name_last"].fillna("")
             ).str.strip()
-            mapping.update(
-                dict(zip(look["key_mlbam"].astype(int), look["full_name"]))
-            )
-        except Exception as exc:
-            print(f"  ⚠️  playerid_reverse_lookup failed for chunk: {exc}")
-
+            for _, row in look.iterrows():
+                mapping[int(row["key_mlbam"])] = row["full_name"]
+        except Exception as e:
+            print(f"⚠️  Name lookup failed for chunk {i}: {e}")
     return mapping
 
 
@@ -102,104 +139,86 @@ def add_player_names(
     id_col: str,
     out_col: str,
 ) -> pd.DataFrame:
-    """Map MLBAM IDs to display names using a pre-built lookup dict."""
-    df[out_col] = df[id_col].astype("Int64").map(
-        lambda x: id_name_map.get(int(x)) if pd.notna(x) else None
+    df[out_col] = (
+        df[id_col]
+        .astype("Int64")
+        .map(lambda x: id_name_map.get(int(x)) if pd.notna(x) else None)
     )
     return df
 
 
-def _format_american_odds(odds_val) -> str:
-    """Format American odds for display, handling NaN gracefully."""
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def _format_pct(val) -> str:
     try:
-        v = int(odds_val)
-        return f"{v:+d}" if v > 0 else str(v)
+        return f"{float(val)*100:.1f}%"
     except (TypeError, ValueError):
-        return "  n/a"
+        return "  —  "
 
 
-def _format_pct(val, decimals: int = 1) -> str:
-    """Format a 0-1 probability as a percentage string."""
+def _format_odds(val) -> str:
     try:
-        return f"{float(val)*100:.{decimals}f}%"
+        v = int(val)
+        return f"+{v}" if v > 0 else str(v)
     except (TypeError, ValueError):
-        return "   n/a"
+        return "  —  "
 
 
 def _format_edge(val) -> str:
-    """Format edge as signed percentage points."""
     try:
-        pp = float(val) * 100
-        sign = "+" if pp >= 0 else ""
-        return f"{sign}{pp:.1f}pp"
+        v = float(val)
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v*100:.1f}pp"
     except (TypeError, ValueError):
-        return "    n/a"
+        return "  —  "
 
 
-def print_ranked_table(ranked: pd.DataFrame, has_odds: bool) -> None:
-    """
-    Pretty-print the top HR candidates.
-
-    Without odds:  batter | pitcher | model_prob | lineup pos
-    With odds:     above + market_over_price | market_fair_prob | edge
-    """
-    TOP_N = 20
-
+def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
     if has_odds:
-        # Sort by edge (model edge over market) for value-focused view.
-        # Separate batters with/without odds lines so no-line players
-        # don't pollute the edge-sorted view.
-        has_line   = ranked[ranked["edge"].notna()].copy()
-        no_line    = ranked[ranked["edge"].isna()].copy()
-
-        has_line = has_line.sort_values("edge", ascending=False)
-        no_line  = no_line.sort_values("hr_prob", ascending=False)
-
         print(f"\n{'='*85}")
-        print(f"  TOP HR CANDIDATES WITH ODDS EDGE")
+        print(f"  TOP HR CANDIDATES  (sorted by edge, then model prob)")
         print(f"{'='*85}")
         print(
-            f"  {'Batter':<24} {'Pitcher':<22} "
-            f"{'Model':>7} {'Market':>8} {'Fair':>7} {'Edge':>8}  {'Book':>4}"
+            f"  {'Batter':<26} {'Pitcher':<22} "
+            f"{'Model':>7}  {'Market':>7}  {'Edge':>8}  {'Odds':>6}  {'Kelly':>6}  {'Slot':>4}"
         )
-        print(f"  {'-'*24} {'-'*22} {'-'*7} {'-'*8} {'-'*7} {'-'*8}  {'-'*4}")
+        print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
 
-        shown = 0
-        for _, row in has_line.head(TOP_N).iterrows():
-            batter  = str(row.get("batter_name", ""))[:24]
+        bettable = ranked[ranked["edge"].notna() & (ranked["edge"] > 0)].sort_values(
+            ["edge", "hr_prob"], ascending=False
+        )
+        rest = ranked[~ranked.index.isin(bettable.index)].sort_values("hr_prob", ascending=False)
+        display = pd.concat([bettable, rest]).head(TOP_N)
+
+        for _, row in display.iterrows():
+            batter  = str(row.get("batter_name", ""))[:26]
             pitcher = str(row.get("pitcher_name", ""))[:22]
             model   = _format_pct(row.get("hr_prob"))
-            mkt     = _format_american_odds(row.get("market_over_price"))
-            fair    = _format_pct(row.get("market_fair_prob"))
+            market  = _format_pct(row.get("market_fair_prob"))
             edge    = _format_edge(row.get("edge"))
-            book    = str(row.get("odds_bookmaker", ""))[:4].upper()
+            odds    = _format_odds(row.get("market_over_price"))
+            kelly   = _format_pct(row.get("kelly_stake"))
+            pos     = int(row.get("batting_order_pos", 0))
+            flag    = "  ← BET" if (pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0) else ""
             print(
-                f"  {batter:<24} {pitcher:<22} "
-                f"{model:>7} {mkt:>8} {fair:>7} {edge:>8}  {book:<4}"
+                f"  {batter:<26} {pitcher:<22} "
+                f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {kelly:>6}  {pos:>4}{flag}"
             )
-            shown += 1
 
-        remaining = TOP_N - shown
-        if remaining > 0 and len(no_line) > 0:
-            print(f"\n  — No line available (model rank only) —")
-            for _, row in no_line.head(remaining).iterrows():
-                batter  = str(row.get("batter_name", ""))[:24]
-                pitcher = str(row.get("pitcher_name", ""))[:22]
-                model   = _format_pct(row.get("hr_prob"))
-                pos     = row.get("batting_order_pos", 0)
-                print(f"  {batter:<24} {pitcher:<22} {model:>7}   (slot {pos})")
-
+        n_edge = len(bettable)
+        if n_edge:
+            avg_edge  = bettable["edge"].mean() * 100
+            avg_kelly = bettable["kelly_stake"].mean() * 100 if "kelly_stake" in bettable else 0
+            print(f"\n  {n_edge} bets with positive edge | avg edge {avg_edge:.1f}pp | avg Kelly {avg_kelly:.1f}%")
+        else:
+            print(f"\n  No positive-edge bets today.")
         print(f"{'='*85}")
-        print(
-            "  Edge = model probability minus fair market probability (vig-removed).\n"
-            "  Positive edge = model more bullish than market.\n"
-            "  Market line is 0.5 HRs over/under unless noted."
-        )
 
     else:
-        # Original display — no odds available
         print(f"\n{'='*70}")
-        print(f"  TOP HR CANDIDATES (no odds data)")
+        print(f"  TOP HR CANDIDATES  (no odds data)")
         print(f"{'='*70}")
         print(
             f"  {'Batter':<26} {'Pitcher':<24} "
@@ -219,23 +238,67 @@ def print_ranked_table(ranked: pd.DataFrame, has_odds: bool) -> None:
         print(f"{'='*70}")
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    model, feature_cols, apply_shrinkage = load_model()
+    parser = argparse.ArgumentParser(
+        description="Score today's batters and print ranked HR candidates.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--run-type", choices=["morning", "final"], default=None,
+        help=(
+            "Pass label stamped into the output CSV filename. "
+            "'morning' = probable starters, early lines (no cache bypass). "
+            "'final'   = confirmed lineups, final lines (use with --force-refresh). "
+            "Omit for a one-off manual run."
+        ),
+    )
+    parser.add_argument(
+        "--force-refresh", action="store_true",
+        help=(
+            "Bypass schedule and odds disk caches. "
+            "Use on the final pass to pick up confirmed lineups and latest lines."
+        ),
+    )
+    parser.add_argument(
+        "--date", default=None,
+        help="Score a specific date (YYYY-MM-DD) instead of the latest in the train table.",
+    )
+    args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Load model + train table
+    # ------------------------------------------------------------------
+    model, feature_cols, apply_shrinkage_flag = load_model()
     train_path = latest_train_table()
 
     df = pd.read_parquet(train_path)
     df["game_date"] = pd.to_datetime(df["game_date"])
 
-    # Apply the same empirical Bayes shrinkage used at training time.
-    if apply_shrinkage:
+    if apply_shrinkage_flag:
         from src.model.train import apply_shrinkage as _apply_shrinkage
         print("Applying empirical Bayes shrinkage ...")
         df = _apply_shrinkage(df)
 
-    target_date = df["game_date"].max()
+    if args.date:
+        target_date = pd.Timestamp(args.date)
+    else:
+        target_date = df["game_date"].max()
+
     today_df = df[df["game_date"] == target_date].copy()
 
-    # Keep only feature columns that exist in the current table
+    if today_df.empty:
+        print(f"No rows found for {target_date.date()} in the train table.")
+        print("Run build_features_multi_season (or build_features_season) to add today.")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Score
+    # ------------------------------------------------------------------
     missing = [c for c in feature_cols if c not in today_df.columns]
     if missing:
         print(f"⚠️  {len(missing)} feature(s) missing at inference — filling with 0:")
@@ -246,7 +309,9 @@ if __name__ == "__main__":
     X = today_df[feature_cols].fillna(0.0)
     today_df["hr_prob"] = model.predict_proba(X)[:, 1]
 
+    # ------------------------------------------------------------------
     # Resolve player names
+    # ------------------------------------------------------------------
     all_ids: list[int] = []
     for col in ("batter", "pitcher"):
         if col in today_df.columns:
@@ -254,13 +319,12 @@ if __name__ == "__main__":
     id_name_map = _build_id_name_map(all_ids)
 
     today_df = add_player_names(today_df, id_name_map, "batter",  "batter_name")
-    if "pitcher" in today_df.columns:
-        today_df = add_player_names(today_df, id_name_map, "pitcher", "pitcher_name")
+    today_df = add_player_names(today_df, id_name_map, "pitcher", "pitcher_name")
 
     ranked = today_df.sort_values("hr_prob", ascending=False).reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # Odds enrichment — gracefully skipped if key is missing or API is down
+    # Odds enrichment
     # ------------------------------------------------------------------
     date_str = str(target_date.date())
     has_odds = False
@@ -273,6 +337,7 @@ if __name__ == "__main__":
                 ranked,
                 date_str,
                 api_key=odds_api_key,
+                force_refresh=args.force_refresh,
             )
             has_odds = ranked["edge"].notna().any()
         except Exception as e:
@@ -284,19 +349,49 @@ if __name__ == "__main__":
             "     export ODDS_API_KEY=your_key_here"
         )
 
-    print(f"\nPredictions for {date_str}:")
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
+    run_label = f" [{args.run_type.upper()} PASS]" if args.run_type else ""
+    print(f"\nPredictions for {date_str}{run_label}:")
+
+    if args.run_type == "morning":
+        print("  ⚠️  Lineups may not be confirmed yet — batting order positions are estimates.")
+    elif args.run_type == "final":
+        print("  ✓  Final pass — use this output for betting decisions.")
+
     print_ranked_table(ranked, has_odds=has_odds)
 
     # ------------------------------------------------------------------
-    # Save today's predictions to CSV for later odds-vs-outcome analysis
+    # Save CSV
     # ------------------------------------------------------------------
-    save_cols = ["batter_name", "pitcher_name", "hr_prob", "batter", "pitcher",
-                 "batting_order_pos", "expected_pa_today"]
+    save_cols = [
+        "batter_name", "pitcher_name", "hr_prob", "batter", "pitcher",
+        "batting_order_pos", "expected_pa_today",
+    ]
     if has_odds:
-        save_cols += ["market_over_price", "market_fair_prob", "edge", "odds_bookmaker"]
+        save_cols += [
+            "market_over_price", "market_fair_prob", "edge",
+            "odds_bookmaker", "kelly_stake",
+        ]
 
-    out_dir = PROJECT_ROOT / "data" / "predictions"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"predictions_{date_str}.csv"
-    ranked[[c for c in save_cols if c in ranked.columns]].to_csv(out_path, index=False)
+    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.run_type:
+        out_path = PREDICTIONS_DIR / f"predictions_{date_str}_{args.run_type}.csv"
+    else:
+        out_path = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
+
+    out_df = ranked[[c for c in save_cols if c in ranked.columns]].copy()
+    out_df["run_type"] = args.run_type or "manual"
+    out_df["run_at"]   = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    out_df.to_csv(out_path, index=False)
     print(f"\n  Saved: {out_path.relative_to(PROJECT_ROOT)}")
+
+    # Final pass also overwrites the canonical un-stamped file so any tool
+    # expecting predictions_YYYY-MM-DD.csv always gets the best snapshot.
+    if args.run_type == "final":
+        canonical = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
+        out_df.to_csv(canonical, index=False)
+        print(f"  Also saved: {canonical.relative_to(PROJECT_ROOT)}  (canonical)")

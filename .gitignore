@@ -162,6 +162,7 @@ cython_debug/
 # Project data + outputs (don't commit large/generated files)
 data/cache/
 data/processed/
+data/backtest/*_results.csv
 models/
 logs/
 patch_*\.py

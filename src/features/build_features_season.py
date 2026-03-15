@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.logging_config import configure_logging
 from src.features.build_features import build_features_for_range
+from src.features.build_features_multi_season import build_month
 
 logger = logging.getLogger(__name__)
 
@@ -32,23 +33,6 @@ def get_months_for_year(year: int) -> list[tuple[str, str]]:
     if overrides:
         return [(f"{year}-{s}", f"{year}-{e}") for s, e in overrides]
     return [(f"{year}-{s}", f"{year}-{e}") for s, e in SEASON_MONTHS]
-
-
-def build_month(start: str, end: str) -> Path:
-    out_path = PROCESSED_DIR / f"train_table_{start}_to_{end}.parquet"
-
-    if out_path.exists():
-        logger.info("Skipping (already exists): %s", out_path.name)
-        return out_path
-
-    result = build_features_for_range(start, end)
-    logger.info(
-        "Saved: %s | rows=%d | hr_rate=%.4f",
-        result.output_path.name,
-        len(result.features_df),
-        result.features_df["hr_hit"].mean(),
-    )
-    return result.output_path
 
 
 def build_season(year: int) -> Path:

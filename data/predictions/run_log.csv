@@ -1,0 +1,6 @@
+run_time_utc,game_date,pass,status,starters_confirmed,lineups_confirmed,odds_available,n_predictions,n_with_edge,elapsed_secs,notes
+2026-03-12T00:39:36.343751+00:00,2026-03-11,final,success,False,True,False,0,0,14.4,force_refresh=True
+2026-03-12T00:39:49.631355+00:00,2026-03-11,morning,success,False,True,False,0,0,12.6,force_refresh=False
+2026-03-12T00:40:04.606263+00:00,2026-03-11,final,success,False,True,False,0,0,14.1,force_refresh=True
+2026-03-13T01:12:58.933886+00:00,2026-03-12,final,success,False,True,False,0,0,18.3,force_refresh=True
+2026-03-13T01:18:02.351387+00:00,2026-03-12,final,success,False,True,False,0,0,12.7,force_refresh=True
