@@ -1,87 +1,91 @@
 """
 MLB HR Model — Daily Scheduler
 ===============================
-Runs predict.py at two key points each day:
+Runs predict.py at the right time for EVERY game wave each day.
 
-  Pass 1 — MORNING  (~10:00 AM ET): Probable starters are posted, early
-            prop lines may be available. Good for spotting early value
-            before the market tightens.
+Problem with a fixed 5pm final pass:
+  The original scheduler hardcoded 5pm ET as the final pass time.
+  That works for night games (7pm first pitch) but completely misses
+  afternoon games (1pm, 4pm starts) — either the pass fires after the
+  game has started, or lineups aren't confirmed yet when it fires early.
 
-  Pass 2 — FINAL    (~75 min before earliest first pitch): Official lineups
-            are confirmed, lines are final. This is the actionable output.
+Solution — game-aware pass timing:
+  This scheduler fetches actual first-pitch times from the MLB Stats API
+  and groups games into waves by start time. Each wave gets its own final
+  pass fired ~90 minutes before that wave's earliest first pitch.
 
-The scheduler detects which pass to run based on current time, refreshes
-the appropriate caches, and logs timing metadata to data/predictions/run_log.csv.
+  Typical daily schedule:
+    Noon games      → first pitch ~12:05 ET  → final pass ~10:30 ET
+    Afternoon games → first pitch ~4:05 ET   → final pass ~2:30 ET
+    Evening games   → first pitch ~7:05 ET   → final pass ~5:30 ET
+    Late games      → first pitch ~10:05 ET  → final pass ~8:30 ET
 
-Usage
------
-    # Run the correct pass for the current time automatically:
-    python -m src.scheduler
+  The morning pass still fires once at 10am ET and covers all games
+  (probable starters, early lines, no confirmed lineups yet).
 
-    # Force a specific pass:
-    python -m src.scheduler --pass morning
-    python -m src.scheduler --pass final
+Pass structure
+--------------
+  MORNING  — 10:00 AM ET daily
+    Probable starters posted; lineups NOT yet confirmed.
+    Good for spotting early line value.
 
-    # Dry-run: show what would run without executing:
-    python -m src.scheduler --dry-run
-
-    # List today's run history:
-    python -m src.scheduler --status
+  FINAL_WAVE_{N} — 90 min before each game wave's earliest first pitch
+    Confirmed lineups, final pre-game lines. USE THIS FOR BETS.
+    One Discord post per wave so you get picks as each group locks.
 
 Windows Task Scheduler setup
 -----------------------------
-Create two tasks in Task Scheduler pointing at this script:
-
-  Task 1 — Morning
-    Program:  C:\\path\\to\\.venv\\Scripts\\python.exe
+  Task 1 — Morning (fixed time, runs daily)
+    Program:   C:\\path\\to\\.venv\\Scripts\\python.exe
     Arguments: -m src.scheduler --pass morning
     Start in:  C:\\path\\to\\mlb-hr-model
     Trigger:   Daily at 10:00 AM
 
-  Task 2 — Final
-    Program:  C:\\path\\to\\.venv\\Scripts\\python.exe
-    Arguments: -m src.scheduler --pass final
+  Task 2 — Game-aware final passes (runs every 30 min, self-manages)
+    Program:   C:\\path\\to\\.venv\\Scripts\\python.exe
+    Arguments: -m src.scheduler --auto-final
     Start in:  C:\\path\\to\\mlb-hr-model
-    Trigger:   Daily at 5:00 PM
+    Trigger:   Daily, repeat every 30 minutes from 10:00 AM to 11:00 PM
 
-  (Adjust the final trigger based on your local timezone relative to ET.
-   Most day games start at 1pm ET; most night games at 7pm ET.
-   5pm ET gives ~2hr buffer before the typical first pitch.)
+  The --auto-final flag checks the current time against today's game
+  schedule and fires a final pass for any wave whose window just opened.
+  Running it every 30 min means you never miss a wave by more than 30 min.
 
-Data availability by pass
---------------------------
-  Morning pass:
-    - Probable starters:  Usually posted by 9–10am ET (not guaranteed)
-    - Batting orders:     NOT confirmed (lineups ~90 min before first pitch)
-    - Prop lines:         Sometimes open, sometimes not yet listed
-    - Best for:           Early-line value, overnight line moves
+Usage
+-----
+    # Morning pass (run at 10am):
+    python -m src.scheduler --pass morning
 
-  Final pass:
-    - Probable starters:  Confirmed (or scratched — schedule refresh catches this)
-    - Batting orders:     Confirmed for most games
-    - Prop lines:         Final pre-game lines, tightest spreads
-    - Best for:           Actual betting decisions
+    # Auto final — fires passes for any wave whose window is now open:
+    python -m src.scheduler --auto-final
 
-Output
-------
-  data/predictions/predictions_YYYY-MM-DD_morning.csv   ← morning snapshot
-  data/predictions/predictions_YYYY-MM-DD_final.csv     ← final snapshot (use this one)
-  data/predictions/predictions_YYYY-MM-DD.csv           ← symlink/copy of final pass
-  data/predictions/run_log.csv                          ← timing + data-quality log
+    # Force a specific named pass:
+    python -m src.scheduler --pass final
+
+    # Show today's game waves and when final passes are scheduled:
+    python -m src.scheduler --show-waves
+
+    # Show today's run history:
+    python -m src.scheduler --status
+
+    # Dry-run any of the above:
+    python -m src.scheduler --auto-final --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -90,52 +94,203 @@ from src.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT    = Path(__file__).resolve().parents[1]
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+SCHEDULE_CACHE  = PROJECT_ROOT / "data" / "cache" / "schedule"
+SCHEDULE_CACHE.mkdir(parents=True, exist_ok=True)
 
 RUN_LOG = PREDICTIONS_DIR / "run_log.csv"
+ET      = ZoneInfo("America/New_York")
 
-ET = ZoneInfo("America/New_York")
+# How far before first pitch to fire the final pass for a wave
+FINAL_PASS_LEAD_MINUTES = 90
 
-# ---------------------------------------------------------------------------
-# Pass definitions
-# ---------------------------------------------------------------------------
+# Games within this many minutes of each other are grouped into the same wave
+WAVE_GAP_MINUTES = 60
 
-# Morning pass: run at 10am ET, cache TTL = none (always fresh at this time)
-# Final pass:   run at 5pm ET  (or manually), force-refresh everything
-PASS_DEFINITIONS = {
-    "morning": {
-        "label":          "MORNING",
-        "run_hour_et":    10,
-        "force_refresh":  False,   # schedule cache may already be warm from yesterday
-        "description":    "Probable starters + early lines. Lineups not yet confirmed.",
-    },
-    "final": {
-        "label":          "FINAL",
-        "run_hour_et":    17,
-        "force_refresh":  True,    # always bypass caches for final pass
-        "description":    "Confirmed lineups + final pre-game lines. Use this for bets.",
-    },
-}
+# Morning pass fires at this ET hour regardless of game schedule
+MORNING_PASS_HOUR_ET = 10
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Time helpers
 # ---------------------------------------------------------------------------
 
 def now_et() -> datetime:
     return datetime.now(tz=ET)
 
 
-def detect_pass() -> str:
-    """Detect which pass to run based on current ET time."""
-    hour = now_et().hour
-    # Before 1pm → morning pass; 1pm+ → final pass
-    return "morning" if hour < 13 else "final"
-
-
 def today_str() -> str:
     return now_et().strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# Fetch today's game start times from MLB Stats API
+# ---------------------------------------------------------------------------
+
+def fetch_game_times(date_str: str, *, force_refresh: bool = False) -> list[datetime]:
+    """
+    Return a sorted list of first-pitch datetimes (ET) for all games on date_str.
+    Caches to data/cache/schedule/game_times_{date_str}.json.
+    Falls back to [] on any error so the scheduler degrades gracefully.
+    """
+    cache_path = SCHEDULE_CACHE / f"game_times_{date_str}.json"
+
+    if cache_path.exists() and not force_refresh:
+        try:
+            with open(cache_path) as f:
+                stored = json.load(f)
+            times = [datetime.fromisoformat(t).astimezone(ET) for t in stored["times"]]
+            logger.debug("Game times cache hit for %s (%d games)", date_str, len(times))
+            return times
+        except Exception as e:
+            logger.warning("Could not read game times cache: %s", e)
+
+    url = (
+        f"https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&date={date_str}&hydrate=team"
+    )
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("Failed to fetch game times for %s: %s", date_str, e)
+        return []
+
+    times = []
+    for date_entry in data.get("dates", []):
+        for game in date_entry.get("games", []):
+            raw = game.get("gameDate")  # ISO 8601 UTC string
+            if raw:
+                try:
+                    dt_utc = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    dt_et  = dt_utc.astimezone(ET)
+                    times.append(dt_et)
+                except Exception:
+                    pass
+
+    times.sort()
+
+    try:
+        with open(cache_path, "w") as f:
+            json.dump({"times": [t.isoformat() for t in times]}, f)
+    except Exception as e:
+        logger.warning("Could not write game times cache: %s", e)
+
+    logger.info("Fetched %d game times for %s", len(times), date_str)
+    return times
+
+
+# ---------------------------------------------------------------------------
+# Wave detection
+# ---------------------------------------------------------------------------
+
+def build_waves(game_times: list[datetime]) -> list[dict]:
+    """
+    Group game start times into waves — clusters of games whose start times
+    are within WAVE_GAP_MINUTES of each other.
+
+    Returns a list of wave dicts, each containing:
+        wave_id         : int (1-based)
+        earliest        : datetime  — earliest first pitch in the wave
+        latest          : datetime  — latest first pitch in the wave
+        game_count      : int
+        final_pass_time : datetime  — when to fire the final pass (earliest - lead)
+        label           : str       — human-readable label e.g. "NOON", "AFTERNOON"
+    """
+    if not game_times:
+        return []
+
+    waves: list[list[datetime]] = []
+    current_wave = [game_times[0]]
+
+    for t in game_times[1:]:
+        gap = (t - current_wave[-1]).total_seconds() / 60
+        if gap <= WAVE_GAP_MINUTES:
+            current_wave.append(t)
+        else:
+            waves.append(current_wave)
+            current_wave = [t]
+    waves.append(current_wave)
+
+    result = []
+    for i, wave in enumerate(waves, start=1):
+        earliest = wave[0]
+        latest   = wave[-1]
+        fp_time  = earliest - timedelta(minutes=FINAL_PASS_LEAD_MINUTES)
+        hour     = earliest.hour
+
+        if hour < 13:
+            label = "NOON"
+        elif hour < 16:
+            label = "AFTERNOON"
+        elif hour < 19:
+            label = "EARLY_EVENING"
+        elif hour < 22:
+            label = "EVENING"
+        else:
+            label = "LATE"
+
+        result.append({
+            "wave_id":         i,
+            "earliest":        earliest,
+            "latest":          latest,
+            "game_count":      len(wave),
+            "final_pass_time": fp_time,
+            "label":           label,
+            "pass_name": f"final_{label.lower()}_{i}",
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Determine which wave passes are due right now
+# ---------------------------------------------------------------------------
+
+def get_due_passes(
+    waves: list[dict],
+    *,
+    already_run: set[str],
+    lookback_minutes: int = 35,
+) -> list[dict]:
+    """
+    Return waves whose final_pass_time fell within the last `lookback_minutes`
+    AND have not already been run today.
+
+    lookback_minutes should be slightly longer than the Task Scheduler repeat
+    interval (default 30 min) to handle slight timing drift.
+    """
+    now   = now_et()
+    due   = []
+    for wave in waves:
+        fp = wave["final_pass_time"]
+        age_minutes = (now - fp).total_seconds() / 60
+        if 0 <= age_minutes <= lookback_minutes:
+            if wave["pass_name"] not in already_run:
+                due.append(wave)
+    return due
+
+
+# ---------------------------------------------------------------------------
+# Run log helpers
+# ---------------------------------------------------------------------------
+
+def load_already_run_today(date_str: str) -> set[str]:
+    """Return set of pass names that have already completed successfully today."""
+    if not RUN_LOG.exists():
+        return set()
+    try:
+        ran = set()
+        with open(RUN_LOG) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("game_date") == date_str and row.get("status") == "success":
+                    ran.add(row.get("pass", ""))
+        return ran
+    except Exception:
+        return set()
 
 
 def log_run(
@@ -150,7 +305,6 @@ def log_run(
     elapsed_secs: float | None,
     notes: str = "",
 ) -> None:
-    """Append a row to the run log CSV."""
     write_header = not RUN_LOG.exists()
     with open(RUN_LOG, "a", newline="") as f:
         writer = csv.writer(f)
@@ -175,45 +329,37 @@ def log_run(
         ])
 
 
+# ---------------------------------------------------------------------------
+# Data availability check (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def check_data_availability(date_str: str) -> dict:
-    """
-    Inspect the cached data for today to determine what's confirmed.
-    Returns a dict of availability flags without making any network calls.
-    """
-    import json
+    odds_cache = PROJECT_ROOT / "data" / "cache" / "odds"
 
-    schedule_cache = PROJECT_ROOT / "data" / "cache" / "schedule"
-    odds_cache     = PROJECT_ROOT / "data" / "cache" / "odds"
-
-    # --- Probable starters ---
-    date_cache = schedule_cache / f"schedule_{date_str}.json"
     starters_confirmed = False
+    date_cache = SCHEDULE_CACHE / f"schedule_{date_str}.json"
     if date_cache.exists():
-        with open(date_cache) as f:
-            games = json.load(f)
-        if isinstance(games, list) and games:
-            has_home = any(g.get("home_starter_id") is not None for g in games)
-            has_away = any(g.get("away_starter_id") is not None for g in games)
-            starters_confirmed = has_home and has_away
+        try:
+            with open(date_cache) as f:
+                games = json.load(f)
+            if isinstance(games, list) and games:
+                has_home = any(g.get("home_starter_id") is not None for g in games)
+                has_away = any(g.get("away_starter_id") is not None for g in games)
+                starters_confirmed = has_home and has_away
+        except Exception:
+            pass
 
-    # --- Lineups (batting orders from live feed) ---
     lineups_confirmed = False
-    game_caches = list(schedule_cache.glob("game_*.json"))
+    game_caches = list(SCHEDULE_CACHE.glob("game_*.json"))
     if game_caches:
-        confirmed_count = 0
-        for gc in game_caches[:5]:  # sample first 5 games
-            try:
-                with open(gc) as f:
-                    roster = json.load(f)
-                if roster.get("batting_orders"):
-                    confirmed_count += 1
-            except Exception:
-                pass
+        confirmed_count = sum(
+            1 for gc in game_caches[:5]
+            if _game_cache_has_lineups(gc)
+        )
         lineups_confirmed = confirmed_count >= 3
 
-    # --- Odds ---
-    odds_file = odds_cache / f"odds_{date_str}.json"
     odds_available = False
+    odds_file = odds_cache / f"odds_{date_str}.json"
     if odds_file.exists():
         try:
             with open(odds_file) as f:
@@ -229,27 +375,156 @@ def check_data_availability(date_str: str) -> dict:
     }
 
 
+def _game_cache_has_lineups(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            roster = json.load(f)
+        return bool(roster.get("batting_orders"))
+    except Exception:
+        return False
+
+
 def inspect_predictions_csv(path: Path) -> dict:
-    """Read a predictions CSV and return summary stats."""
-    import pandas as pd
-    if not path.exists():
+    try:
+        import pandas as pd
+        if not path.exists():
+            return {"n_predictions": 0, "n_with_edge": 0}
+        df = pd.read_csv(path)
+        n_edge = int(df["edge"].notna().sum()) if "edge" in df.columns else 0
+        return {"n_predictions": len(df), "n_with_edge": n_edge}
+    except Exception:
         return {"n_predictions": 0, "n_with_edge": 0}
-    df = pd.read_csv(path)
-    n_edge = int(df["edge"].notna().sum()) if "edge" in df.columns else 0
-    return {"n_predictions": len(df), "n_with_edge": n_edge}
 
 
-def print_status() -> None:
-    """Print today's run history from the log."""
-    date_str = today_str()
-    if not RUN_LOG.exists():
-        print(f"No run log found. Nothing has run yet.")
+# ---------------------------------------------------------------------------
+# Core pass runner
+# ---------------------------------------------------------------------------
+
+def run_pass(
+    pass_name: str,
+    *,
+    dry_run: bool = False,
+    force_refresh: bool = True,
+    description: str = "",
+) -> int:
+    """
+    Execute one prediction pass. Returns exit code.
+    pass_name is used as the --run-type label in predict.py AND as the
+    key logged to run_log.csv.
+    """
+    date_str   = today_str()
+    start_time = datetime.now(tz=timezone.utc)
+    avail      = check_data_availability(date_str)
+
+    print(f"\n{'='*72}")
+    print(f"  MLB HR MODEL — {pass_name.upper()} PASS  ({date_str})")
+    print(f"{'='*72}")
+    if description:
+        print(f"  {description}")
+    print(f"\n  Data availability:")
+    print(f"    Probable starters : {'confirmed' if avail['starters_confirmed'] else 'not yet posted'}")
+    print(f"    Batting lineups   : {'confirmed' if avail['lineups_confirmed'] else 'not yet confirmed'}")
+    print(f"    Prop lines        : {'available' if avail['odds_available'] else 'not yet available / no API key'}")
+    print(f"  Force-refresh caches: {force_refresh}")
+
+    # Map wave pass names (e.g. "final_evening") back to "final" for predict.py
+    # so it saves to the right canonical filename. We pass --wave-label separately.
+    predict_run_type = "morning" if pass_name == "morning" else "final"
+
+    if dry_run:
+        cmd_str = (
+            f"python -m src.model.predict --run-type {predict_run_type}"
+            + (" --force-refresh" if force_refresh else "")
+        )
+        print(f"\n  [DRY RUN] Would run: {cmd_str}")
+        print(f"{'='*72}\n")
+        return 0
+
+    cmd = [sys.executable, "-m", "src.model.predict", "--run-type", predict_run_type]
+    if force_refresh:
+        cmd.append("--force-refresh")
+
+    logger.info("Running: %s", " ".join(cmd))
+
+    try:
+        result    = subprocess.run(cmd, cwd=PROJECT_ROOT)
+        exit_code = result.returncode
+        status    = "success" if exit_code == 0 else f"failed (exit {exit_code})"
+    except Exception as e:
+        logger.error("predict.py crashed: %s", e)
+        exit_code = 1
+        status    = f"error: {e}"
+
+    elapsed = (datetime.now(tz=timezone.utc) - start_time).total_seconds()
+
+    out_csv = PREDICTIONS_DIR / f"predictions_{date_str}_{predict_run_type}.csv"
+    if not out_csv.exists():
+        out_csv = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
+    stats = inspect_predictions_csv(out_csv)
+
+    log_run(
+        pass_name=pass_name,
+        date_str=date_str,
+        status=status,
+        elapsed_secs=elapsed,
+        notes=f"force_refresh={force_refresh}",
+        **avail,
+        **stats,
+    )
+
+    print(f"\n  {'='*70}")
+    print(f"  {pass_name.upper()} complete — {status}")
+    print(f"  Predictions: {stats['n_predictions']}   With edge: {stats['n_with_edge']}   Elapsed: {elapsed:.0f}s")
+    print(f"  {'='*70}\n")
+
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# Show waves (diagnostic)
+# ---------------------------------------------------------------------------
+
+def show_waves(date_str: str) -> None:
+    game_times = fetch_game_times(date_str, force_refresh=True)
+    waves      = build_waves(game_times)
+    already    = load_already_run_today(date_str)
+
+    print(f"\n{'='*72}")
+    print(f"  MLB game waves for {date_str}  ({len(game_times)} games, {len(waves)} wave(s))")
+    print(f"{'='*72}")
+
+    if not waves:
+        print("  No games found (or MLB API unavailable).")
+        print(f"{'='*72}\n")
         return
 
-    import csv as _csv
+    for w in waves:
+        fp_str   = w["final_pass_time"].strftime("%I:%M %p ET")
+        e_str    = w["earliest"].strftime("%I:%M %p ET")
+        l_str    = w["latest"].strftime("%I:%M %p ET")
+        status   = "✓ already run" if w["pass_name"] in already else "pending"
+        print(
+            f"\n  Wave {w['wave_id']}  [{w['label']}]  —  {w['game_count']} game(s)"
+            f"\n    First pitches : {e_str} – {l_str}"
+            f"\n    Final pass at : {fp_str}  ({w['pass_name']})  {status}"
+        )
+
+    print(f"\n{'='*72}\n")
+
+
+# ---------------------------------------------------------------------------
+# Status (run log)
+# ---------------------------------------------------------------------------
+
+def print_status() -> None:
+    date_str = today_str()
+    if not RUN_LOG.exists():
+        print("No run log found. Nothing has run yet.")
+        return
+
     rows = []
     with open(RUN_LOG) as f:
-        reader = _csv.DictReader(f)
+        reader = csv.DictReader(f)
         for row in reader:
             if row.get("game_date") == date_str:
                 rows.append(row)
@@ -262,95 +537,22 @@ def print_status() -> None:
     print(f"  Run history for {date_str}")
     print(f"{'='*72}")
     for row in rows:
-        t = row.get("run_time_utc", "")[:19].replace("T", " ")
-        p = row.get("pass", "").upper()
-        status = row.get("status", "")
-        n   = row.get("n_predictions", "?")
-        ne  = row.get("n_with_edge", "?")
-        sec = row.get("elapsed_secs", "?")
+        t        = row.get("run_time_utc", "")[:19].replace("T", " ")
+        p        = row.get("pass", "").upper()
+        status   = row.get("status", "")
+        n        = row.get("n_predictions", "?")
+        ne       = row.get("n_with_edge", "?")
+        sec      = row.get("elapsed_secs", "?")
         starters = "✓" if row.get("starters_confirmed") == "True" else "✗"
         lineups  = "✓" if row.get("lineups_confirmed")  == "True" else "✗"
         odds     = "✓" if row.get("odds_available")     == "True" else "✗"
-        notes = row.get("notes", "")
+        notes    = row.get("notes", "")
         print(f"\n  [{p}]  {t} UTC  —  {status}")
         print(f"    Starters: {starters}   Lineups: {lineups}   Odds: {odds}")
         print(f"    Predictions: {n}   With edge: {ne}   Elapsed: {sec}s")
         if notes:
             print(f"    Notes: {notes}")
     print(f"{'='*72}\n")
-
-
-# ---------------------------------------------------------------------------
-# Main runner
-# ---------------------------------------------------------------------------
-
-def run_pass(pass_name: str, *, dry_run: bool = False) -> int:
-    """
-    Execute one prediction pass. Returns exit code.
-    """
-    defn        = PASS_DEFINITIONS[pass_name]
-    date_str    = today_str()
-    start_time  = datetime.now(tz=timezone.utc)
-
-    avail = check_data_availability(date_str)
-
-    print(f"\n{'='*72}")
-    print(f"  MLB HR MODEL — {defn['label']} PASS  ({date_str})")
-    print(f"{'='*72}")
-    print(f"  {defn['description']}")
-    print(f"\n  Data availability (pre-run):")
-    print(f"    Probable starters : {'confirmed' if avail['starters_confirmed'] else 'not yet posted'}")
-    print(f"    Batting lineups   : {'confirmed' if avail['lineups_confirmed'] else 'not yet confirmed'}")
-    print(f"    Prop lines        : {'available' if avail['odds_available'] else 'not yet available / no API key'}")
-    print(f"\n  Force-refresh caches: {defn['force_refresh']}")
-
-    if dry_run:
-        print(f"\n  [DRY RUN] Would run: python -m src.model.predict --run-type {pass_name}"
-              + (" --force-refresh" if defn["force_refresh"] else ""))
-        print(f"{'='*72}\n")
-        return 0
-
-    # Build the predict.py command
-    cmd = [sys.executable, "-m", "src.model.predict", "--run-type", pass_name]
-    if defn["force_refresh"]:
-        cmd.append("--force-refresh")
-
-    logger.info("Running: %s", " ".join(cmd))
-
-    try:
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT)
-        exit_code = result.returncode
-        status = "success" if exit_code == 0 else f"failed (exit {exit_code})"
-    except Exception as e:
-        logger.error("predict.py crashed: %s", e)
-        exit_code = 1
-        status = f"error: {e}"
-
-    elapsed = (datetime.now(tz=timezone.utc) - start_time).total_seconds()
-
-    # Inspect the output CSV for summary stats
-    out_csv = PREDICTIONS_DIR / f"predictions_{date_str}_{pass_name}.csv"
-    if not out_csv.exists():
-        out_csv = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
-    stats = inspect_predictions_csv(out_csv)
-
-    # Log the run
-    log_run(
-        pass_name=pass_name,
-        date_str=date_str,
-        status=status,
-        elapsed_secs=elapsed,
-        notes=f"force_refresh={defn['force_refresh']}",
-        **avail,
-        **stats,
-    )
-
-    print(f"\n  {'='*70}")
-    print(f"  {defn['label']} pass complete — {status}")
-    print(f"  Predictions: {stats['n_predictions']}   With edge: {stats['n_with_edge']}   Elapsed: {elapsed:.0f}s")
-    print(f"  {'='*70}\n")
-
-    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -361,30 +563,106 @@ def main() -> None:
     configure_logging()
 
     parser = argparse.ArgumentParser(
-        description="MLB HR model daily scheduler — runs predict.py at the right time",
+        description="MLB HR model scheduler — game-aware pass timing",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument(
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--pass", dest="pass_name", choices=["morning", "final"],
-        help="Which pass to run. Auto-detected from current time if omitted.",
+        help="Run a specific pass immediately (morning or final).",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Show what would run without executing.",
+    mode.add_argument(
+        "--auto-final", action="store_true",
+        help=(
+            "Check today's game schedule and fire final passes for any wave "
+            "whose window just opened. Schedule this every 30 min in Task Scheduler."
+        ),
     )
-    parser.add_argument(
+    mode.add_argument(
+        "--show-waves", action="store_true",
+        help="Print today's game waves and their scheduled pass times, then exit.",
+    )
+    mode.add_argument(
         "--status", action="store_true",
         help="Print today's run history and exit.",
     )
+
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would run without executing.")
+    parser.add_argument("--debug",   action="store_true")
     args = parser.parse_args()
 
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    date_str = today_str()
+
+    # ---- --status ----
     if args.status:
         print_status()
         return
 
-    pass_name = args.pass_name or detect_pass()
-    logger.info("Running %s pass (date: %s)", pass_name.upper(), today_str())
+    # ---- --show-waves ----
+    if args.show_waves:
+        show_waves(date_str)
+        return
 
-    sys.exit(run_pass(pass_name, dry_run=args.dry_run))
+    # ---- --pass morning | final ----
+    if args.pass_name:
+        is_morning = args.pass_name == "morning"
+        sys.exit(run_pass(
+            args.pass_name,
+            dry_run=args.dry_run,
+            force_refresh=not is_morning,
+            description=(
+                "Probable starters + early lines. Lineups not yet confirmed."
+                if is_morning else
+                "Confirmed lineups + final pre-game lines. Use this for bets."
+            ),
+        ))
+
+    # ---- --auto-final ----
+    if args.auto_final:
+        game_times = fetch_game_times(date_str, force_refresh=False)
+        waves      = build_waves(game_times)
+
+        if not waves:
+            print(f"No games found for {date_str} — nothing to do.")
+            return
+
+        already  = load_already_run_today(date_str)
+        due      = get_due_passes(waves, already_run=already)
+
+        if not due:
+            now_str = now_et().strftime("%I:%M %p ET")
+            print(f"[{now_str}] No final passes due right now.")
+            if args.dry_run:
+                show_waves(date_str)
+            return
+
+        for wave in due:
+            print(
+                f"\n⏰  Wave {wave['wave_id']} [{wave['label']}] final pass triggered "
+                f"({wave['game_count']} games, first pitch {wave['earliest'].strftime('%I:%M %p ET')})"
+            )
+            rc = run_pass(
+                wave["pass_name"],
+                dry_run=args.dry_run,
+                force_refresh=True,
+                description=(
+                    f"Final pass for {wave['label']} wave — "
+                    f"{wave['game_count']} game(s), first pitch {wave['earliest'].strftime('%I:%M %p ET')}"
+                ),
+            )
+            if rc != 0:
+                logger.warning("Pass %s exited with code %d", wave["pass_name"], rc)
+
+        return
+
+    # No mode specified — print help
+    parser.print_help()
 
 
 if __name__ == "__main__":
