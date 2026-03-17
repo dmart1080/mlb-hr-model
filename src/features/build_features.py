@@ -602,7 +602,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(weather_df, on="game_pk", how="left")
     )
 
-   # Park factor
+    # Park factor
     features_df["home_team"] = features_df["game_pk"].map(game_pk_to_home)
     for _str_col in ("batter_team", "home_team", "pitcher_hand", "batter_hand"):
         if _str_col in features_df.columns:

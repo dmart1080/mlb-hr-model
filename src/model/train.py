@@ -26,7 +26,7 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-TEST_START_DATE = "2025-03-27"
+TEST_START_DATE = "2026-03-26"
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +122,12 @@ class TrainResult:
 
 
 def latest_train_table() -> Path:
-    multi = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    multi = PROCESSED_DIR / "train_table_2021_2026_full.parquet"
     if multi.exists():
         return multi
+    multi_legacy = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    if multi_legacy.exists():
+        return multi_legacy
     season = PROCESSED_DIR / "train_table_2024_full_season.parquet"
     if season.exists():
         return season
@@ -497,7 +500,7 @@ def train_baseline(train_path: Path) -> TrainResult:
         "split_type":    split_type,
     }
 
-    model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2025.joblib"
+    model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2026.joblib"
     joblib.dump({
         "model": model,
         "feature_cols": feature_cols,

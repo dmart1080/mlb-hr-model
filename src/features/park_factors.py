@@ -3,7 +3,7 @@ Park factor utilities for the MLB HR model.
 
 Resolution order for any given season:
   1. Dynamic fetch from MLB Stats API (cached per season, refreshed if >30 days old)
-  2. Hardcoded 2024 static table (fallback if API unavailable)
+  2. Hardcoded 2025 static table (fallback if API unavailable)
   3. DEFAULT_PARK_FACTOR = 100 (neutral) for any team not found in either source
 """
 from __future__ import annotations
@@ -30,19 +30,36 @@ DEFAULT_PARK_FACTOR = 100
 # treated as partial/broken and we fall through to the static table.
 _MIN_TEAMS_REQUIRED = 20
 
+# Updated to 2025 Statcast HR park factors (source: Baseball Savant).
+# Used as the static fallback when the MLB Stats API is unavailable.
+# The dynamic API fetch supersedes this table once enough 2026 games are played.
+#
+# Notable changes from 2024:
+#   LAD 105→137  Dodger Stadium now #1 HR park in baseball
+#   PIT  95→ 66  PNC Park worst HR park in baseball
+#   STL  98→ 77  Busch Stadium second-worst
+#   TEX 107→ 80  Globe Life flipped to very pitcher-friendly
+#   BAL 110→121  Camden Yards wall changes fully took effect
+#   TOR 102→118  Rogers Centre playing very HR-friendly
+#   DET  95→114  Comerica surprise 2025 — monitor for regression
+#   ATH  —→112   Sutter Health Park (Sacramento) is a bandbox
+#   BOS 104→ 84  Fenway suppresses HRs despite hitter-friendly rep
+#   COL 120→126  Coors remains king
+#   TBR  97→102  Steinbrenner Field (Tampa) — 2025 temp home
 HR_PARK_FACTOR: dict[str, int] = {
-    "ARI": 102, "ATL": 108, "BAL": 110, "BOS": 104, "CHC": 102,
-    "CIN": 115, "CLE":  96, "COL": 120, "CWS": 101, "DET":  95,
-    "HOU": 101, "KCR":  97, "LAA":  98, "LAD": 105, "MIA":  92,
-    "MIL": 103, "MIN":  99, "NYM":  99, "NYY": 112, "OAK":  88,
-    "PHI": 110, "PIT":  95, "SDP":  94, "SEA":  90, "SFG":  92,
-    "STL":  98, "TBR":  97, "TEX": 107, "TOR": 102, "WSN":  96,
+    "ARI": 105, "ATL": 103, "ATH": 112, "BAL": 121, "BOS":  84,
+    "CHC":  97, "CIN": 110, "CLE":  93, "COL": 126, "CWS":  91,
+    "DET": 114, "HOU":  95, "KCR":  83, "LAA":  96, "LAD": 137,
+    "MIA":  84, "MIL": 100, "MIN": 106, "NYM":  98, "NYY": 108,
+    "OAK":  91, "PHI": 117, "PIT":  66, "SDP":  92, "SEA":  88,
+    "SFG":  84, "STL":  77, "TBR": 102, "TEX":  80, "TOR": 118,
+    "WSN":  99,
 }
 
 _TEAM_ID_TO_ABBR: dict[int, str] = {
     108: "LAA", 109: "ARI", 110: "BAL", 111: "BOS", 112: "CHC",
     113: "CIN", 114: "CLE", 115: "COL", 116: "DET", 117: "HOU",
-    118: "KCR", 119: "LAD", 120: "WSN", 121: "NYM", 133: "OAK",
+    118: "KCR", 119: "LAD", 120: "WSN", 121: "NYM", 133: "ATH",
     134: "PIT", 135: "SDP", 136: "SEA", 137: "SFG", 138: "STL",
     139: "TBR", 140: "TEX", 141: "TOR", 142: "MIN", 143: "PHI",
     144: "ATL", 145: "CWS", 146: "MIA", 147: "NYY", 158: "MIL",
@@ -195,7 +212,7 @@ def get_park_factors(season: int) -> dict[str, float]:
         return {k: v / 100.0 for k, v in stored.items()}
 
     logger.warning(
-        "Park factors: using static 2024 fallback for season=%d", season
+        "Park factors: using static 2025 fallback for season=%d", season
     )
     return {k: v / 100.0 for k, v in HR_PARK_FACTOR.items()}
 
@@ -210,7 +227,7 @@ if __name__ == "__main__":
     from src.logging_config import configure_logging
     configure_logging()
 
-    for yr in [2023, 2024, 2025]:
+    for yr in [2024, 2025, 2026]:
         pf = get_park_factors(yr)
         logger.info("%d park factors (%d teams):", yr, len(pf))
         for abbr, val in sorted(pf.items(), key=lambda x: -x[1]):

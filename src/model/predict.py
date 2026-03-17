@@ -65,9 +65,13 @@ def latest_train_table() -> Path:
       2. 2024 full-season file (legacy)
       3. Most-recently-modified train_table_*.parquet
     """
-    multi = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    multi = PROCESSED_DIR / "train_table_2021_2026_full.parquet"
     if multi.exists():
         return multi
+
+    multi_legacy = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    if multi_legacy.exists():
+        return multi_legacy
 
     season = PROCESSED_DIR / "train_table_2024_full_season.parquet"
     if season.exists():
@@ -91,6 +95,8 @@ def load_model():
       3. Legacy 2024 models
     """
     candidates = [
+        MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2026.joblib",
+        MODELS_DIR / "hr_model_logreg_calibrated_2021_2026.joblib",
         MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2025.joblib",
         MODELS_DIR / "hr_model_logreg_calibrated_2021_2025.joblib",
         MODELS_DIR / "hr_model_lightgbm_calibrated_2024.joblib",
@@ -392,22 +398,22 @@ if __name__ == "__main__":
     # Final pass also overwrites the canonical un-stamped file so any tool
     # expecting predictions_YYYY-MM-DD.csv always gets the best snapshot.
     if args.run_type == "final":
-            canonical = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
-            out_df.to_csv(canonical, index=False)
-            print(f"  Also saved: {canonical.relative_to(PROJECT_ROOT)}  (canonical)")
-    
-        # ------------------------------------------------------------------
-        # Discord notification
-        # ------------------------------------------------------------------
+        canonical = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
+        out_df.to_csv(canonical, index=False)
+        print(f"  Also saved: {canonical.relative_to(PROJECT_ROOT)}  (canonical)")
+
+    # ------------------------------------------------------------------
+    # Discord notification
+    # ------------------------------------------------------------------
     try:
-            from src.notifications.discord import send_to_discord
-            pass_label = (args.run_type or "manual").upper()
-            sent = send_to_discord(
-                ranked,
-                pass_label=pass_label,
-                date_str=date_str,
-            )
-            if sent:
-                print(f"  Discord: picks posted ✓")
+        from src.notifications.discord import send_to_discord
+        pass_label = (args.run_type or "manual").upper()
+        sent = send_to_discord(
+            ranked,
+            pass_label=pass_label,
+            date_str=date_str,
+        )
+        if sent:
+            print(f"  Discord: picks posted ✓")
     except Exception as _disc_err:
-            print(f"  Discord: notification failed — {_disc_err}")
+        print(f"  Discord: notification failed — {_disc_err}")

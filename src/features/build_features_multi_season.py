@@ -19,6 +19,7 @@ SEASONS = [
     ("2023-03-30", "2023-10-01"),
     ("2024-03-20", "2024-10-01"),
     ("2025-03-27", "2025-10-01"),
+    ("2026-03-26", "2026-10-01"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -26,7 +27,7 @@ SEASONS = [
 # Set to True to build only one month of 2025 data and verify the full
 # pipeline before committing to a full multi-season rebuild.
 # ---------------------------------------------------------------------------
-TEST_MODE = False
+TEST_MODE = True
 TEST_RANGE = ("2025-03-27", "2025-04-30")
 
 
@@ -60,7 +61,7 @@ def build_month(start: str, end: str) -> Path:
     return result.output_path
 
 
-def build_multi_season(output_name: str = "train_table_2021_2025_full.parquet") -> Path:
+def build_multi_season(output_name: str = "train_table_2021_2026_full.parquet") -> Path:
     """
     Build (or resume) feature tables for all seasons in SEASONS,
     then concatenate into a single parquet file.
