@@ -12,8 +12,8 @@ Usage
     # Morning pass — probable starters, early lines:
     python -m src.model.predict --run-type morning
 
-    # Final pass — confirmed lineups, final lines (bypasses caches):
-    python -m src.model.predict --run-type final --force-refresh
+    # Final pass — confirmed lineups, final lines (--force-refresh auto-enabled):
+    python -m src.model.predict --run-type final
 
     # Score a specific date:
     python -m src.model.predict --date 2026-04-01
@@ -259,7 +259,7 @@ if __name__ == "__main__":
         help=(
             "Pass label stamped into the output CSV filename. "
             "'morning' = probable starters, early lines (no cache bypass). "
-            "'final'   = confirmed lineups, final lines (use with --force-refresh). "
+            "'final'   = confirmed lineups, final lines (--force-refresh auto-enabled). "
             "Omit for a one-off manual run."
         ),
     )
@@ -275,6 +275,14 @@ if __name__ == "__main__":
         help="Score a specific date (YYYY-MM-DD) instead of the latest in the train table.",
     )
     args = parser.parse_args()
+
+    # Final passes should always bypass caches — confirmed lineups and the
+    # latest odds lines must be fetched fresh, not served from a stale cache.
+    # Auto-enable here so a manual `python -m src.model.predict --run-type final`
+    # behaves correctly without requiring the user to remember a second flag.
+    if args.run_type == "final" and not args.force_refresh:
+        args.force_refresh = True
+        print("ℹ️  Final pass: --force-refresh enabled automatically.")
 
     # ------------------------------------------------------------------
     # Load model + train table

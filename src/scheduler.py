@@ -427,6 +427,20 @@ def run_pass(
     print(f"    Prop lines        : {'available' if avail['odds_available'] else 'not yet available / no API key'}")
     print(f"  Force-refresh caches: {force_refresh}")
 
+    # Warn when a final pass fires before books have posted HR props.
+    # Books typically open props 2-4 hours before first pitch; the final pass
+    # fires 90 min out, so there's a window where lines aren't up yet.
+    # We proceed (model-only output is still valid) but surface it clearly
+    # so the user knows to re-run manually once lines post.
+    is_final = not pass_name.startswith("morning")
+    if is_final and not avail["odds_available"]:
+        print(
+            "\n  ⚠️  WARNING: Prop lines are not yet available for this final pass.\n"
+            "     Output will be model-only — no edge, Kelly, or odds columns.\n"
+            "     Once lines post, re-run to get edge-filtered picks:\n"
+            "       python -m src.scheduler --pass final"
+        )
+
     # Map wave pass names (e.g. "final_evening") back to "final" for predict.py
     # so it saves to the right canonical filename. We pass --wave-label separately.
     predict_run_type = "morning" if pass_name == "morning" else "final"
