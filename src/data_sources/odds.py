@@ -422,15 +422,30 @@ def kelly_fraction(
     american_odds: market over price in American format (e.g. -130, +110)
     kelly_mult   : fraction of full Kelly to use (default 0.25)
 
+    Notes
+    -----
+    For HR props, market_over_price typically ranges from +200 to +700
+    (fair prob 12–33%).  Kelly is 0.0 whenever model_prob ≤ break-even
+    probability implied by the market odds, which is 1/(1 + b).
+
     Example
     -------
-        model_prob=0.18, american_odds=-130  →  ~3.5% of bankroll
+        model_prob=0.25, american_odds=+300  →  ~2.5% of bankroll
+        b = 300/100 = 3.0
+        break-even = 1/(1+3) = 25.0%  — model is exactly at break-even → 0.0%
+
+        model_prob=0.30, american_odds=+300  →  ~1.25% of bankroll
+        f_full = (3*0.30 - 0.70)/3 = 0.20/3 = 0.067
+        f_frac = 0.067 * 0.25 = 1.67%
+
+        model_prob=0.18, american_odds=-130  →  0.0% (model below break-even of 56.5%)
     """
+    # Convert to net decimal profit per $1 risked (same as decimal_odds - 1)
     if american_odds < 0:
-        b = 100 / abs(american_odds)
+        b = 100.0 / abs(american_odds)
     else:
-        b = american_odds / 100
-    p = model_prob
+        b = american_odds / 100.0
+    p = float(model_prob)
     q = 1.0 - p
     if b <= 0:
         return 0.0

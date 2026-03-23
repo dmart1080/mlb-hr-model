@@ -333,11 +333,17 @@ def edge_threshold_sweep(results: pd.DataFrame, kelly_mult: float = KELLY_FRACTI
         win_rate  = subset["actual_hr"].mean()
         units_1u  = subset["pnl_1u"].sum()
         roi_1u    = units_1u / n
-        kelly_pnl = subset.apply(
-            lambda r: _bet_pnl(r["market_over_price"], bool(r["actual_hr"]))
-                      * kelly_fraction(r["hr_prob"], r["market_over_price"], kelly_mult),
-            axis=1,
-        ).sum()
+        # Use pre-computed kelly_pnl column from build_results where available —
+        # avoids redundant row-wise apply() and guarantees consistency with
+        # the kelly_stake already written into the results DataFrame.
+        if "kelly_pnl" in subset.columns and subset["kelly_pnl"].notna().any():
+            kelly_pnl = subset["kelly_pnl"].sum()
+        else:
+            kelly_pnl = subset.apply(
+                lambda r: _bet_pnl(r["market_over_price"], bool(r["actual_hr"]))
+                          * kelly_fraction(r["hr_prob"], r["market_over_price"], kelly_mult),
+                axis=1,
+            ).sum()
         roi_kelly = kelly_pnl / n if n > 0 else np.nan
         rows.append({
             "min_edge":    round(t, 2),

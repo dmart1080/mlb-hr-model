@@ -169,24 +169,35 @@ def load_train_table(
     end_date: str | None = None,
 ) -> pd.DataFrame:
     """Load the multi-season train table and filter to date range."""
+    # Explicit candidates in preference order — add new filenames here when
+    # train.py saves under a new name (e.g. 2021_2027 next year).
     candidates = [
+        PROCESSED_DIR / "train_table_2021_2026_full.parquet",
         PROCESSED_DIR / "train_table_2021_2025_full.parquet",
         PROCESSED_DIR / "train_table_2024_full_season.parquet",
     ]
     path = None
     for c in candidates:
-        if c.exists():
+        if c.exists() and c.stat().st_size > 10_000:
             path = c
             break
     if path is None:
-        # Try any train_table_*.parquet
-        files = sorted(PROCESSED_DIR.glob("train_table_*.parquet"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        # Glob fallback: prefer largest non-empty combined file over per-month stubs.
+        files = [
+            p for p in PROCESSED_DIR.glob("train_table_*.parquet")
+            if p.stat().st_size > 10_000 and "full" in p.name
+        ]
+        if not files:
+            files = [
+                p for p in PROCESSED_DIR.glob("train_table_*.parquet")
+                if p.stat().st_size > 10_000
+            ]
         if not files:
             raise FileNotFoundError(
-                "No train_table_*.parquet found in data/processed/.\n"
+                "No non-empty train_table_*.parquet found in data/processed/.\n"
                 "Run src/features/build_features_multi_season.py first."
             )
+        files.sort(key=lambda p: p.stat().st_size, reverse=True)
         path = files[0]
 
     logger.info("Loading train table: %s", path.name)
@@ -212,7 +223,11 @@ def score_with_model(df: pd.DataFrame) -> pd.DataFrame:
     import joblib
     import glob as _glob
 
+    # Preference order: newest combined model first.
+    # Add the next year's filename here each offseason after retraining.
     candidates = [
+        MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2026.joblib",
+        MODELS_DIR / "hr_model_logreg_calibrated_2021_2026.joblib",
         MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2025.joblib",
         MODELS_DIR / "hr_model_logreg_calibrated_2021_2025.joblib",
         MODELS_DIR / "hr_model_lightgbm_calibrated_2024.joblib",

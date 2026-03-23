@@ -131,13 +131,14 @@ def latest_train_table() -> Path:
     season = PROCESSED_DIR / "train_table_2024_full_season.parquet"
     if season.exists():
         return season
-    files = sorted(
-        PROCESSED_DIR.glob("train_table_*.parquet"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # Glob fallback: sort by size so empty stubs never win over real data.
+    files = [
+        p for p in PROCESSED_DIR.glob("train_table_*.parquet")
+        if p.stat().st_size > 10_000
+    ]
     if not files:
-        raise FileNotFoundError("No train_table_*.parquet found in data/processed/")
+        raise FileNotFoundError("No non-empty train_table_*.parquet found in data/processed/")
+    files.sort(key=lambda p: p.stat().st_size, reverse=True)
     return files[0]
 
 
