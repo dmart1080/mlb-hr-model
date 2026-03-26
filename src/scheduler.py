@@ -226,7 +226,7 @@ def get_due_passes(
     waves: list[dict],
     *,
     already_run: set[str],
-    lookback_minutes: int = 35,
+    lookback_minutes: int = 240,
 ) -> list[dict]:
     """
     Return waves whose final_pass_time fell within the last `lookback_minutes`
@@ -321,29 +321,52 @@ def check_data_availability(date_str: str) -> dict:
 
     roster_cache_dir = PROJECT_ROOT / "data" / "cache" / "schedule"
     if roster_cache_dir.exists():
-        pattern = f"*{date_str}*"
-        cache_files = list(roster_cache_dir.glob(pattern))
-        if cache_files:
-            starters_confirmed = True
-            for path in cache_files:
-                if _game_cache_has_lineups(path):
-                    lineups_confirmed = True
-                    break
+        # Check the schedule_{date}.json for actual starter IDs (not just any file)
+        schedule_cache = roster_cache_dir / f"schedule_{date_str}.json"
+        if schedule_cache.exists():
+            try:
+                with open(schedule_cache) as f:
+                    games = json.load(f)
+                if isinstance(games, list) and games:
+                    has_home = any(g.get("home_starter_id") is not None for g in games)
+                    has_away = any(g.get("away_starter_id") is not None for g in games)
+                    starters_confirmed = has_home and has_away
+            except Exception:
+                pass
+
+        # Check game_*.json files for confirmed batting orders
+        game_cache_files = list(roster_cache_dir.glob(f"game_*{date_str}*.json"))
+        if not game_cache_files:
+            game_cache_files = list(roster_cache_dir.glob("game_*.json"))
+        for path in game_cache_files:
+            if _game_cache_has_lineups(path):
+                lineups_confirmed = True
+                break
 
     odds_cache_dir = PROJECT_ROOT / "data" / "cache" / "odds"
     if odds_cache_dir.exists():
-        odds_file = odds_cache_dir / f"hr_props_{date_str}.json"
-        if not odds_file.exists():
-            # try any file for today
+        # Check all known naming conventions, then fall back to any file for today
+        candidate_names = [
+            f"odds_{date_str}.json",
+            f"hr_props_{date_str}.json",
+        ]
+        odds_file = None
+        for name in candidate_names:
+            p = odds_cache_dir / name
+            if p.exists():
+                odds_file = p
+                break
+        if odds_file is None:
             today_files = list(odds_cache_dir.glob(f"*{date_str}*"))
             if today_files:
                 odds_file = today_files[0]
-        try:
-            with open(odds_file) as f:
-                odds_data = json.load(f)
-            odds_available = len(odds_data.get("props", [])) > 0
-        except Exception:
-            pass
+        if odds_file is not None:
+            try:
+                with open(odds_file) as f:
+                    odds_data = json.load(f)
+                odds_available = len(odds_data.get("props", [])) > 0
+            except Exception:
+                pass
 
     return {
         "starters_confirmed": starters_confirmed,
@@ -488,9 +511,12 @@ def run_pass(
         date_str=date_str,
         status=status,
         elapsed_secs=elapsed,
+        starters_confirmed=avail["starters_confirmed"],
+        lineups_confirmed=avail["lineups_confirmed"],
+        odds_available=avail["odds_available"],
+        n_predictions=stats["n_predictions"],
+        n_with_edge=stats["n_with_edge"],
         notes=f"force_refresh={force_refresh}",
-        **avail,
-        **stats,
     )
 
     print(f"\n  {'='*70}")
@@ -561,13 +587,22 @@ def print_status() -> None:
         t        = row.get("run_time_utc", "")[:19].replace("T", " ")
         p        = row.get("pass", "").upper()
         status   = row.get("status", "")
-        n        = row.get("n_predictions", "?")
-        ne       = row.get("n_with_edge", "?")
         sec      = row.get("elapsed_secs", "?")
         starters = "✓" if row.get("starters_confirmed") == "True" else "✗"
         lineups  = "✓" if row.get("lineups_confirmed")  == "True" else "✗"
         odds     = "✓" if row.get("odds_available")     == "True" else "✗"
         notes    = row.get("notes", "")
+
+        # Safely parse prediction counts — guard against old schema where
+        # booleans were accidentally stored in these columns.
+        raw_n  = row.get("n_predictions", "?")
+        raw_ne = row.get("n_with_edge", "?")
+        try:
+            n  = int(raw_n)  if str(raw_n).lstrip("-").isdigit() else "?"
+            ne = int(raw_ne) if str(raw_ne).lstrip("-").isdigit() else "?"
+        except (ValueError, TypeError):
+            n, ne = "?", "?"
+
         print(f"\n  [{p}]  {t} UTC  —  {status}")
         print(f"    Starters: {starters}   Lineups: {lineups}   Odds: {odds}")
         print(f"    Predictions: {n}   With edge: {ne}   Elapsed: {sec}s")

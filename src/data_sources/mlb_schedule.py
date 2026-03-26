@@ -88,11 +88,29 @@ def fetch_probable_starters_for_date(
                 "away_starter_id":  int(away_prob["id"]) if away_prob else None,
             })
 
-    with open(cache, "w") as f:
-        json.dump(rows, f)
+    df = pd.DataFrame(rows)
 
-    logger.debug("Fetched %d games for %s", len(rows), date_str)
-    return pd.DataFrame(rows)
+    # --- Rotowire fallback: fill any None starter IDs ---
+    missing_home = df["home_starter_id"].isna().sum()
+    missing_away = df["away_starter_id"].isna().sum()
+    if missing_home > 0 or missing_away > 0:
+        logger.info(
+            "MLB API missing starters: %d home, %d away — trying Rotowire fallback",
+            missing_home, missing_away,
+        )
+        try:
+            from src.data_sources.rotowire_starters import enrich_schedule_with_rotowire
+            df = enrich_schedule_with_rotowire(df, date_str, force_refresh=force_refresh)
+        except Exception as e:
+            logger.warning("Rotowire fallback failed: %s", e)
+    else:
+        df["starter_source"] = "mlb_api"
+
+    with open(cache, "w") as f:
+        json.dump(df.to_dict("records"), f)
+
+    logger.debug("Fetched %d games for %s", len(df), date_str)
+    return df
 
 
 # ---------------------------------------------------------------------------

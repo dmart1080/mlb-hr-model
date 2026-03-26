@@ -206,25 +206,25 @@ def build_picks_payload(
     else:
         bets = ranked_df.sort_values("hr_prob", ascending=False).head(10).copy()
 
+    no_edge_fallback = False
     if bets.empty:
-        # Send a "no picks" notice
-        payload = {
-            "embeds": [{
-                "title": f"⚾ MLB HR Picks — {date_str} [{pass_label}]",
-                "description": "No positive-edge bets found today. 🔍",
-                "color": COLOUR_NO_ODDS,
-                "footer": {"text": f"MLB HR Model • {pass_label} pass • {date_str}"},
-            }]
-        }
-        return [payload]
+        # No positive-edge bets — fall back to top picks by model prob, flagged as no edge
+        bets = ranked_df.sort_values("hr_prob", ascending=False).head(10).copy()
+        no_edge_fallback = True
 
-    colour = COLOUR_FINAL if pass_label == "FINAL" else COLOUR_MORNING
+    colour = COLOUR_NO_ODDS if no_edge_fallback else (COLOUR_FINAL if pass_label == "FINAL" else COLOUR_MORNING)
 
     payloads = []
 
     # ---- Header message ----
     n_bets = len(bets)
-    if has_odds:
+    if no_edge_fallback:
+        desc = (
+            f"**⚠️ No Edge Today — Top {n_bets} Model Picks**\n"
+            f"No positive-edge bets found vs current lines. "
+            f"These are the model's best HR candidates but **bet at your own risk**."
+        )
+    elif has_odds:
         avg_edge = bets["edge"].mean() * 100
         desc = (
             f"**{n_bets} bet{'s' if n_bets != 1 else ''} with positive edge** "
@@ -264,6 +264,13 @@ def build_picks_payload(
             {"name": "📍 Batting Slot",  "value": str(slot), "inline": True},
             {"name": "🤖 Model Prob",    "value": model,    "inline": True},
         ]
+
+        if no_edge_fallback:
+            fields.insert(0, {
+                "name": "⚠️ NO EDGE",
+                "value": "Model pick only — no positive edge vs current market lines.",
+                "inline": False,
+            })
 
         if has_odds:
             fields += [
