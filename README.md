@@ -1,80 +1,16 @@
-# mlb-hr-model
+# MLB HR Model
 
-MLB home run prediction model using Statcast data. Given a batter–pitcher matchup and game context, the model outputs the probability that the batter hits at least one home run in that game.
-
-## Results (2024 season, single-season baseline)
-
-| Metric | Value |
-|---|---|
-| ROC-AUC | 0.623 |
-| Log loss | 0.323 |
-| Baseline HR rate | 10.1% |
-| Top 10% bucket HR rate | 15.1% (1.49× baseline) |
-| Top 1% bucket HR rate | 22.2% (2.19× baseline) |
-
-Model: LightGBM + sigmoid calibration. Trained on 2021–2024, tested on 2025 (out-of-time) once the multi-season data build completes. Results above are from the 2024 single-season baseline; multi-season results will be updated once the full build runs.
+A machine-learning pipeline that predicts daily MLB home run probabilities, identifies edges against sportsbook lines, and posts picks to Discord automatically — with no manual intervention required.
 
 ---
 
 ## How it works
 
-Each row in the training table represents one batter–game opportunity. The label is `hr_hit = 1` if the batter hit at least one home run in that game.
+1. **Morning pass (10 AM ET)** — scores every batter on today's slate using probable starters and early lines. Good for spotting value before the market moves.
+2. **Final passes (90 min before each game wave)** — re-scores with confirmed lineups and live prop lines. These are the picks to bet.
+3. **Discord** gets one embed per pick, per wave, automatically.
 
-**Only regular season games are used** (`game_type = "R"`). Spring training, postseason, All-Star, and exhibition games are excluded at the Statcast fetch level and double-filtered in the feature builder.
-
-Features are computed from Statcast pitch/event data using rolling windows calculated strictly before the game date (no leakage):
-
-### Batter features
-
-| Group | Features |
-|---|---|
-| **14-day rolling** | PA count, HR rate, barrel rate, EV mean, LA mean, hard-hit rate, FB rate, K rate, BB rate |
-| **14-day platoon** | HR rate, barrel rate, hard-hit rate vs LHP and vs RHP separately |
-| **Season-to-date** | Same contact-quality set as 14-day |
-| **Season platoon** | HR rate, barrel rate, hard-hit rate vs LHP and vs RHP |
-| **7-day trend** | EV trend, hard-hit trend, barrel trend, HR trend (7d minus prior 7d) |
-| **Home/away splits** | HR rate, hard-hit rate, barrel rate at home vs away (season) |
-| **Context** | `is_home_game`, `same_hand_matchup` (batter hand vs pitcher hand) |
-| **Lineup** | `batting_order_pos` (1–9), `is_top_of_order` (slots 1–4), `expected_pa_today` |
-| **Rest** | `b_days_rest` (days since last game) |
-
-### Pitcher features
-
-All pitcher features are computed against the **actual starting pitcher** resolved via the MLB Stats API live feed, not the mode-pitcher proxy.
-
-| Group | Features |
-|---|---|
-| **30-day rolling** | PA faced, HR allowed rate, EV allowed mean, hard-hit allowed rate, FB allowed rate, barrel allowed rate, K rate, BB rate |
-| **30-day platoon** | HR allowed rate, hard-hit allowed rate, barrel allowed rate vs LHB and vs RHB |
-| **Season-to-date** | Same set as 30-day |
-| **Season platoon** | HR allowed rate, hard-hit allowed rate, barrel allowed rate vs LHB and vs RHB |
-| **Velo (30-day)** | Fastball velocity mean, fastball usage %, offspeed usage % |
-| **Velo trend** | FB velo change (recent 3 starts vs prior 3 starts) |
-| **Rest** | `p_days_rest`, `p_is_short_rest` (≤3 days) |
-
-### Edge / interaction features
-
-Batter 14-day minus pitcher 30-day for EV, hard-hit rate, FB rate, barrel rate, HR rate, K rate, BB rate. Also: platoon-split edges (vsL, vsR), K-rate interaction, BB-rate interaction, contact pressure composite, discipline balance.
-
-### Context features
-
-| Feature | Description |
-|---|---|
-| `park_factor_hr` | HR park factor fetched from MLB Stats API per season (cached 30 days; falls back to static 2024 table if API returns fewer than 20 teams or missing `parkFactor` field) |
-| `temp_f`, `wind_hr_impact` | Game-day temperature and wind impact on HR (direction × speed) |
-| `is_indoor` | 1 for domed stadiums (MIA, HOU, SEA, ARI, MIL, TOR, TB); wind and temp forced to neutral |
-| `temp_above_75`, `temp_above_85`, `wind_out_strong`, `wind_in_strong` | Binary weather flags |
-| `relief_pa_pct` | Fraction of in-game PAs taken against non-starters; discounts starter-based matchup features |
-
-### Cold-start handling
-
-All rate features use **empirical Bayes shrinkage** toward league-average priors so low-PA players regress to the mean rather than showing misleading zeros or extreme rates:
-
-- Batter prior: 50 PA
-- Pitcher prior: 75 PA
-- League rates: HR 3.3%, barrel 7.3%, hard-hit 38.0%, FB 35.0%, K 22.7%, BB 8.3%
-
-Shrinkage is applied at both **training time** (in `train.py`) and **inference time** (in `predict.py` when `apply_shrinkage=True` is stored in the model bundle).
+The scheduler is game-aware: it groups games into waves by start time and fires a separate final pass for each wave (noon games, afternoon games, evening games, etc.) so you never miss a slate.
 
 ---
 
@@ -90,26 +26,35 @@ mlb-hr-model/
 │   │   ├── odds/               # Odds API HR prop cache (TTL 2h)
 │   │   └── park_factors/       # Park factor cache (TTL 30d)
 │   ├── processed/              # Feature tables and train tables (gitignored)
-│   └── predictions/            # Daily prediction CSVs: predictions_YYYY-MM-DD.csv
-├── models/                     # Saved .joblib bundles + train_runs.csv log (gitignored)
+│   ├── predictions/            # Daily prediction CSVs + run_log.csv
+│   ├── backtest/               # Backtest results
+│   └── recaps/                 # Weekly recap CSVs
+├── models/                     # Saved .joblib model bundles + train_runs.csv (gitignored)
 ├── src/
-│   ├── logging_config.py           # Centralised logging setup
+│   ├── logging_config.py
+│   ├── scheduler.py                        # Game-aware daily scheduler (main entry point)
 │   ├── data_sources/
-│   │   ├── statcast.py             # Statcast fetch + disk cache + RS filter
-│   │   ├── weather.py              # MLB Stats API weather fetch + cache
-│   │   ├── mlb_schedule.py         # MLB Stats API: probable/actual starters + batting orders
-│   │   └── odds.py                 # The Odds API: HR prop lines + edge calculation
+│   │   ├── statcast.py                     # Statcast fetch + disk cache
+│   │   ├── weather.py                      # MLB Stats API weather
+│   │   ├── mlb_schedule.py                 # Probable starters + confirmed lineups
+│   │   └── odds.py                         # The Odds API: HR props + edge calc
 │   ├── features/
-│   │   ├── build_labels.py             # Collapse events → batter-game labels
-│   │   ├── build_features_common.py    # Shared constants + pure helpers (base layer)
-│   │   ├── build_features_fast.py      # Vectorised rolling window computation
-│   │   ├── build_features.py           # Main feature pipeline (calls fast + enrichments)
-│   │   ├── build_features_season.py    # Single-season build CLI
-│   │   ├── build_features_multi_season.py  # Multi-season build (2021–2025)
-│   │   └── park_factors.py             # HR park factor fetch + static fallback
-│   └── model/
-│       ├── train.py        # Train + calibrate + save model
-│       └── predict.py      # Load model, score latest date, print ranked list + save CSV
+│   │   ├── build_labels.py                 # Collapse events → batter-game labels
+│   │   ├── build_features_common.py        # Shared constants + pure helpers
+│   │   ├── build_features_fast.py          # Vectorised rolling window computation
+│   │   ├── build_features.py               # Main feature pipeline
+│   │   ├── build_features_season.py        # Single-season build CLI
+│   │   ├── build_features_multi_season.py  # Multi-season build (2021–2026)
+│   │   ├── build_today_features.py         # Today's matchup features (called by scheduler)
+│   │   └── park_factors.py                 # HR park factor fetch + static fallback
+│   ├── model/
+│   │   ├── train.py                        # Train + calibrate + save model
+│   │   └── predict.py                      # Score today's slate, save CSV, post to Discord
+│   ├── analysis/
+│   │   └── weekly_recap.py                 # Weekly P&L + calibration report
+│   └── notifications/
+│       ├── discord.py                      # Discord webhook: pick embeds + weekly recap
+│       └── DISCORD_SETUP.md               # Webhook setup guide
 └── README.md
 ```
 
@@ -120,289 +65,201 @@ mlb-hr-model/
 **Requirements:** Python 3.10+
 
 ```bash
+git clone https://github.com/YOUR_USERNAME/mlb-hr-model.git
+cd mlb-hr-model
+
 python -m venv .venv
+
 # Windows
 .venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
 
-pip install pybaseball lightgbm scikit-learn pandas numpy joblib pyarrow \
-            requests python-dotenv rapidfuzz
+pip install -r requirements.txt
 ```
 
-Optional — for odds/edge detection:
-```bash
-export ODDS_API_KEY=your_key_here   # get a free key at https://the-odds-api.com
-# or add to a .env file in the project root:
-echo "ODDS_API_KEY=your_key_here" >> .env
+### Environment variables
+
+Create a `.env` file in the project root:
+
+```env
+# Required for odds/edge detection (free tier: 500 req/month)
+# Get a key at https://the-odds-api.com
+ODDS_API_KEY=your_key_here
+
+# Required for Discord pick notifications
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+
+# Optional — separate channels per pass type
+DISCORD_WEBHOOK_MORNING=https://discord.com/api/webhooks/...
+DISCORD_WEBHOOK_FINAL=https://discord.com/api/webhooks/...
 ```
 
 ---
 
-## Usage
+## One-time: build training data + train model
 
-### 1. Build features
+### 1. Build features (multi-season, 2021–2026)
 
-**Multi-season (recommended, resume-safe):**
 ```bash
 python -m src.features.build_features_multi_season
 ```
-Builds month-by-month for 2021–2025. Already-built months are skipped automatically. First run takes 20–40 min due to MLB API roster fetches (cached after first run). Saves `data/processed/train_table_2021_2025_full.parquet`.
 
-> **Test mode:** `build_features_multi_season.py` has a `TEST_MODE = True` flag at the top. In test mode it builds only one month of 2025 data so you can verify the full pipeline quickly before committing to a full rebuild. Set `TEST_MODE = False` to build all seasons.
+Builds month-by-month, skipping already-built months. First run takes 20–40 min due to MLB API fetches (cached after first run). Saves `data/processed/train_table_2021_2026_full.parquet`.
 
-**Single season (faster, for development):**
-```bash
-python -m src.features.build_features_season build --year 2024
-python -m src.features.build_features_season build --year 2024 --debug          # verbose
-python -m src.features.build_features_season build --year 2024 --log-file b.log # log to file
+> Set `TEST_MODE = True` at the top of `build_features_multi_season.py` to build just one month first and verify the pipeline.
 
-# Combine multiple seasons into one table:
-python -m src.features.build_features_season combine --years 2022 2023 2024
-```
-
-### 2. Train
+### 2. Train the model
 
 ```bash
 python -m src.model.train
 ```
 
-Uses a **hard calendar split**: train = everything before 2025-03-27, test = 2025 season (true out-of-time validation). Falls back to an 80/20 percentage split if no 2025 data is present yet.
+Saves a calibrated LightGBM bundle to `models/`.
 
-- Trains both LightGBM and Logistic Regression, keeps whichever scores higher on raw ROC-AUC
-- Calibrates with Platt scaling (sigmoid) on a held-out chronological slice
-- Prints a full summary and appends a row to `models/train_runs.csv`
-- Saves model bundle to `models/hr_model_<name>_2021_2025.joblib`
+---
 
-### 3. Predict
+## Daily usage (automated)
+
+### Scheduler commands
 
 ```bash
-python -m src.model.predict
+# Show today's game waves and scheduled pass times
+python -m src.scheduler --show-waves
+
+# Run the morning pass manually
+python -m src.scheduler --pass morning
+
+# Check if any final passes are due now and fire them
+python -m src.scheduler --auto-final
+
+# See today's run history
+python -m src.scheduler --status
+
+# Dry-run without executing or posting to Discord
+python -m src.scheduler --auto-final --dry-run
 ```
 
-Scores all batter–pitcher matchups on the latest date in the feature table. Prints the top 20 HR candidates.
+### Manual predict (any date)
 
-If `ODDS_API_KEY` is set, also fetches today's HR prop lines from The Odds API and shows:
-- Market over price (American odds)
-- Fair probability (vig-removed)
-- Edge = model probability − fair market probability
-
-Saves predictions to `data/predictions/predictions_YYYY-MM-DD.csv`.
-
----
-
-## Cleaning data cache (for testing / forcing fresh downloads)
-
-Use these commands when testing new code that changes how features are computed or when you need to force a full re-download.
-
-Each section shows both **PowerShell** (Windows) and **bash** (macOS/Linux) versions. The `python` commands are the same on both platforms.
-
----
-
-### Clear everything (nuclear)
-
-Removes all cached data and processed feature tables.
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache, data\processed
-```
 ```bash
-# bash
-rm -rf data/cache/ data/processed/
+python -m src.model.predict --date 2026-04-01
 ```
 
 ---
 
-### Clear only Statcast cache
+## Automated deployment (Hetzner VPS)
 
-Forces a full re-download from Baseball Savant on the next run.
+The project runs fully automated on a $5/mo Linux VPS — no laptop required.
 
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\statcast
+### Server setup
 
-# or a specific date range only:
-Remove-Item -ErrorAction SilentlyContinue data\cache\statcast\statcast_2024-03-20_to_2024-10-01.parquet
-```
 ```bash
-# bash
-rm -rf data/cache/statcast/
+# On the server
+apt update && apt upgrade -y
+apt install -y python3 python3-pip python3-venv git
 
-# or a specific date range only:
-rm data/cache/statcast/statcast_2024-03-20_to_2024-10-01.parquet
+git clone https://github.com/YOUR_USERNAME/mlb-hr-model.git
+cd mlb-hr-model
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-> **Note:** The Statcast cache now stores `game_type` so the regular-season filter works correctly. Old cache files missing this column are detected automatically on the next run and re-downloaded. You can also force it manually with the commands above.
-
----
-
-### Clear roster / batting order cache
-
-Forces a re-fetch of actual starters and batting orders from the MLB Stats API.
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\schedule
-
-# or a specific game:
-Remove-Item -ErrorAction SilentlyContinue data\cache\schedule\game_745456.json
-```
+Copy your `.env` from your laptop:
 ```bash
-# bash
-rm -rf data/cache/schedule/
-rm data/cache/schedule/game_745456.json
+# On your laptop
+scp .env root@YOUR_SERVER_IP:/root/mlb-hr-model/.env
 ```
 
----
+### Cron jobs (Linux)
 
-### Clear weather cache
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\weather
-```
 ```bash
-# bash
-rm -rf data/cache/weather/
+crontab -e
 ```
 
----
-
-### Clear park factors cache
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\park_factors
+Add these two lines:
 ```
+# Morning pass — 10:00 AM ET (UTC-4 in summer)
+0 14 * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.scheduler --pass morning >> /root/mlb-hr-model/cron.log 2>&1
+
+# Auto final — every 30 min, 10 AM–11 PM ET
+*/30 14-23 * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.scheduler --auto-final >> /root/mlb-hr-model/cron.log 2>&1
+```
+
+> **Note:** Server runs UTC. 10 AM ET = 14:00 UTC in summer (EDT). Change `14` → `15` when clocks fall back in November.
+
+### Verify it's working
+
 ```bash
-# bash
-rm -rf data/cache/park_factors/
+tail -f /root/mlb-hr-model/cron.log
+python -m src.scheduler --status
 ```
 
 ---
 
-### Clear odds cache
+## Weekly recap
 
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\odds
-```
+Review model performance vs actual outcomes:
+
 ```bash
-# bash
-rm -rf data/cache/odds/
+# Last 7 days
+python -m src.analysis.weekly_recap
+
+# Specific week
+python -m src.analysis.weekly_recap --week 2026-04-07
+
+# All-time summary
+python -m src.analysis.weekly_recap --all-time
+
+# Post to Discord
+python -m src.analysis.weekly_recap --discord
+
+# Save to CSV
+python -m src.analysis.weekly_recap --save
 ```
 
 ---
 
-### Clear only processed feature tables
+## Typical daily schedule
 
-Keeps the raw Statcast cache (no re-download needed) but forces feature recomputation.
+| Time (ET)   | Event                                      |
+|-------------|--------------------------------------------|
+| 10:00 AM    | Morning pass — probable starters, early lines |
+| ~10:30 AM   | Final pass for noon game wave              |
+| ~2:30 PM    | Final pass for afternoon game wave         |
+| ~5:30 PM    | Final pass for evening game wave           |
+| ~8:30 PM    | Final pass for late game wave              |
 
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\processed
+Each final pass posts picks to Discord ~90 minutes before first pitch.
 
-# or a specific month:
-Remove-Item -ErrorAction SilentlyContinue data\processed\train_table_2024-04-01_to_2024-04-30.parquet
+---
+
+## Discord pick format
+
+Each pick is posted as a rich embed:
+
 ```
-```bash
-# bash
-rm -rf data/processed/
-
-# or a specific month:
-rm data/processed/train_table_2024-04-01_to_2024-04-30.parquet
+#1  Aaron Judge — HR Over
+┌─────────────────────────────────────────────────────┐
+│ vs Pitcher     Gerrit Cole        Batting Slot  3   │
+│ Model Prob     14.2%              Market Fair   9.8%│
+│ Edge           +4.4pp             Kelly Stake   6.1%│
+│ DraftKings     +115               FanDuel       +115│
+│ Other Books    Need +105 or better (break-even -108)│
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### Clear models
+## Key files
 
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue models
-```
-```bash
-# bash
-rm -rf models/
-```
-
----
-
-### Recommended workflow: testing new feature code
-
-When you change feature logic (rolling windows, edge features, new columns) — clear processed tables but keep the Statcast cache to avoid re-downloading ~GB of data:
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\processed
-python -m src.features.build_features_multi_season
-python -m src.model.train
-```
-```bash
-# bash
-rm -rf data/processed/
-python -m src.features.build_features_multi_season
-python -m src.model.train
-```
-
----
-
-### Recommended workflow: testing new data pipeline code
-
-When you change how Statcast data is fetched, cleaned, or filtered (e.g. the regular-season `game_type` filter):
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue data\cache\statcast, data\processed
-python -m src.features.build_features_multi_season
-python -m src.model.train
-```
-```bash
-# bash
-rm -rf data/cache/statcast/ data/processed/
-python -m src.features.build_features_multi_season
-python -m src.model.train
-```
-
----
-
-## Data
-
-All pitch/event data is sourced from [Baseball Savant](https://baseballsavant.mlb.com/) via the [pybaseball](https://github.com/jldbc/pybaseball) library. Starter and batting order data is fetched from the [MLB Stats API](https://statsapi.mlb.com). HR prop odds are fetched from [The Odds API](https://the-odds-api.com). All raw data is cached locally — re-runs do not re-download unless caches are cleared.
-
-`data/` and `models/` are gitignored and should never be committed.
-
----
-
-## Model details
-
-Two models are trained and compared on raw ROC-AUC; the better one is kept:
-
-- **Logistic Regression** — StandardScaler → L2-regularized LR with `class_weight="balanced"` to handle the ~10% HR base rate
-- **LightGBM** — `num_leaves=31`, `min_child_samples=300`, `reg_lambda=10.0`, `reg_alpha=0.1`, `subsample=0.8`, `colsample_bytree=0.6`, early stopping on AUC with a calibration holdout
-
-Both are calibrated with **Platt scaling** (sigmoid) on a held-out chronological calibration slice (last 20% of the training period). The final model bundle is saved to `models/hr_model_<name>_2021_2025.joblib` and includes:
-- `model`: calibrated classifier
-- `feature_cols`: ordered list of feature column names
-- `apply_shrinkage`: bool flag — when True, `predict.py` applies empirical Bayes shrinkage before scoring
-
-### Barrel approximation
-
-The Statcast barrel definition is approximated directly from launch speed and angle since the raw `barrel` column is not reliably populated in all pybaseball versions:
-
-- EV ≥ 98 mph AND launch angle within a widening range:
-  - At 98 mph: LA 26°–30°
-  - Each additional mph widens the range by ±1° (e.g. 103 mph → 21°–35°)
-  - Capped at 108 mph: LA 16°–41°
-
-This matches the [Baseball Savant barrel definition](https://www.mlb.com/glossary/statcast/barrels).
-
----
-
-## Known limitations
-
-- Pitcher features are only as good as starter resolution. If the MLB Stats API returns no starter for a game, the model falls back to `pitcher_mode` (most-common pitcher faced), which may be a reliever in bulk-usage games.
-- Weather data is pulled from the MLB Stats API game feed and may not be available for games that haven't started yet. Pre-game weather uses neutral values (72°F, 0 mph wind).
-- The odds integration requires a paid Odds API key; the free tier (500 requests/month) covers roughly one full day's slate per day.
-- `relief_pa_pct` is computed post-game and is 0.0 at prediction time (before the game starts). It is included as a training signal but not meaningful for live predictions.
+| File | Purpose |
+|------|---------|
+| `src/scheduler.py` | Main entry point — game-aware pass timing |
+| `src/model/predict.py` | Scores batters, applies odds, posts to Discord |
+| `src/model/train.py` | Trains and calibrates the LightGBM model |
+| `src/data_sources/odds.py` | Fetches HR prop lines from The Odds API |
+| `src/notifications/discord.py` | Formats and sends Discord pick embeds |
+| `src/analysis/weekly_recap.py` | Weekly P&L and calibration report |
+| `data/predictions/run_log.csv` | History of every pass run |
