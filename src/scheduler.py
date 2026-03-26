@@ -50,26 +50,6 @@ Windows Task Scheduler setup
   The --auto-final flag checks the current time against today's game
   schedule and fires a final pass for any wave whose window just opened.
   Running it every 30 min means you never miss a wave by more than 30 min.
-
-Usage
------
-    # Morning pass (run at 10am):
-    python -m src.scheduler --pass morning
-
-    # Auto final — fires passes for any wave whose window is now open:
-    python -m src.scheduler --auto-final
-
-    # Force a specific named pass:
-    python -m src.scheduler --pass final
-
-    # Show today's game waves and when final passes are scheduled:
-    python -m src.scheduler --show-waves
-
-    # Show today's run history:
-    python -m src.scheduler --status
-
-    # Dry-run any of the above:
-    python -m src.scheduler --auto-final --dry-run
 """
 
 from __future__ import annotations
@@ -112,6 +92,7 @@ WAVE_GAP_MINUTES = 60
 # Morning pass fires at this ET hour regardless of game schedule
 MORNING_PASS_HOUR_ET = 10
 
+
 # ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
@@ -134,64 +115,56 @@ def fetch_game_times(date_str: str, *, force_refresh: bool = False) -> list[date
     Caches to data/cache/schedule/game_times_{date_str}.json.
     Falls back to [] on any error so the scheduler degrades gracefully.
     """
-    cache_path = SCHEDULE_CACHE / f"game_times_{date_str}.json"
+    cache_file = SCHEDULE_CACHE / f"game_times_{date_str}.json"
 
-    if cache_path.exists() and not force_refresh:
+    if not force_refresh and cache_file.exists():
         try:
-            with open(cache_path) as f:
-                stored = json.load(f)
-            times = [datetime.fromisoformat(t).astimezone(ET) for t in stored["times"]]
-            logger.debug("Game times cache hit for %s (%d games)", date_str, len(times))
-            return times
-        except Exception as e:
-            logger.warning("Could not read game times cache: %s", e)
+            with open(cache_file) as f:
+                raw = json.load(f)
+            return [datetime.fromisoformat(t) for t in raw]
+        except Exception:
+            pass
 
-    url = (
-        f"https://statsapi.mlb.com/api/v1/schedule"
-        f"?sportId=1&date={date_str}&hydrate=team"
-    )
     try:
-        resp = requests.get(url, timeout=10)
+        url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}"
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
+
+        times: list[datetime] = []
+        for date_block in data.get("dates", []):
+            for game in date_block.get("games", []):
+                game_time_str = game.get("gameDate")
+                if game_time_str:
+                    try:
+                        utc_dt = datetime.fromisoformat(
+                            game_time_str.replace("Z", "+00:00")
+                        )
+                        et_dt = utc_dt.astimezone(ET)
+                        times.append(et_dt)
+                    except Exception:
+                        continue
+
+        times.sort()
+
+        with open(cache_file, "w") as f:
+            json.dump([t.isoformat() for t in times], f)
+
+        return times
+
     except Exception as e:
-        logger.warning("Failed to fetch game times for %s: %s", date_str, e)
+        logger.warning("Could not fetch game times for %s: %s", date_str, e)
         return []
-
-    times = []
-    for date_entry in data.get("dates", []):
-        for game in date_entry.get("games", []):
-            raw = game.get("gameDate")  # ISO 8601 UTC string
-            if raw:
-                try:
-                    dt_utc = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                    dt_et  = dt_utc.astimezone(ET)
-                    times.append(dt_et)
-                except Exception:
-                    pass
-
-    times.sort()
-
-    try:
-        with open(cache_path, "w") as f:
-            json.dump({"times": [t.isoformat() for t in times]}, f)
-    except Exception as e:
-        logger.warning("Could not write game times cache: %s", e)
-
-    logger.info("Fetched %d game times for %s", len(times), date_str)
-    return times
 
 
 # ---------------------------------------------------------------------------
-# Wave detection
+# Group games into waves
 # ---------------------------------------------------------------------------
 
 def build_waves(game_times: list[datetime]) -> list[dict]:
     """
-    Group game start times into waves — clusters of games whose start times
-    are within WAVE_GAP_MINUTES of each other.
-
-    Returns a list of wave dicts, each containing:
+    Group game_times into waves (clusters of games within WAVE_GAP_MINUTES
+    of each other). Returns a list of wave dicts, each containing:
         wave_id         : int (1-based)
         earliest        : datetime  — earliest first pitch in the wave
         latest          : datetime  — latest first pitch in the wave
@@ -239,7 +212,7 @@ def build_waves(game_times: list[datetime]) -> list[dict]:
             "game_count":      len(wave),
             "final_pass_time": fp_time,
             "label":           label,
-            "pass_name": f"final_{label.lower()}_{i}",
+            "pass_name":       f"final_{label.lower()}_{i}",
         })
 
     return result
@@ -262,10 +235,10 @@ def get_due_passes(
     lookback_minutes should be slightly longer than the Task Scheduler repeat
     interval (default 30 min) to handle slight timing drift.
     """
-    now   = now_et()
-    due   = []
+    now  = now_et()
+    due  = []
     for wave in waves:
-        fp = wave["final_pass_time"]
+        fp          = wave["final_pass_time"]
         age_minutes = (now - fp).total_seconds() / 60
         if 0 <= age_minutes <= lookback_minutes:
             if wave["pass_name"] not in already_run:
@@ -281,28 +254,29 @@ def load_already_run_today(date_str: str) -> set[str]:
     """Return set of pass names that have already completed successfully today."""
     if not RUN_LOG.exists():
         return set()
+    already = set()
     try:
-        ran = set()
         with open(RUN_LOG) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row.get("game_date") == date_str and row.get("status") == "success":
-                    ran.add(row.get("pass", ""))
-        return ran
+                    already.add(row.get("pass", ""))
     except Exception:
-        return set()
+        pass
+    return already
 
 
 def log_run(
+    *,
     pass_name: str,
     date_str: str,
     status: str,
-    starters_confirmed: bool | None,
-    lineups_confirmed: bool | None,
-    odds_available: bool | None,
-    n_predictions: int | None,
-    n_with_edge: int | None,
-    elapsed_secs: float | None,
+    elapsed_secs: float,
+    starters_confirmed: bool,
+    lineups_confirmed: bool,
+    odds_available: bool,
+    n_predictions: int,
+    n_with_edge: int,
     notes: str = "",
 ) -> None:
     write_header = not RUN_LOG.exists()
@@ -311,56 +285,59 @@ def log_run(
         if write_header:
             writer.writerow([
                 "run_time_utc", "game_date", "pass", "status",
-                "starters_confirmed", "lineups_confirmed", "odds_available",
-                "n_predictions", "n_with_edge", "elapsed_secs", "notes",
+                "elapsed_secs", "starters_confirmed", "lineups_confirmed",
+                "odds_available", "n_predictions", "n_with_edge", "notes",
             ])
         writer.writerow([
             datetime.now(tz=timezone.utc).isoformat(),
             date_str,
             pass_name,
             status,
+            f"{elapsed_secs:.1f}",
             starters_confirmed,
             lineups_confirmed,
             odds_available,
             n_predictions,
             n_with_edge,
-            round(elapsed_secs, 1) if elapsed_secs is not None else None,
             notes,
         ])
 
 
 # ---------------------------------------------------------------------------
-# Data availability check (unchanged from original)
+# Data availability check
 # ---------------------------------------------------------------------------
 
 def check_data_availability(date_str: str) -> dict:
-    odds_cache = PROJECT_ROOT / "data" / "cache" / "odds"
-
+    """
+    Heuristically check what data is available for today's slate.
+    Returns a dict with boolean flags:
+        starters_confirmed : True if the roster cache has probable starters
+        lineups_confirmed  : True if at least one game cache has batting orders
+        odds_available     : True if the odds cache has HR props
+    """
     starters_confirmed = False
-    date_cache = SCHEDULE_CACHE / f"schedule_{date_str}.json"
-    if date_cache.exists():
-        try:
-            with open(date_cache) as f:
-                games = json.load(f)
-            if isinstance(games, list) and games:
-                has_home = any(g.get("home_starter_id") is not None for g in games)
-                has_away = any(g.get("away_starter_id") is not None for g in games)
-                starters_confirmed = has_home and has_away
-        except Exception:
-            pass
+    lineups_confirmed  = False
+    odds_available     = False
 
-    lineups_confirmed = False
-    game_caches = list(SCHEDULE_CACHE.glob("game_*.json"))
-    if game_caches:
-        confirmed_count = sum(
-            1 for gc in game_caches[:5]
-            if _game_cache_has_lineups(gc)
-        )
-        lineups_confirmed = confirmed_count >= 3
+    roster_cache_dir = PROJECT_ROOT / "data" / "cache" / "schedule"
+    if roster_cache_dir.exists():
+        pattern = f"*{date_str}*"
+        cache_files = list(roster_cache_dir.glob(pattern))
+        if cache_files:
+            starters_confirmed = True
+            for path in cache_files:
+                if _game_cache_has_lineups(path):
+                    lineups_confirmed = True
+                    break
 
-    odds_available = False
-    odds_file = odds_cache / f"odds_{date_str}.json"
-    if odds_file.exists():
+    odds_cache_dir = PROJECT_ROOT / "data" / "cache" / "odds"
+    if odds_cache_dir.exists():
+        odds_file = odds_cache_dir / f"hr_props_{date_str}.json"
+        if not odds_file.exists():
+            # try any file for today
+            today_files = list(odds_cache_dir.glob(f"*{date_str}*"))
+            if today_files:
+                odds_file = today_files[0]
         try:
             with open(odds_file) as f:
                 odds_data = json.load(f)
@@ -428,10 +405,6 @@ def run_pass(
     print(f"  Force-refresh caches: {force_refresh}")
 
     # Warn when a final pass fires before books have posted HR props.
-    # Books typically open props 2-4 hours before first pitch; the final pass
-    # fires 90 min out, so there's a window where lines aren't up yet.
-    # We proceed (model-only output is still valid) but surface it clearly
-    # so the user knows to re-run manually once lines post.
     is_final = not pass_name.startswith("morning")
     if is_final and not avail["odds_available"]:
         print(
@@ -442,23 +415,57 @@ def run_pass(
         )
 
     # Map wave pass names (e.g. "final_evening") back to "final" for predict.py
-    # so it saves to the right canonical filename. We pass --wave-label separately.
+    # so it saves to the right canonical filename.
     predict_run_type = "morning" if pass_name == "morning" else "final"
 
     if dry_run:
         cmd_str = (
-            f"python -m src.model.predict --run-type {predict_run_type}"
+            f"python -m src.features.build_today_features"
+            + (" --force-refresh" if force_refresh else "")
+            + f"\npython -m src.model.predict --run-type {predict_run_type}"
             + (" --force-refresh" if force_refresh else "")
         )
-        print(f"\n  [DRY RUN] Would run: {cmd_str}")
+        print(f"\n  [DRY RUN] Would run:\n    {cmd_str}")
         print(f"{'='*72}\n")
         return 0
 
+    # ------------------------------------------------------------------
+    # Step 1: Build today's features
+    # This injects ALL of today's matchup rows (full game slate) into the
+    # combined train table so predict.py sees every batter, not just stale rows.
+    # ------------------------------------------------------------------
+    build_cmd = [sys.executable, "-m", "src.features.build_today_features"]
+    if force_refresh:
+        build_cmd.append("--force-refresh")
+
+    logger.info("Building today's features: %s", " ".join(build_cmd))
+    print(f"\n  Step 1/2 — Building today's features ...")
+
+    try:
+        build_result = subprocess.run(build_cmd, cwd=PROJECT_ROOT)
+        if build_result.returncode != 0:
+            logger.warning(
+                "build_today_features exited with code %d — predict will use "
+                "whatever rows are already in the train table.",
+                build_result.returncode,
+            )
+            print(
+                f"  ⚠️  build_today_features exited with code {build_result.returncode}.\n"
+                "     Proceeding with predict using existing train table rows."
+            )
+    except Exception as e:
+        logger.error("build_today_features crashed: %s", e)
+        print(f"  ⚠️  build_today_features crashed: {e}\n     Proceeding anyway.")
+
+    # ------------------------------------------------------------------
+    # Step 2: Score
+    # ------------------------------------------------------------------
     cmd = [sys.executable, "-m", "src.model.predict", "--run-type", predict_run_type]
     if force_refresh:
         cmd.append("--force-refresh")
 
-    logger.info("Running: %s", " ".join(cmd))
+    logger.info("Running predict: %s", " ".join(cmd))
+    print(f"\n  Step 2/2 — Scoring predictions ...")
 
     try:
         result    = subprocess.run(cmd, cwd=PROJECT_ROOT)
@@ -513,10 +520,10 @@ def show_waves(date_str: str) -> None:
         return
 
     for w in waves:
-        fp_str   = w["final_pass_time"].strftime("%I:%M %p ET")
-        e_str    = w["earliest"].strftime("%I:%M %p ET")
-        l_str    = w["latest"].strftime("%I:%M %p ET")
-        status   = "✓ already run" if w["pass_name"] in already else "pending"
+        fp_str = w["final_pass_time"].strftime("%I:%M %p ET")
+        e_str  = w["earliest"].strftime("%I:%M %p ET")
+        l_str  = w["latest"].strftime("%I:%M %p ET")
+        status = "✓ already run" if w["pass_name"] in already else "pending"
         print(
             f"\n  Wave {w['wave_id']}  [{w['label']}]  —  {w['game_count']} game(s)"
             f"\n    First pitches : {e_str} – {l_str}"
@@ -646,8 +653,8 @@ def main() -> None:
             print(f"No games found for {date_str} — nothing to do.")
             return
 
-        already  = load_already_run_today(date_str)
-        due      = get_due_passes(waves, already_run=already)
+        already = load_already_run_today(date_str)
+        due     = get_due_passes(waves, already_run=already)
 
         if not due:
             now_str = now_et().strftime("%I:%M %p ET")

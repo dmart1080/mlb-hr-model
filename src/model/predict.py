@@ -45,9 +45,9 @@ load_dotenv()
 
 from pybaseball.playerid_lookup import playerid_reverse_lookup
 
-PROJECT_ROOT  = Path(__file__).resolve().parents[2]
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-MODELS_DIR    = PROJECT_ROOT / "models"
+PROJECT_ROOT    = Path(__file__).resolve().parents[2]
+PROCESSED_DIR   = PROJECT_ROOT / "data" / "processed"
+MODELS_DIR      = PROJECT_ROOT / "models"
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 
 _LOOKUP_CHUNK_SIZE = 500
@@ -61,22 +61,41 @@ TOP_N = 20
 def latest_train_table() -> Path:
     """
     Preference order:
-      1. 2021-2025 multi-season file
-      2. 2024 full-season file (legacy)
-      3. Most-recently-modified train_table_*.parquet
+      1. Today's _today.parquet written by build_today_features (most current)
+      2. 2021-2026 combined multi-season file (updated by build_today_features)
+      3. 2021-2025 combined multi-season file (legacy)
+      4. 2024 full-season file (legacy)
+      5. Most-recently-modified train_table_*.parquet
+
+    The _today.parquet is preferred when it exists because it's guaranteed
+    to contain exactly today's slate with fresh features.  The combined file
+    is second because build_today_features appends to it, so it always has
+    today's rows after build_today_features runs.
     """
-    multi = PROCESSED_DIR / "train_table_2021_2026_full.parquet"
-    if multi.exists():
-        return multi
+    from datetime import date as _date
+    today_str = _date.today().strftime("%Y-%m-%d")
 
-    multi_legacy = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
-    if multi_legacy.exists():
-        return multi_legacy
+    # 1. Today's dedicated file — written fresh by build_today_features
+    today_file = PROCESSED_DIR / f"train_table_{today_str}_today.parquet"
+    if today_file.exists() and today_file.stat().st_size > 1_000:
+        return today_file
 
+    # 2. Combined 2021-2026 (build_today_features appends here)
+    multi_2026 = PROCESSED_DIR / "train_table_2021_2026_full.parquet"
+    if multi_2026.exists():
+        return multi_2026
+
+    # 3. Combined 2021-2025 (legacy)
+    multi_2025 = PROCESSED_DIR / "train_table_2021_2025_full.parquet"
+    if multi_2025.exists():
+        return multi_2025
+
+    # 4. 2024 single-season (legacy)
     season = PROCESSED_DIR / "train_table_2024_full_season.parquet"
     if season.exists():
         return season
 
+    # 5. Glob fallback — most recently modified
     files = sorted(
         glob.glob(str(PROCESSED_DIR / "train_table_*.parquet")),
         key=lambda p: Path(p).stat().st_mtime,
@@ -90,9 +109,11 @@ def latest_train_table() -> Path:
 def load_model():
     """
     Load the best available model.  Preference order:
-      1. 2021-2025 LightGBM calibrated
-      2. 2021-2025 LogReg calibrated
-      3. Legacy 2024 models
+      1. 2021-2026 LightGBM calibrated
+      2. 2021-2026 LogReg calibrated
+      3. 2021-2025 LightGBM calibrated
+      4. 2021-2025 LogReg calibrated
+      5. Legacy 2024 models
     """
     candidates = [
         MODELS_DIR / "hr_model_lightgbm_calibrated_2021_2026.joblib",
@@ -154,7 +175,7 @@ def add_player_names(
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Display helpers
 # ---------------------------------------------------------------------------
 
 def _format_pct(val) -> str:
@@ -174,7 +195,7 @@ def _format_odds(val) -> str:
 
 def _format_edge(val) -> str:
     try:
-        v = float(val)
+        v    = float(val)
         sign = "+" if v >= 0 else ""
         return f"{sign}{v*100:.1f}pp"
     except (TypeError, ValueError):
@@ -195,11 +216,11 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         bettable = ranked[ranked["edge"].notna() & (ranked["edge"] > 0)].sort_values(
             ["edge", "hr_prob"], ascending=False
         )
-        rest = ranked[~ranked.index.isin(bettable.index)].sort_values("hr_prob", ascending=False)
+        rest    = ranked[~ranked.index.isin(bettable.index)].sort_values("hr_prob", ascending=False)
         display = pd.concat([bettable, rest]).head(TOP_N)
 
         for _, row in display.iterrows():
-            batter  = str(row.get("batter_name", ""))[:26]
+            batter  = str(row.get("batter_name",  ""))[:26]
             pitcher = str(row.get("pitcher_name", ""))[:22]
             model   = _format_pct(row.get("hr_prob"))
             market  = _format_pct(row.get("market_fair_prob"))
@@ -217,9 +238,13 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         if n_edge:
             avg_edge  = bettable["edge"].mean() * 100
             avg_kelly = bettable["kelly_stake"].mean() * 100 if "kelly_stake" in bettable else 0
-            print(f"\n  {n_edge} bets with positive edge | avg edge {avg_edge:.1f}pp | avg Kelly {avg_kelly:.1f}%")
+            print(
+                f"\n  {n_edge} bets with positive edge | "
+                f"avg edge {avg_edge:.1f}pp | avg Kelly {avg_kelly:.1f}%"
+            )
         else:
             print(f"\n  No positive-edge bets today.")
+
         print(f"{'='*85}")
 
     else:
@@ -234,7 +259,7 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
 
         top = ranked.sort_values("hr_prob", ascending=False).head(TOP_N)
         for _, row in top.iterrows():
-            batter  = str(row.get("batter_name", ""))[:26]
+            batter  = str(row.get("batter_name",  ""))[:26]
             pitcher = str(row.get("pitcher_name", ""))[:24]
             model   = _format_pct(row.get("hr_prob"))
             pos     = int(row.get("batting_order_pos", 0))
@@ -278,8 +303,6 @@ if __name__ == "__main__":
 
     # Final passes should always bypass caches — confirmed lineups and the
     # latest odds lines must be fetched fresh, not served from a stale cache.
-    # Auto-enable here so a manual `python -m src.model.predict --run-type final`
-    # behaves correctly without requiring the user to remember a second flag.
     if args.run_type == "final" and not args.force_refresh:
         args.force_refresh = True
         print("ℹ️  Final pass: --force-refresh enabled automatically.")
@@ -289,6 +312,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     model, feature_cols, apply_shrinkage_flag = load_model()
     train_path = latest_train_table()
+    print(f"Using train table: {train_path.name}")
 
     df = pd.read_parquet(train_path)
     df["game_date"] = pd.to_datetime(df["game_date"])
@@ -306,9 +330,14 @@ if __name__ == "__main__":
     today_df = df[df["game_date"] == target_date].copy()
 
     if today_df.empty:
-        print(f"No rows found for {target_date.date()} in the train table.")
-        print("Run build_features_multi_season (or build_features_season) to add today.")
+        print(f"\nNo rows found for {target_date.date()} in {train_path.name}.")
+        print(
+            "Run build_today_features first to inject today's slate:\n"
+            "    python -m src.features.build_today_features --force-refresh"
+        )
         sys.exit(1)
+
+    print(f"Scoring {len(today_df)} batter rows for {target_date.date()} ...")
 
     # ------------------------------------------------------------------
     # Score

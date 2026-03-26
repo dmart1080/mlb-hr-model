@@ -1,46 +1,28 @@
 """
-MLB HR Model — Today's Feature Builder
-========================================
-Fetches today's MLB schedule, resolves probable/actual starters and batting
-orders, then builds one prediction row per (batter, game) using the same
-rolling-window features already computed in the train table.
+build_today_features.py
+========================
+Builds today's prediction feature rows from live MLB API data and carries
+forward rolling Statcast statistics from the historical train table.
 
-This is the missing "live inference" step between:
-    historical train table  →  TODAY'S ROWS  →  predict.py
+This module is the bridge between the historical training pipeline and the
+live daily prediction pipeline. It does NOT re-compute rolling statistics
+from raw Statcast data (that would take too long). Instead, it:
 
-Usage
------
-    # Build for today (default):
-    python -m src.features.build_today_features
+  1. Fetches today's game schedule and probable/confirmed starters.
+  2. Fetches batting orders for each game.
+  3. Builds one row per (game, batter, opposing_starter) matchup.
+  4. Carries forward each batter's and pitcher's most recent rolling
+     statistics from the historical train table (last known game).
+  5. Resolves handedness and same_hand_matchup.
+  6. Fetches weather for each ballpark.
+  7. Applies park factors.
+  8. Recomputes edge/interaction features.
+  9. Fills any remaining NaN stat columns with league-average priors.
+ 10. Writes the result to data/processed/train_table_{date}_today.parquet
+     AND appends/overwrites today's rows in the combined train table so
+     predict.py finds them automatically.
 
-    # Build for a specific date:
-    python -m src.features.build_today_features --date 2026-03-26
-
-    # Force-refresh schedule/roster caches:
-    python -m src.features.build_today_features --force-refresh
-
-    # Dry-run: show what would be built without writing files:
-    python -m src.features.build_today_features --dry-run
-
-How it works
-------------
-1.  Fetch today's games from the MLB Stats API (probable starters + rosters).
-2.  Load the existing train table (contains rolling-window batter/pitcher stats
-    up through the last game played).
-3.  For each today batter, find their most recent feature row in the train table
-    and carry those features forward to today's game date.
-4.  Override game-specific fields: game_pk, home_team, pitcher, weather,
-    park factor, batting order, is_home_game, same_hand_matchup.
-5.  Set hr_hit = 0 (unknown — game hasn't been played yet).
-6.  Append today's rows to a "today" parquet that predict.py can read.
-
-Why carry-forward works
------------------------
-Rolling windows (14-day, 30-day, season) are computed STRICTLY before the
-game date in build_features.py.  For today's prediction we want the same
-windows — i.e. all PA through yesterday.  The last row in the train table
-for each batter already contains exactly those windows (calculated before
-their most recent game).  Carrying them forward to today is correct because
+Carrying them forward to today is correct because
 no new games have been played today yet.
 
 Edge cases handled
@@ -255,7 +237,6 @@ def build_today_features(
     """
     Build prediction feature rows for target_date and write them to a parquet
     that predict.py will find via latest_train_table().
-
     Returns the path to the written file.
     """
     if target_date is None:
@@ -295,11 +276,11 @@ def build_today_features(
     rows = []
 
     for _, game in schedule_df.iterrows():
-        gp       = int(game["game_pk"])
-        home     = str(game.get("home_team", ""))
-        away     = str(game.get("away_team", ""))
-        h_start  = game.get("home_starter_id")
-        a_start  = game.get("away_starter_id")
+        gp      = int(game["game_pk"])
+        home    = str(game.get("home_team", ""))
+        away    = str(game.get("away_team", ""))
+        h_start = game.get("home_starter_id")
+        a_start = game.get("away_starter_id")
 
         # Override with actual starters if we have them
         if not starters_df.empty:
@@ -337,21 +318,21 @@ def build_today_features(
                 pitcher_id = None  # will be filled with league avg
 
             rows.append({
-                "game_date":           target_ts,
-                "game_pk":             gp,
-                "batter":              batter_id,
-                "pitcher":             int(pitcher_id) if pitcher_id is not None else None,
-                "home_team":           home,
-                "batter_team":         home if is_home else away,
-                "is_home_game":        is_home,
-                "batting_order_pos":   bat_order,
-                "is_top_of_order":     int(bat_order in range(1, 5)),
-                "expected_pa_today":   _EXPECTED_PA.get(bat_order, _EXPECTED_PA_DEFAULT),
-                "hr_hit":              0,    # unknown — game not played yet
-                "relief_pa_pct":       0.0,  # pre-game: no relief PAs yet
-                "p_is_short_rest":     0,
-                "b_days_rest":         _LEAGUE_FILL["b_days_rest"],
-                "p_days_rest":         _LEAGUE_FILL["p_days_rest"],
+                "game_date":         target_ts,
+                "game_pk":           gp,
+                "batter":            batter_id,
+                "pitcher":           int(pitcher_id) if pitcher_id is not None else None,
+                "home_team":         home,
+                "batter_team":       home if is_home else away,
+                "is_home_game":      is_home,
+                "batting_order_pos": bat_order,
+                "is_top_of_order":   int(bat_order in range(1, 5)),
+                "expected_pa_today": _EXPECTED_PA.get(bat_order, _EXPECTED_PA_DEFAULT),
+                "hr_hit":            0,    # unknown — game not played yet
+                "relief_pa_pct":     0.0,  # pre-game: no relief PAs yet
+                "p_is_short_rest":   0,
+                "b_days_rest":       _LEAGUE_FILL["b_days_rest"],
+                "p_days_rest":       _LEAGUE_FILL["p_days_rest"],
             })
 
     if not rows:
@@ -369,11 +350,14 @@ def build_today_features(
     train_df = _load_latest_train_table()
 
     # Latest batter features
-    batter_latest = _latest_batter_features(train_df)
+    batter_latest    = _latest_batter_features(train_df)
     batter_feat_cols = [c for c in batter_latest.columns
                         if c.startswith("b_") and c not in {"batter"}]
     batter_feat_cols += ["same_hand_matchup", "pitcher_hand", "batter_hand"]
-    batter_feat_cols = [c for c in batter_feat_cols if c in batter_latest.columns]
+    batter_feat_cols  = [c for c in batter_feat_cols if c in batter_latest.columns]
+    # KEY FIX: drop any cols already present in today_df — prevents _x/_y
+    # duplicate column crash (e.g. b_days_rest already set in step 3).
+    batter_feat_cols  = [c for c in batter_feat_cols if c not in today_df.columns]
 
     today_df = today_df.merge(
         batter_latest[["batter"] + batter_feat_cols],
@@ -398,9 +382,11 @@ def build_today_features(
             .last()
             .reset_index()
         )
-        # Drop game_date from pitcher_latest so it doesn't collide on merge
-        pitcher_merge_cols = ["pitcher"] + [c for c in pitcher_feat_cols
-                                            if c in pitcher_latest.columns]
+        # Drop game_date and any cols already in today_df — prevents duplicate crash
+        pitcher_merge_cols = ["pitcher"] + [
+            c for c in pitcher_feat_cols
+            if c in pitcher_latest.columns and c not in today_df.columns
+        ]
         today_df = today_df.merge(
             pitcher_latest[pitcher_merge_cols],
             on="pitcher",
@@ -418,7 +404,6 @@ def build_today_features(
     # 5. Resolve same_hand_matchup if missing
     # ------------------------------------------------------------------
     if "batter_hand" not in today_df.columns or today_df["batter_hand"].isna().all():
-        # Try to pull from train table
         bhand = (
             train_df.dropna(subset=["batter", "batter_hand"])
             .groupby("batter")["batter_hand"]
@@ -567,7 +552,11 @@ def _append_to_combined(today_df: pd.DataFrame, target_date: str) -> None:
     # Align columns — add missing cols as 0 in either direction
     for col in existing.columns:
         if col not in today_copy.columns:
-            today_copy[col] = 0.0 if col not in {"pitcher_hand", "batter_hand", "pitcher_mode", "batter_team", "home_team"} else None
+            today_copy[col] = (
+                0.0 if col not in
+                {"pitcher_hand", "batter_hand", "pitcher_mode", "batter_team", "home_team"}
+                else None
+            )
     for col in today_copy.columns:
         if col not in existing.columns:
             existing[col] = 0.0

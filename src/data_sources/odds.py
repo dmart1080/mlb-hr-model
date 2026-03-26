@@ -134,15 +134,20 @@ def _get_api_key(api_key: Optional[str]) -> str:
 
 def _fetch_events_for_date(date_str: str, api_key: str) -> list[dict]:
     """
-    Fetch all MLB event IDs scheduled on date_str.
+    Fetch all MLB event IDs scheduled on date_str (ET).
     Returns a list of event dicts from The Odds API /events endpoint.
+
+    Note: The Odds API uses UTC timestamps.  ET is UTC-4 (EDT) or UTC-5 (EST),
+    so a game at 11:05pm ET = 03:05 UTC next day.  We extend commenceTimeTo to
+    next day 05:00 UTC to ensure all ET games on date_str are captured.
     """
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     url = f"{_API_BASE}/sports/{_SPORT}/events"
     params = {
         "apiKey":           api_key,
         "dateFormat":       "iso",
         "commenceTimeFrom": f"{date_str}T00:00:00Z",
-        "commenceTimeTo":   f"{date_str}T23:59:59Z",
+        "commenceTimeTo":   f"{next_day}T05:00:00Z",  # covers through ~1am ET next day
     }
     try:
         resp = requests.get(url, params=params, timeout=15)
@@ -532,7 +537,9 @@ def enrich_predictions_with_odds(
 
 if __name__ == "__main__":
     import sys
+    from dotenv import load_dotenv
     from src.logging_config import configure_logging
+    load_dotenv()
     configure_logging()
 
     date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
