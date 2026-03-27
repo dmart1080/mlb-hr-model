@@ -505,10 +505,18 @@ def build_today_features(
 
 
 def _write_empty(target_date: str, dry_run: bool) -> Path:
-    out_path = PROCESSED_DIR / f"train_table_{target_date}_today.parquet"
-    if not dry_run:
-        pd.DataFrame().to_parquet(out_path, index=False)
-    return out_path
+    """
+    Called when there are no batter rows to write (batting orders not yet posted).
+    Prints a clear message and exits with code 0 so the scheduler logs a clean
+    skip rather than a failure, and predict.py is never invoked on empty data.
+    """
+    print(
+        f"\n  ℹ️  No batting orders available for {target_date} yet.\n"
+        "     This is normal for early-morning passes before MLB posts lineups.\n"
+        "     The final pass (90 min before first pitch) will retry automatically."
+    )
+    import sys
+    sys.exit(0)
 
 
 def _append_to_combined(today_df: pd.DataFrame, target_date: str) -> None:

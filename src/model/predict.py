@@ -315,6 +315,17 @@ if __name__ == "__main__":
     print(f"Using train table: {train_path.name}")
 
     df = pd.read_parquet(train_path)
+
+    # Guard: empty parquet (no batting orders posted yet) — exit cleanly
+    # rather than crashing with KeyError: 'game_date'
+    if df.empty or "game_date" not in df.columns:
+        print(
+            f"\n  ℹ️  No batter rows in {train_path.name} — "
+            "batting orders not yet posted. Skipping predictions.\n"
+            "     The final pass will retry automatically before first pitch."
+        )
+        sys.exit(0)
+
     df["game_date"] = pd.to_datetime(df["game_date"])
 
     if apply_shrinkage_flag:
