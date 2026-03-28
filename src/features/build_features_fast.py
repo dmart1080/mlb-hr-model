@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """
 Vectorised replacements for the three slow per-row loop functions in
-build_features.py.
+build_features.py, plus pulled-ball rate and pitch-type matchup features.
 
 Import chain (no cycles):
     build_features_common  <-  build_features_fast  <-  build_features
@@ -19,8 +19,14 @@ from src.features.build_features_common import (
     MIN_PA_WINDOW,
     FASTBALL_TYPES,
     OFFSPEED_TYPES,
+    PITCH_GROUP_FASTBALL,
+    PITCH_GROUP_BREAKING,
+    PITCH_GROUP_OFFSPEED,
+    MIN_PA_PITCH_TYPE,
+    MIN_PITCHES_PITCH_TYPE,
     _safe_mean,
     _batter_trend_stats,
+    _is_pulled_airball,
 )
 
 _PITCHER_VELO_COLS = [
@@ -49,8 +55,6 @@ def _window_merge(
     - Right bound is STRICT (<) so same-day PA never leaks into features.
     - FIX 3: Season window lower bound is also STRICT (>) so a game played
       exactly on March 1 (season start) is not included in its own features.
-      Previously >= was used which could include same-day data for the very
-      first day of the season.
     """
     merged = pa_df.merge(
         need[[player_col, "game_date"]].rename(columns={"game_date": "target_date"}),
@@ -62,10 +66,6 @@ def _window_merge(
     in_window = merged["game_date"] < merged["target_date"]
 
     if season_window:
-        # Season start = March 1 of the target year.
-        # FIX 3: use strict > so March 1 games are NOT included in March 1
-        # features.  The original code used >= which let same-day data leak
-        # on the opening day of the season.
         szn_start = pd.to_datetime(
             merged["target_date"].dt.year.astype(str) + "-03-01"
         )
@@ -81,8 +81,6 @@ def _window_merge(
 # Aggregation helper
 # ---------------------------------------------------------------------------
 
-# Columns produced by _agg_pa_stats that are only meaningful for the
-# *overall* window, not platoon splits (they'd duplicate on merge).
 _PLATOON_DROP_COLS = {"ev_mean", "la_mean"}
 
 
@@ -91,14 +89,11 @@ def _agg_pa_stats(
     group_cols: list[str],
     min_pa: int,
     prefix: str,
-    drop_means: bool = False,   # set True for platoon splits
+    drop_means: bool = False,
 ) -> pd.DataFrame:
     """
     Aggregate PA-level stats.  Returns one row per group.
     Rates are NaN when PA < min_pa (cold-start guard).
-
-    drop_means=True omits ev_mean and la_mean so they don't collide
-    when multiple platoon DataFrames are merged onto the same base.
     """
     windowed = windowed.copy()
     ev = windowed["launch_speed"]
@@ -106,7 +101,6 @@ def _agg_pa_stats(
     windowed["_ev_gte95"] = (ev >= 95).astype(float)
     windowed["_fb"]       = la.between(20, 40).astype(float)
 
-    # Determine PA column: use "pitcher" size for pitcher-prefix aggs, else row count
     pa_src = "pitcher" if ("pitcher" in windowed.columns and prefix.startswith("p")) else "is_hr"
 
     agg = windowed.groupby(group_cols, sort=False).agg(
@@ -206,7 +200,7 @@ def precompute_batter_windows_fast(
         "target_date":    "game_date",
     })
 
-    # ── Platoon splits — drop_means=True prevents la_mean/ev_mean collision ─
+    # ── Platoon splits ───────────────────────────────────────────────────────
     def _plat_14(hand):
         sub = w14[w14["p_throws"] == hand]
         if sub.empty:
@@ -325,7 +319,6 @@ def precompute_batter_windows_fast(
         .to_dict()
     )
     need_copy["batter_hand"] = need_copy["batter"].map(batter_hand_lookup)
-    pitcher_hand_col = need.get("pitcher_hand") if hasattr(need, "get") else None
     if "pitcher_hand" in need.columns:
         need_copy["pitcher_hand"] = need["pitcher_hand"].values
     else:
@@ -361,15 +354,12 @@ def precompute_batter_windows_fast(
 # ---------------------------------------------------------------------------
 
 _PITCHER_STAT_COLS: list[str] = [
-    # 30-day overall
     "p_pa_30", "p_hr_allowed_30", "p_hr_allowed_rate_30",
     "p_barrel_allowed_rate_30", "p_ev_allowed_mean_30", "p_la_allowed_mean_30",
     "p_hardhit_allowed_rate_30", "p_fb_allowed_rate_30", "p_k_rate_30", "p_bb_rate_30",
-    # season overall
     "p_pa_szn", "p_hr_allowed_szn", "p_hr_allowed_rate_szn",
     "p_barrel_allowed_rate_szn", "p_ev_allowed_mean_szn", "p_la_allowed_mean_szn",
     "p_hardhit_allowed_rate_szn", "p_fb_allowed_rate_szn", "p_k_rate_szn", "p_bb_rate_szn",
-    # platoon splits
     "p_pa_30_vsL", "p_hr_allowed_30_vsL", "p_hr_allowed_rate_30_vsL",
     "p_barrel_allowed_rate_30_vsL", "p_hardhit_allowed_rate_30_vsL",
     "p_fb_allowed_rate_30_vsL", "p_k_rate_30_vsL", "p_bb_rate_30_vsL",
@@ -395,17 +385,10 @@ def precompute_pitcher_windows_fast(
         .reset_index(drop=True)
     )
 
-    # Guard: if need is empty (all starter_pitcher_id values were NaN and were
-    # dropped), return a zero-row frame with the full expected column schema so
-    # that the left-merge in build_features_for_range adds the columns (as NaN)
-    # rather than silently omitting them — which would cause KeyErrors later in
-    # _add_edge_features.
     if need.empty:
         logger.warning(
             "precompute_pitcher_windows_fast: target_dates is empty after "
-            "deduplication (all starter_pitcher_id values may be NaN). "
-            "Returning zero-row frame with full pitcher stat schema — all "
-            "pitcher features will be NaN for this date range."
+            "deduplication. Returning zero-row frame with full pitcher stat schema."
         )
         empty_cols = ["pitcher", "game_date"] + _PITCHER_STAT_COLS
         empty_df = pd.DataFrame(columns=empty_cols)
@@ -448,11 +431,10 @@ def precompute_pitcher_windows_fast(
         "target_date":    "game_date",
     })
 
-    # ── Platoon splits — drop_means=True prevents collision ─────────────────
+    # ── Platoon splits ───────────────────────────────────────────────────────
     def _plat(windowed, hand, suffix, min_pa):
         sub = windowed[windowed["stand"] == hand]
         if sub.empty:
-            # Return a DataFrame with all expected columns (filled with NaN)
             plat_cols = [
                 "pitcher", "game_date",
                 f"p_pa_{suffix}_vs{hand}",
@@ -519,6 +501,7 @@ def precompute_pitcher_velo_fast(
         empty_df = pd.DataFrame(columns=empty_cols)
         empty_df['game_date'] = pd.to_datetime(empty_df['game_date'])
         return empty_df
+
     # ── 30-day FB velo / mix ────────────────────────────────────────────────
     w30 = _window_merge(pitches_df, need, "pitcher", days_back=30)
 
@@ -611,3 +594,322 @@ def precompute_pitcher_velo_fast(
         result = result.merge(df_part, on=["pitcher", "game_date"], how="left")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Pulled AIR BALL rate windows  (NEW)
+# ---------------------------------------------------------------------------
+
+def precompute_batter_pull_fast(
+    pitches_df: pd.DataFrame,
+    target_dates: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    For each (batter, game_date), compute rolling PULLED AIR BALL rate over
+    the 14-day and season windows.
+
+    "Pulled air ball" = fly ball or line drive hit to the pull side of the
+    field.  Ground balls are excluded because they don't produce home runs
+    and would dilute the signal.
+
+    pitches_df must be the PITCH-LEVEL DataFrame (one row per pitch/event)
+    so that hc_x / hc_y, bb_type, and stand are available.
+
+    Required columns: batter, game_date, hc_x, hc_y, stand, bb_type, events
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_pull_air_rate_14,     b_pull_air_rate_szn,     ← pulled FB+LD / all FB+LD
+        b_pull_air_hr_rate_14,  b_pull_air_hr_rate_szn   ← HR / pulled FB+LD
+    """
+    need = (
+        target_dates
+        .drop_duplicates(subset=["batter", "game_date"])
+        .reset_index(drop=True)
+    )
+
+    empty_cols = ["batter", "game_date",
+                  "b_pull_air_rate_14", "b_pull_air_rate_szn",
+                  "b_pull_air_hr_rate_14", "b_pull_air_hr_rate_szn"]
+
+    if need.empty or pitches_df.empty:
+        df = pd.DataFrame(columns=empty_cols)
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        return df
+
+    # Check required spray-chart columns — absent in old cache
+    missing = [c for c in ("hc_x", "hc_y", "bb_type") if c not in pitches_df.columns]
+    if missing:
+        logger.warning(
+            "precompute_batter_pull_fast: columns %s missing from pitches_df. "
+            "Delete Statcast cache files and re-download to enable pull-airball features.",
+            missing,
+        )
+        df = pd.DataFrame(columns=empty_cols)
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        return df
+
+    p = pitches_df.copy()
+    p["_events_str"] = p["events"].astype("string").str.lower().str.strip()
+    p["_is_hr"]      = (p["_events_str"] == "home_run").fillna(False).astype("int8")
+
+    # Tag pulled air balls using the updated helper (fly_ball + line_drive only)
+    p["_is_pull_air"] = _is_pulled_airball(
+        p["hc_x"], p["hc_y"],
+        p.get("stand",   pd.Series(dtype=str)),
+        p.get("bb_type", pd.Series(dtype=str)),
+    ).fillna(False).astype("int8")
+
+    # Denominator: ALL air balls (fly ball + line drive) in play, not just pulled
+    bb = p.get("bb_type", pd.Series(dtype=str)).astype("string").str.lower().str.strip()
+    p["_is_airball"] = bb.isin(["fly_ball", "line_drive"]).fillna(False).astype("int8")
+
+    # Keep only rows that are air balls with valid coordinates
+    # (hc_x / hc_y NaN → _is_pull_air=0 so they count in denominator but not numerator)
+    air_df = p[p["_is_airball"] == 1].copy()
+
+    if air_df.empty:
+        df = pd.DataFrame(columns=empty_cols)
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        return df
+
+    def _agg_pull_air(windowed: pd.DataFrame, suffix: str, min_ab: int) -> pd.DataFrame:
+        if windowed.empty:
+            return pd.DataFrame(columns=["batter", "game_date",
+                                          f"b_pull_air_rate_{suffix}",
+                                          f"b_pull_air_hr_rate_{suffix}"])
+
+        agg = windowed.groupby(["batter", "target_date"], sort=False).agg(
+            _air_bip  =("_is_airball",   "size"),   # total air balls
+            _pull_air =("_is_pull_air",  "sum"),    # pulled air balls
+        ).reset_index()
+
+        # HR on pulled air balls only
+        pull_hr = (
+            windowed[windowed["_is_pull_air"] == 1]
+            .groupby(["batter", "target_date"], sort=False)["_is_hr"]
+            .sum()
+            .reset_index()
+            .rename(columns={"_is_hr": "_pull_air_hr"})
+        )
+        agg = agg.merge(pull_hr, on=["batter", "target_date"], how="left")
+        agg["_pull_air_hr"] = agg["_pull_air_hr"].fillna(0)
+
+        mask = agg["_air_bip"] >= min_ab
+        agg[f"b_pull_air_rate_{suffix}"] = np.where(
+            mask,
+            agg["_pull_air"] / agg["_air_bip"].replace(0, np.nan),
+            np.nan,
+        )
+        agg[f"b_pull_air_hr_rate_{suffix}"] = np.where(
+            mask & (agg["_pull_air"] > 0),
+            agg["_pull_air_hr"] / agg["_pull_air"].replace(0, np.nan),
+            np.nan,
+        )
+        return agg[["batter", "target_date",
+                    f"b_pull_air_rate_{suffix}",
+                    f"b_pull_air_hr_rate_{suffix}"]].rename(columns={"target_date": "game_date"})
+
+    w14  = _window_merge(air_df, need, "batter", days_back=14)
+    wszn = _window_merge(air_df, need, "batter", days_back=0, season_window=True)
+
+    pull_14  = _agg_pull_air(w14,  "14",  min_ab=MIN_PA_WINDOW)
+    pull_szn = _agg_pull_air(wszn, "szn", min_ab=MIN_PA_BATTER_SZN)
+
+    base = need[["batter", "game_date"]].copy()
+    base["game_date"] = pd.to_datetime(base["game_date"])
+
+    for df_part in [pull_14, pull_szn]:
+        if df_part.empty or "game_date" not in df_part.columns:
+            continue
+        df_part = df_part.copy()
+        df_part["game_date"] = pd.to_datetime(df_part["game_date"])
+        base = base.merge(df_part, on=["batter", "game_date"], how="left")
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Pitch-type matchup windows  (NEW)
+# ---------------------------------------------------------------------------
+
+def precompute_pitch_matchup_fast(
+    pitches_df: pd.DataFrame,
+    target_dates: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute pitch-type matchup features combining:
+        (a) batter's HR rate vs fastballs / breaking balls / offspeed (14d + season)
+        (b) pitcher's usage rate of each pitch type (30-day)
+        (c) pitcher's HR-allowed rate by pitch type (30-day)
+        (d) interaction: batter_hr_vs_X * pitcher_usage_X
+
+    target_dates must have columns: batter, pitcher, game_date
+
+    Returns DataFrame with columns:
+        batter, pitcher, game_date,
+        b_hr_rate_vs_fb_14,   b_hr_rate_vs_fb_szn,
+        b_hr_rate_vs_brk_14,  b_hr_rate_vs_brk_szn,
+        b_hr_rate_vs_os_14,   b_hr_rate_vs_os_szn,
+        p_fb_usage_30,  p_brk_usage_30,  p_os_usage_30,
+        p_hr_rate_vs_fb_30,  p_hr_rate_vs_brk_30,  p_hr_rate_vs_os_30,
+        matchup_fb_30,  matchup_brk_30,  matchup_os_30,
+        matchup_best_30
+    """
+    empty_cols = [
+        "batter", "pitcher", "game_date",
+        "b_hr_rate_vs_fb_14",  "b_hr_rate_vs_fb_szn",
+        "b_hr_rate_vs_brk_14", "b_hr_rate_vs_brk_szn",
+        "b_hr_rate_vs_os_14",  "b_hr_rate_vs_os_szn",
+        "p_fb_usage_30",  "p_brk_usage_30",  "p_os_usage_30",
+        "p_hr_rate_vs_fb_30", "p_hr_rate_vs_brk_30", "p_hr_rate_vs_os_30",
+        "matchup_fb_30",  "matchup_brk_30",  "matchup_os_30",
+        "matchup_best_30",
+    ]
+
+    need = (
+        target_dates
+        .drop_duplicates(subset=["batter", "pitcher", "game_date"])
+        .reset_index(drop=True)
+    )
+
+    if need.empty or pitches_df.empty:
+        df = pd.DataFrame(columns=empty_cols)
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        return df
+
+    p = pitches_df.copy()
+    p["_pt_str"]     = p["pitch_type"].astype("string").str.upper().str.strip()
+    p["_events_str"] = p["events"].astype("string").str.lower().str.strip()
+    p["_is_hr"]      = (p["_events_str"] == "home_run").fillna(False).astype("int8")
+
+    p["_grp_fb"]  = p["_pt_str"].isin(PITCH_GROUP_FASTBALL).fillna(False).astype("int8")
+    p["_grp_brk"] = p["_pt_str"].isin(PITCH_GROUP_BREAKING).fillna(False).astype("int8")
+    p["_grp_os"]  = p["_pt_str"].isin(PITCH_GROUP_OFFSPEED).fillna(False).astype("int8")
+
+    # Only include pitches that ended PAs for rate calculations
+    p_outcome = p[p["_events_str"].notna() & (p["_events_str"] != "")].copy()
+
+    batter_need  = need[["batter", "game_date"]].drop_duplicates()
+    pitcher_need = need[["pitcher", "game_date"]].drop_duplicates()
+
+    # ── Batter HR rate vs each pitch group ──────────────────────────────────
+    def _batter_hr_vs(group_col: str, grp_name: str, days: int, szn: bool,
+                       min_pa: int, win_sfx: str) -> pd.DataFrame:
+        col_name = f"b_hr_rate_vs_{grp_name}_{win_sfx}"
+        w = _window_merge(p_outcome, batter_need, "batter",
+                          days_back=days, season_window=szn)
+        if w.empty:
+            return pd.DataFrame(columns=["batter", "game_date", col_name])
+        sub = w[w[group_col] == 1]
+        if sub.empty:
+            return pd.DataFrame(columns=["batter", "game_date", col_name])
+        agg = sub.groupby(["batter", "target_date"], sort=False).agg(
+            _pa=("_is_hr", "size"), _hr=("_is_hr", "sum"),
+        ).reset_index()
+        agg[col_name] = np.where(
+            agg["_pa"] >= min_pa,
+            agg["_hr"] / agg["_pa"].replace(0, np.nan), np.nan,
+        )
+        return agg[["batter", "target_date", col_name]].rename(
+            columns={"target_date": "game_date"}
+        )
+
+    b_fb_14   = _batter_hr_vs("_grp_fb",  "fb",  14, False, MIN_PA_PITCH_TYPE, "14")
+    b_brk_14  = _batter_hr_vs("_grp_brk", "brk", 14, False, MIN_PA_PITCH_TYPE, "14")
+    b_os_14   = _batter_hr_vs("_grp_os",  "os",  14, False, MIN_PA_PITCH_TYPE, "14")
+    b_fb_szn  = _batter_hr_vs("_grp_fb",  "fb",  0,  True,  MIN_PA_BATTER_SZN, "szn")
+    b_brk_szn = _batter_hr_vs("_grp_brk", "brk", 0,  True,  MIN_PA_BATTER_SZN, "szn")
+    b_os_szn  = _batter_hr_vs("_grp_os",  "os",  0,  True,  MIN_PA_BATTER_SZN, "szn")
+
+    # ── Pitcher pitch-type usage (30d, ALL pitches including balls) ──────────
+    w30_p = _window_merge(p, pitcher_need, "pitcher", days_back=30)
+
+    if not w30_p.empty:
+        pagg = w30_p.groupby(["pitcher", "target_date"], sort=False).agg(
+            _total   =("_grp_fb",  "size"),
+            _fb_cnt  =("_grp_fb",  "sum"),
+            _brk_cnt =("_grp_brk", "sum"),
+            _os_cnt  =("_grp_os",  "sum"),
+        ).reset_index()
+        mask_p = pagg["_total"] >= MIN_PITCHES_PITCH_TYPE
+        pagg["p_fb_usage_30"]  = np.where(mask_p, pagg["_fb_cnt"]  / pagg["_total"].replace(0, np.nan), np.nan)
+        pagg["p_brk_usage_30"] = np.where(mask_p, pagg["_brk_cnt"] / pagg["_total"].replace(0, np.nan), np.nan)
+        pagg["p_os_usage_30"]  = np.where(mask_p, pagg["_os_cnt"]  / pagg["_total"].replace(0, np.nan), np.nan)
+        pitcher_usage = pagg[["pitcher", "target_date",
+                               "p_fb_usage_30", "p_brk_usage_30", "p_os_usage_30"]].rename(
+            columns={"target_date": "game_date"}
+        )
+    else:
+        pitcher_usage = pd.DataFrame(columns=["pitcher", "game_date",
+                                               "p_fb_usage_30", "p_brk_usage_30", "p_os_usage_30"])
+
+    # ── Pitcher HR-allowed rate by pitch group (30d) ─────────────────────────
+    def _pitcher_hr_vs(group_col: str, col_name: str,
+                        windowed: pd.DataFrame, p_need: pd.DataFrame) -> pd.DataFrame:
+        if windowed.empty:
+            return pd.DataFrame(columns=["pitcher", "game_date", col_name])
+        p_out_30 = windowed[windowed["_events_str"].notna() & (windowed["_events_str"] != "")]
+        sub = p_out_30[p_out_30[group_col] == 1]
+        if sub.empty:
+            return pd.DataFrame(columns=["pitcher", "game_date", col_name])
+        agg = sub.groupby(["pitcher", "target_date"], sort=False).agg(
+            _pa=("_is_hr", "size"), _hr=("_is_hr", "sum"),
+        ).reset_index()
+        agg[col_name] = np.where(
+            agg["_pa"] >= MIN_PA_PITCH_TYPE,
+            agg["_hr"] / agg["_pa"].replace(0, np.nan), np.nan,
+        )
+        return agg[["pitcher", "target_date", col_name]].rename(
+            columns={"target_date": "game_date"}
+        )
+
+    p_hr_fb_30  = _pitcher_hr_vs("_grp_fb",  "p_hr_rate_vs_fb_30",  w30_p, pitcher_need)
+    p_hr_brk_30 = _pitcher_hr_vs("_grp_brk", "p_hr_rate_vs_brk_30", w30_p, pitcher_need)
+    p_hr_os_30  = _pitcher_hr_vs("_grp_os",  "p_hr_rate_vs_os_30",  w30_p, pitcher_need)
+
+    # ── Merge everything onto (batter, pitcher, game_date) base ────────────
+    base = need[["batter", "pitcher", "game_date"]].copy()
+    base["game_date"] = pd.to_datetime(base["game_date"])
+
+    for df_part in [b_fb_14, b_brk_14, b_os_14, b_fb_szn, b_brk_szn, b_os_szn]:
+        if df_part.empty or "game_date" not in df_part.columns:
+            continue
+        df_part = df_part.copy()
+        df_part["game_date"] = pd.to_datetime(df_part["game_date"])
+        base = base.merge(df_part, on=["batter", "game_date"], how="left")
+
+    for df_part in [pitcher_usage, p_hr_fb_30, p_hr_brk_30, p_hr_os_30]:
+        if df_part.empty or "game_date" not in df_part.columns:
+            continue
+        df_part = df_part.copy()
+        df_part["game_date"] = pd.to_datetime(df_part["game_date"])
+        base = base.merge(df_part, on=["pitcher", "game_date"], how="left")
+
+    # ── Matchup interaction terms ────────────────────────────────────────────
+    # Season rate preferred (more stable); 14d as fallback
+    def _best(szn: str, d14: str) -> pd.Series:
+        s = base.get(szn, pd.Series(np.nan, index=base.index))
+        d = base.get(d14, pd.Series(np.nan, index=base.index))
+        return s.fillna(d)
+
+    b_fb  = _best("b_hr_rate_vs_fb_szn",  "b_hr_rate_vs_fb_14")
+    b_brk = _best("b_hr_rate_vs_brk_szn", "b_hr_rate_vs_brk_14")
+    b_os  = _best("b_hr_rate_vs_os_szn",  "b_hr_rate_vs_os_14")
+
+    fb_usage  = base.get("p_fb_usage_30",  pd.Series(np.nan, index=base.index))
+    brk_usage = base.get("p_brk_usage_30", pd.Series(np.nan, index=base.index))
+    os_usage  = base.get("p_os_usage_30",  pd.Series(np.nan, index=base.index))
+
+    base["matchup_fb_30"]  = b_fb  * fb_usage
+    base["matchup_brk_30"] = b_brk * brk_usage
+    base["matchup_os_30"]  = b_os  * os_usage
+
+    matchup_cols = ["matchup_fb_30", "matchup_brk_30", "matchup_os_30"]
+    avail_matchup = [c for c in matchup_cols if c in base.columns]
+    if avail_matchup:
+        base["matchup_best_30"] = base[avail_matchup].max(axis=1)
+    else:
+        base["matchup_best_30"] = np.nan
+
+    return base

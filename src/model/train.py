@@ -312,6 +312,62 @@ def apply_shrinkage(df: pd.DataFrame) -> pd.DataFrame:
             df[f"hardhit_edge_14_30_vs{hand}"]  = _edge(b_hard, p_hard)
             df[f"barrel_edge_14_30_vs{hand}"]   = _edge(b_bar,  p_bar)
 
+    # ------------------------------------------------------------------
+    # Shrink pitch-type HR rates (small-sample — benefits from prior)
+    # Use a tighter prior since pitch-type PA windows are smaller than
+    # overall 14d windows.
+    # ------------------------------------------------------------------
+    _PITCH_PRIOR_PA = 30   # lighter prior: pitch-type splits have fewer events
+
+    pitch_type_batter_pairs = [
+        ("b_hr_rate_vs_fb_14",  "b_pa_14",  "hr", _PITCH_PRIOR_PA),
+        ("b_hr_rate_vs_brk_14", "b_pa_14",  "hr", _PITCH_PRIOR_PA),
+        ("b_hr_rate_vs_os_14",  "b_pa_14",  "hr", _PITCH_PRIOR_PA),
+        ("b_hr_rate_vs_fb_szn", "b_pa_szn", "hr", _PITCH_PRIOR_PA),
+        ("b_hr_rate_vs_brk_szn","b_pa_szn", "hr", _PITCH_PRIOR_PA),
+        ("b_hr_rate_vs_os_szn", "b_pa_szn", "hr", _PITCH_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in pitch_type_batter_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior)
+
+    pitch_type_pitcher_pairs = [
+        ("p_hr_rate_vs_fb_30",  "p_pa_30", "hr", _PITCHER_PRIOR_PA),
+        ("p_hr_rate_vs_brk_30", "p_pa_30", "hr", _PITCHER_PRIOR_PA),
+        ("p_hr_rate_vs_os_30",  "p_pa_30", "hr", _PITCHER_PRIOR_PA),
+    ]
+    for rate_col, pa_col, metric, prior in pitch_type_pitcher_pairs:
+        if rate_col in df.columns and pa_col in df.columns:
+            df[rate_col] = _shrink_rate(df[rate_col], df[pa_col], _LEAGUE_RATES[metric], prior)
+
+    # ------------------------------------------------------------------
+    # Recompute matchup interaction terms after shrinkage
+    # ------------------------------------------------------------------
+    def _best_batter_rate(szn_col: str, d14_col: str) -> pd.Series:
+        s = df.get(szn_col, pd.Series(np.nan, index=df.index))
+        d = df.get(d14_col, pd.Series(np.nan, index=df.index))
+        return s.fillna(d)
+
+    b_fb  = _best_batter_rate("b_hr_rate_vs_fb_szn",  "b_hr_rate_vs_fb_14")
+    b_brk = _best_batter_rate("b_hr_rate_vs_brk_szn", "b_hr_rate_vs_brk_14")
+    b_os  = _best_batter_rate("b_hr_rate_vs_os_szn",  "b_hr_rate_vs_os_14")
+
+    if "p_fb_usage_30" in df.columns:
+        df["matchup_fb_30"]  = b_fb  * df["p_fb_usage_30"]
+        df["matchup_brk_30"] = b_brk * df["p_brk_usage_30"].fillna(0)
+        df["matchup_os_30"]  = b_os  * df["p_os_usage_30"].fillna(0)
+        matchup_cols = ["matchup_fb_30", "matchup_brk_30", "matchup_os_30"]
+        avail = [c for c in matchup_cols if c in df.columns]
+        if avail:
+            df["matchup_best_30"] = df[avail].max(axis=1)
+
+    # Pull air ball × park factor
+    if "b_pull_air_rate_szn" in df.columns and "park_factor_hr" in df.columns:
+        pull_col = df["b_pull_air_rate_szn"].fillna(
+            df.get("b_pull_air_rate_14", pd.Series(np.nan, index=df.index))
+        )
+        df["pull_air_x_park"] = pull_col * df["park_factor_hr"]
+
     return df
 
 
@@ -533,6 +589,22 @@ def train_baseline(train_path: Path) -> TrainResult:
         "batting_order_pos", "is_top_of_order", "expected_pa_today", "relief_pa_pct",
         "p_fb_velo_30", "p_fb_pct_30", "p_offspeed_pct_30", "p_fb_velo_trend",
         "b_days_rest", "p_days_rest", "p_is_short_rest",
+        # Pulled air ball rate (fly ball + line drive to pull side only)
+        "b_pull_air_rate_14", "b_pull_air_rate_szn",
+        "b_pull_air_hr_rate_14", "b_pull_air_hr_rate_szn",
+        # Batter HR rate vs pitch type groups (14d + season)
+        "b_hr_rate_vs_fb_14",  "b_hr_rate_vs_fb_szn",
+        "b_hr_rate_vs_brk_14", "b_hr_rate_vs_brk_szn",
+        "b_hr_rate_vs_os_14",  "b_hr_rate_vs_os_szn",
+        # Pitcher pitch-type usage (30d)
+        "p_fb_usage_30", "p_brk_usage_30", "p_os_usage_30",
+        # Pitcher HR allowed by pitch type (30d)
+        "p_hr_rate_vs_fb_30", "p_hr_rate_vs_brk_30", "p_hr_rate_vs_os_30",
+        # Matchup interaction terms (batter_hr_vs_X * pitcher_usage_X)
+        "matchup_fb_30", "matchup_brk_30", "matchup_os_30",
+        "matchup_best_30",
+        # Pulled air ball rate × park factor
+        "pull_air_x_park",
     ]
 
     available = set(df.columns)

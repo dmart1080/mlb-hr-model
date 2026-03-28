@@ -26,6 +26,8 @@ from src.features.build_features_fast import (
     precompute_batter_windows_fast,
     precompute_pitcher_windows_fast,
     precompute_pitcher_velo_fast,
+    precompute_batter_pull_fast,
+    precompute_pitch_matchup_fast,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,7 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "p_throws", "stand",
             "release_speed", "pitch_type",
             "game_type",
+            "hc_x", "hc_y", "bb_type",   # spray chart + batted ball type for pull-airball features
         ],
         regular_season_only=True,
     ).df.copy()
@@ -419,6 +422,17 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
         df["hardhit_x_wind"] = _col("b_hardhit_rate_14") * df["wind_hr_impact"]
         df["barrel_x_wind"]  = _col("b_barrel_rate_14")  * df["wind_hr_impact"]
 
+    # Pulled air ball rate × park factor
+    if "b_pull_air_rate_szn" in df.columns and "park_factor_hr" in df.columns:
+        pull_col = _col("b_pull_air_rate_szn").fillna(_col("b_pull_air_rate_14"))
+        df["pull_air_x_park"] = pull_col * df["park_factor_hr"]
+
+    # Best pitch-type matchup score (max across FB / breaking / offspeed)
+    matchup_cols = ["matchup_fb_30", "matchup_brk_30", "matchup_os_30"]
+    avail_matchup = [c for c in matchup_cols if c in df.columns]
+    if avail_matchup:
+        df["matchup_best_30"] = df[avail_matchup].max(axis=1)
+
     return df
 
 
@@ -586,6 +600,28 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     pitcher_velo = precompute_pitcher_velo_fast(pitches_df, pitcher_need)
 
     # ------------------------------------------------------------------
+    # Pulled air ball rate
+    # ------------------------------------------------------------------
+    logger.info("Precomputing pulled air ball rates ...")
+    pull_stats = precompute_batter_pull_fast(
+        pitches_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Pitch-type matchup features
+    # ------------------------------------------------------------------
+    logger.info("Precomputing pitch-type matchup features ...")
+    pitch_matchup_need = (
+        labels[[merge_pitcher_col, "batter", "game_date"]]
+        .rename(columns={merge_pitcher_col: "pitcher"})
+        .dropna(subset=["pitcher"])
+        .copy()
+    )
+    pitch_matchup_need["pitcher"] = pitch_matchup_need["pitcher"].astype(int)
+    pitch_matchup = precompute_pitch_matchup_fast(pitches_df, pitch_matchup_need)
+
+    # ------------------------------------------------------------------
     # Merge everything
     # ------------------------------------------------------------------
     features_df = (
@@ -598,6 +634,11 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(
             pitcher_velo.rename(columns={"pitcher": merge_pitcher_col}),
             on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(pull_stats, on=["batter", "game_date"], how="left")
+        .merge(
+            pitch_matchup.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "batter", "game_date"], how="left",
         )
         .merge(weather_df, on="game_pk", how="left")
     )

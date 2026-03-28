@@ -33,7 +33,12 @@ def _cache_filename(start_date: str, end_date: str) -> str:
 
 # Columns we always want cached — superset of everything build_features needs.
 # game_type is required so we can filter to regular season (R) only.
-REQUIRED_CACHE_COLS = {"p_throws", "stand", "release_speed", "pitch_type", "game_type"}
+# hc_x / hc_y are required for pulled-ball rate features.
+REQUIRED_CACHE_COLS = {
+    "p_throws", "stand", "release_speed", "pitch_type", "game_type",
+    "hc_x", "hc_y",    # spray chart coordinates for pull-airball rate
+    "bb_type",          # batted ball type (fly_ball/line_drive/ground_ball/popup)
+}
 
 # Regular season game type code in the Statcast / MLB Stats API.
 REGULAR_SEASON_GAME_TYPE = "R"
@@ -153,6 +158,7 @@ if __name__ == "__main__":
         columns=[
             "game_date", "game_pk", "batter", "pitcher", "events",
             "p_throws", "stand", "release_speed", "pitch_type", "game_type",
+            "hc_x", "hc_y",
         ],
     )
     logger.info("Loaded rows: %d", len(result.df))
@@ -160,4 +166,6 @@ if __name__ == "__main__":
     logger.info("From cache:  %s", result.from_cache)
     if "game_type" in result.df.columns:
         logger.info("Game types:  %s", result.df["game_type"].value_counts().to_dict())
+    if "hc_x" in result.df.columns:
+        logger.info("hc_x nulls:  %d / %d", result.df["hc_x"].isna().sum(), len(result.df))
     print(result.df.head(10))

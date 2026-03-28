@@ -16,9 +16,21 @@ import pandas as pd
 FASTBALL_TYPES = {"FF", "SI"}
 OFFSPEED_TYPES = {"SL", "CH", "CU", "KC", "FS", "ST", "SV", "CS", "EP"}
 
+# Pitch-type groups used for matchup features
+# Each batter HR rate vs pitch type × pitcher usage rate of that pitch type
+PITCH_GROUP_FASTBALL  = {"FF", "SI", "FC"}          # 4-seam, sinker, cutter
+PITCH_GROUP_BREAKING  = {"SL", "CU", "KC", "CS", "SV"}  # slider, curve, knuckle-curve
+PITCH_GROUP_OFFSPEED  = {"CH", "FS", "EP"}           # changeup, splitter, eephus
+
 MIN_PA_BATTER_SZN  = 10
 MIN_PA_PITCHER_SZN = 10
 MIN_PA_WINDOW      = 5
+
+# Minimum pitches required to compute a reliable pitch-type usage rate
+MIN_PITCHES_PITCH_TYPE = 20
+
+# Minimum PA to trust a batter's HR rate vs a pitch group
+MIN_PA_PITCH_TYPE = 10
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +69,53 @@ def _is_barrel(launch_speed: pd.Series, launch_angle: pd.Series) -> pd.Series:
         (ev >= 98) &
         (la >= la_min) & (la <= la_max)
     ).fillna(False)
+
+
+def _is_pulled_airball(
+    hc_x: pd.Series,
+    hc_y: pd.Series,
+    stand: pd.Series,
+    bb_type: pd.Series,
+) -> pd.Series:
+    """
+    Classify a batted ball as a PULLED AIR BALL (fly ball or line drive pulled
+    to the pull-side of the field).
+
+    Ground balls and popups are excluded — only fly balls and line drives count
+    because those are the trajectories that produce home runs.
+
+    Statcast coordinate system (from catcher's perspective):
+        hc_x: 0 = left foul line, ~125 = center, ~250 = right foul line
+        hc_y: 0 = home plate side, increases toward outfield
+
+    Pull direction:
+        RHB pulled → left side  → hc_x < 125
+        LHB pulled → right side → hc_x > 125
+
+    We use hc_x < 100 / hc_x > 150 as tighter thresholds to stay solidly in
+    the pull-side fair territory and avoid foul-ball noise near the lines.
+
+    bb_type values (Statcast): 'fly_ball', 'line_drive', 'ground_ball', 'popup'
+    Only 'fly_ball' and 'line_drive' are counted.
+    """
+    x   = pd.to_numeric(hc_x,  errors="coerce")
+    y   = pd.to_numeric(hc_y,  errors="coerce")
+    bb  = bb_type.astype("string").str.lower().str.strip()
+
+    rhb = stand == "R"
+    lhb = stand == "L"
+
+    # Air ball = fly ball or line drive (not ground ball, not popup)
+    is_air = bb.isin(["fly_ball", "line_drive"])
+
+    # Ball in play with valid coordinates
+    in_play = x.notna() & y.notna() & (y > 0) & is_air
+
+    pulled = (
+        (rhb & in_play & (x < 100)) |   # RHB pulls to left side
+        (lhb & in_play & (x > 150))      # LHB pulls to right side
+    )
+    return pulled.fillna(False)
 
 
 # ---------------------------------------------------------------------------
