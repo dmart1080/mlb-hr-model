@@ -150,7 +150,7 @@ def fetch_upcoming_game_pks(date_str: str) -> set[int] | None:
     """
     import requests as _req
 
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=game(status)"
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=game(status),team"
     try:
         resp = _req.get(url, timeout=10)
         resp.raise_for_status()

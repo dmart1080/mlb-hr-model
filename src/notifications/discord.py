@@ -3,12 +3,14 @@ Discord Webhook Notifier — MLB HR Picks
 ========================================
 Sends daily bet picks to a Discord channel via webhook.
 
-Each pick is posted as a rich embed with:
-  - Player name, pitcher faced, batting slot
-  - Model prob, market prob, edge
-  - DraftKings / FanDuel odds (from odds data)
-  - Minimum odds for other books (use --manual-check list)
-  - Kelly stake recommendation
+Pick tiers
+----------
+  🟢 BET    edge > 0pp         — positive edge, post as full pick embed
+  🟡 WATCH  -2pp ≤ edge ≤ 0pp — near-edge, worth monitoring or shopping
+  (below -2pp is not shown)
+
+The watch-list is posted as a compact single embed (not individual cards)
+so it doesn't flood the channel on days with no strong edges.
 
 Setup
 -----
@@ -20,15 +22,6 @@ Setup
   Optional — separate channels per pass:
        DISCORD_WEBHOOK_MORNING=https://discord.com/api/webhooks/...
        DISCORD_WEBHOOK_FINAL=https://discord.com/api/webhooks/...
-
-Usage (standalone test)
------------------------
-    python -m src.notifications.discord --date 2026-04-01
-    python -m src.notifications.discord --pass final
-    python -m src.notifications.discord --dry-run        # print to console only
-
-Called automatically by predict.py after every final pass if
-DISCORD_WEBHOOK_URL (or DISCORD_WEBHOOK_FINAL) is set.
 """
 
 from __future__ import annotations
@@ -50,65 +43,45 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT    = Path(__file__).resolve().parents[2]
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 
-# ---------------------------------------------------------------------------
-# Platform colours (used for embed accent)
-# ---------------------------------------------------------------------------
-COLOUR_FINAL   = 0x00B16A   # green  — confirmed bets
-COLOUR_MORNING = 0xF39C12   # amber  — early / unconfirmed
-COLOUR_NO_ODDS = 0x95A5A6   # grey   — model-only run
+COLOUR_FINAL    = 0x00B16A   # green  — confirmed bets
+COLOUR_MORNING  = 0xF39C12   # amber  — early / unconfirmed
+COLOUR_WATCH    = 0xF39C12   # amber  — near-edge watch list
+COLOUR_NO_ODDS  = 0x95A5A6   # grey   — model-only run
+
+# Near-edge window: picks between WATCH_FLOOR and 0pp are shown as watch list
+WATCH_FLOOR_PP = -2.0
+
 
 # ---------------------------------------------------------------------------
-# Minimum-odds calculation
+# Platform odds helpers
 # ---------------------------------------------------------------------------
 
 def american_to_decimal(american: int | float) -> float:
-    """Convert American odds to decimal."""
     if american < 0:
         return 1 + (100 / abs(american))
     return 1 + (american / 100)
 
 
 def decimal_to_american(decimal: float) -> int:
-    """Convert decimal odds to American (rounded to nearest 5)."""
     if decimal >= 2.0:
         american = (decimal - 1) * 100
     else:
         american = -100 / (decimal - 1)
-    # Round to nearest 5 (typical book increment)
     return int(round(american / 5) * 5)
 
 
 def minimum_odds_for_edge(
     model_prob: float,
     min_edge_pp: float = 3.0,
-    vig_pct: float = 0.045,
+    vig_pct: float = 0.035,   # updated to match odds.py
 ) -> dict:
     """
-    Calculate the minimum acceptable American odds at which a bet still
-    has at least `min_edge_pp` percentage-points of edge vs the model.
-
-    For use when manually checking a book that isn't in the odds feed.
-
-    Parameters
-    ----------
-    model_prob  : model's HR probability (0–1)
-    min_edge_pp : minimum edge required in percentage points (default 3pp)
-    vig_pct     : assumed book vig to add on top (default 4.5%)
-
-    Returns
-    -------
-    dict with:
-        min_fair_decimal    : minimum decimal odds before vig
-        min_book_decimal    : minimum decimal odds after vig (what book shows)
-        min_book_american   : minimum American odds to show on a bet slip
-        breakeven_american  : odds at which edge = 0 (no-bet threshold)
+    Calculate the minimum acceptable American odds for at least min_edge_pp
+    of edge. Uses 3.5% vig to match the updated odds.py assumption.
     """
-    # Fair probability threshold: model_prob minus minimum edge
-    # = maximum fair prob we're willing to accept from the market
     max_market_fair_prob = model_prob - (min_edge_pp / 100)
 
     if max_market_fair_prob <= 0:
-        # Edge requirement > model prob — no line will ever be good enough
         return {
             "min_fair_decimal":  None,
             "min_book_decimal":  None,
@@ -117,20 +90,11 @@ def minimum_odds_for_edge(
             "note": "Model prob too low for this edge threshold.",
         }
 
-    # Convert to decimal odds (fair, before vig)
     min_fair_decimal = 1 / max_market_fair_prob
 
-    # Add vig: the book's implied prob = fair_prob * (1 + vig/2) per side
-    # So the over price will be slightly worse than fair.
-    # We want the minimum BOOK odds (after vig), meaning the market fair prob
-    # implied by what the book shows must still be <= max_market_fair_prob.
-    # Solve: book_implied_prob = book_decimal_implied / (1 + vig)
-    # min_book_decimal such that the fair prob it implies <= max_market_fair_prob
     min_book_implied_prob = max_market_fair_prob * (1 + vig_pct / 2)
     min_book_decimal = 1 / min_book_implied_prob
 
-    # Breakeven (edge = 0): market fair prob == model prob
-    breakeven_fair_decimal = 1 / model_prob
     breakeven_book_implied_prob = model_prob * (1 + vig_pct / 2)
     breakeven_book_decimal = 1 / breakeven_book_implied_prob
 
@@ -139,7 +103,7 @@ def minimum_odds_for_edge(
         "min_book_decimal":   round(min_book_decimal, 3),
         "min_book_american":  decimal_to_american(min_book_decimal),
         "breakeven_american": decimal_to_american(breakeven_book_decimal),
-        "note": f"Need odds ≥ {_fmt_american(decimal_to_american(min_book_decimal))} on other books "
+        "note": f"Need odds ≥ {_fmt_american(decimal_to_american(min_book_decimal))} "
                 f"for {min_edge_pp:.0f}pp edge.",
     }
 
@@ -173,7 +137,112 @@ def _fmt_edge(val) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Embed builder
+# Embed builders
+# ---------------------------------------------------------------------------
+
+def _build_bet_embed(
+    rank: int,
+    row,
+    *,
+    colour: int,
+    pass_label: str,
+    date_str: str,
+    min_edge_pp: float,
+    has_odds: bool,
+) -> dict:
+    """Build a full pick embed for a positive-edge bet."""
+    batter  = str(row.get("batter_name", "Unknown"))
+    pitcher = str(row.get("pitcher_name", "Unknown"))
+    slot    = int(row.get("batting_order_pos", 0)) or "?"
+    model   = _fmt_pct(row.get("hr_prob"))
+    market  = _fmt_pct(row.get("market_fair_prob")) if has_odds else "—"
+    edge    = _fmt_edge(row.get("edge")) if has_odds else "—"
+    odds    = _fmt_american(row.get("market_over_price")) if has_odds else "—"
+    kelly   = _fmt_pct(row.get("kelly_stake")) if has_odds else "—"
+    book    = str(row.get("odds_bookmaker", "")).upper() or "—"
+
+    fields = [
+        {"name": "🆚 vs Pitcher",   "value": pitcher,   "inline": True},
+        {"name": "📍 Batting Slot", "value": str(slot), "inline": True},
+        {"name": "🤖 Model Prob",   "value": model,     "inline": True},
+    ]
+
+    if has_odds:
+        fields += [
+            {"name": "📊 Market Fair", "value": market, "inline": True},
+            {"name": "📈 Edge",        "value": edge,   "inline": True},
+            {"name": "💰 Kelly Stake", "value": kelly,  "inline": True},
+            {"name": "🟢 DraftKings",  "value": odds,   "inline": True},
+            {"name": "🔵 FanDuel",     "value": odds,   "inline": True},
+            {"name": "📖 Source Book", "value": book,   "inline": True},
+        ]
+
+        try:
+            hr_prob = float(row.get("hr_prob", 0))
+            min_odds_info = minimum_odds_for_edge(hr_prob, min_edge_pp=min_edge_pp)
+            min_american  = min_odds_info.get("min_book_american")
+            breakeven     = min_odds_info.get("breakeven_american")
+            other_books_text = (
+                f"Need **{_fmt_american(min_american)}** or better\n"
+                f"*(break-even: {_fmt_american(breakeven)})*"
+                if min_american is not None
+                else "Prob too low for this threshold"
+            )
+        except Exception:
+            other_books_text = "—"
+
+        fields.append({
+            "name":   f"🔍 Other Books (min for {min_edge_pp:.0f}pp edge)",
+            "value":  other_books_text,
+            "inline": False,
+        })
+
+    return {
+        "title":  f"#{rank}  {batter}  — HR Over",
+        "color":  colour,
+        "fields": fields,
+        "footer": {"text": f"MLB HR Model • {pass_label} pass • {date_str}"},
+    }
+
+
+def _build_watchlist_embed(
+    watch_rows,
+    *,
+    date_str: str,
+    pass_label: str,
+) -> dict:
+    """
+    Build a compact single embed for near-edge watch-list picks.
+    These are picks where -2pp ≤ edge < 0pp — worth monitoring but not bets.
+    """
+    lines = []
+    for _, row in watch_rows.iterrows():
+        name    = str(row.get("batter_name",  "?"))
+        pitcher = str(row.get("pitcher_name", "?"))
+        model   = _fmt_pct(row.get("hr_prob"))
+        edge    = _fmt_edge(row.get("edge"))
+        odds    = _fmt_american(row.get("market_over_price"))
+        book    = str(row.get("odds_bookmaker", "")).upper() or "—"
+        slot    = int(row.get("batting_order_pos", 0))
+        lines.append(
+            f"**{name}** vs {pitcher} (slot {slot})\n"
+            f"  Model {model} | Edge {edge} | {odds} [{book}]"
+        )
+
+    return {
+        "title":       f"🟡 Watch List — Near Edge ({date_str})",
+        "description": (
+            f"These {len(lines)} pick(s) are within 2pp of positive edge. "
+            f"Worth shopping other books or monitoring for line movement.\n\n"
+            + "\n\n".join(lines)
+        ),
+        "color":  COLOUR_WATCH,
+        "footer": {"text": f"MLB HR Model • {pass_label} pass • {date_str} • not a bet recommendation"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main payload builder
 # ---------------------------------------------------------------------------
 
 def build_picks_payload(
@@ -184,12 +253,13 @@ def build_picks_payload(
     min_edge_pp: float = 3.0,
 ) -> list[dict]:
     """
-    Build a list of Discord webhook payloads (one per message chunk).
+    Build Discord webhook payloads.
 
-    Discord embed field limit: 25 fields per embed.
-    We send one embed per pick so each card is readable.
-
-    Returns a list of dicts ready to POST to the webhook.
+    Tier logic:
+      edge > 0pp             → full pick embed (green)  — bet
+      WATCH_FLOOR ≤ edge ≤ 0 → compact watch-list embed (amber) — monitor
+      edge < WATCH_FLOOR     → not shown
+      no odds at all         → top-10 model-only fallback (grey)
     """
     import pandas as pd
 
@@ -198,128 +268,80 @@ def build_picks_payload(
 
     has_odds = "edge" in ranked_df.columns and ranked_df["edge"].notna().any()
 
-    # Filter to positive-edge bets only (or top-10 if no odds)
-    if has_odds:
-        bets = ranked_df[
-            ranked_df["edge"].notna() & (ranked_df["edge"] > 0)
-        ].sort_values(["edge", "hr_prob"], ascending=False).copy()
-    else:
-        bets = ranked_df.sort_values("hr_prob", ascending=False).head(10).copy()
-
-    no_edge_fallback = False
-    if bets.empty:
-        # No positive-edge bets — fall back to top picks by model prob, flagged as no edge
-        bets = ranked_df.sort_values("hr_prob", ascending=False).head(10).copy()
-        no_edge_fallback = True
-
-    colour = COLOUR_NO_ODDS if no_edge_fallback else (COLOUR_FINAL if pass_label == "FINAL" else COLOUR_MORNING)
-
     payloads = []
 
-    # ---- Header message ----
-    n_bets = len(bets)
-    if no_edge_fallback:
-        desc = (
-            f"**⚠️ No Edge Today — Top {n_bets} Model Picks**\n"
-            f"No positive-edge bets found vs current lines. "
-            f"These are the model's best HR candidates but **bet at your own risk**."
-        )
-    elif has_odds:
+    # ---- No odds fallback ----
+    if not has_odds:
+        top = ranked_df.sort_values("hr_prob", ascending=False).head(10)
+        lines = []
+        for _, row in top.iterrows():
+            lines.append(
+                f"**{row.get('batter_name','?')}** vs {row.get('pitcher_name','?')} "
+                f"— {_fmt_pct(row.get('hr_prob'))} (slot {int(row.get('batting_order_pos',0))})"
+            )
+        payloads.append({"embeds": [{
+            "title":       f"⚾ MLB HR Picks — {date_str}  [{pass_label}]",
+            "description": "**Model-only picks** (no odds data)\n\n" + "\n".join(lines),
+            "color":       COLOUR_NO_ODDS,
+        }]})
+        return payloads
+
+    # ---- Split into bet / watch tiers ----
+    watch_floor = WATCH_FLOOR_PP / 100.0
+
+    bets = ranked_df[
+        ranked_df["edge"].notna() & (ranked_df["edge"] > 0)
+    ].sort_values(["edge", "hr_prob"], ascending=False).copy()
+
+    watch = ranked_df[
+        ranked_df["edge"].notna() &
+        (ranked_df["edge"] >= watch_floor) &
+        (ranked_df["edge"] <= 0)
+    ].sort_values(["edge", "hr_prob"], ascending=False).copy()
+
+    colour = COLOUR_FINAL if pass_label == "FINAL" else COLOUR_MORNING
+
+    # ---- Header ----
+    if len(bets) > 0:
         avg_edge = bets["edge"].mean() * 100
         desc = (
-            f"**{n_bets} bet{'s' if n_bets != 1 else ''} with positive edge** "
+            f"**{len(bets)} bet{'s' if len(bets) != 1 else ''} with positive edge** "
             f"| avg edge **{avg_edge:+.1f}pp**\n"
             f"✅ DraftKings & FanDuel odds shown directly.\n"
             f"📋 Other books: check minimum odds listed per pick."
         )
     else:
         desc = (
-            f"**Top {n_bets} HR candidates** (model-only, no odds data)\n"
-            f"ℹ️ Set `ODDS_API_KEY` for edge-filtered picks with minimum odds."
+            f"**No positive-edge bets today.**\n"
+            f"Check the watch list below for near-edge candidates."
         )
 
-    header_payload = {
-        "embeds": [{
-            "title": f"⚾ MLB HR Picks — {date_str}  [{pass_label}]",
-            "description": desc,
-            "color": colour,
-        }]
-    }
-    payloads.append(header_payload)
+    if len(watch) > 0:
+        desc += f"\n🟡 **{len(watch)} watch-list pick{'s' if len(watch) != 1 else ''}** (within 2pp of edge)"
 
-    # ---- One embed per pick ----
+    payloads.append({"embeds": [{
+        "title":       f"⚾ MLB HR Picks — {date_str}  [{pass_label}]",
+        "description": desc,
+        "color":       colour,
+    }]})
+
+    # ---- One embed per bet ----
     for rank, (_, row) in enumerate(bets.iterrows(), start=1):
-        batter  = str(row.get("batter_name", "Unknown"))
-        pitcher = str(row.get("pitcher_name", "Unknown"))
-        slot    = int(row.get("batting_order_pos", 0)) or "?"
-        model   = _fmt_pct(row.get("hr_prob"))
-        market  = _fmt_pct(row.get("market_fair_prob")) if has_odds else "—"
-        edge    = _fmt_edge(row.get("edge")) if has_odds else "—"
-        odds    = _fmt_american(row.get("market_over_price")) if has_odds else "—"
-        kelly   = _fmt_pct(row.get("kelly_stake")) if has_odds else "—"
-        book    = str(row.get("odds_bookmaker", "")).upper() or "—"
-
-        fields = [
-            {"name": "🆚 vs Pitcher",    "value": pitcher,  "inline": True},
-            {"name": "📍 Batting Slot",  "value": str(slot), "inline": True},
-            {"name": "🤖 Model Prob",    "value": model,    "inline": True},
-        ]
-
-        if no_edge_fallback:
-            fields.insert(0, {
-                "name": "⚠️ NO EDGE",
-                "value": "Model pick only — no positive edge vs current market lines.",
-                "inline": False,
-            })
-
-        if has_odds:
-            fields += [
-                {"name": "📊 Market Fair", "value": market, "inline": True},
-                {"name": "📈 Edge",        "value": edge,   "inline": True},
-                {"name": "💰 Kelly Stake", "value": kelly,  "inline": True},
-            ]
-
-            # DraftKings / FanDuel — show the odds we have directly
-            # (The odds feed aggregates to one book; DK/FD are typically within
-            #  a few ticks of each other for HR props)
-            dk_fd_odds = odds
-            fields += [
-                {"name": "🟢 DraftKings",  "value": dk_fd_odds, "inline": True},
-                {"name": "🔵 FanDuel",     "value": dk_fd_odds, "inline": True},
-                {"name": "📖 Source Book", "value": book,       "inline": True},
-            ]
-
-            # Minimum odds for OTHER books (manual check)
-            try:
-                hr_prob = float(row.get("hr_prob", 0))
-                min_odds_info = minimum_odds_for_edge(hr_prob, min_edge_pp=min_edge_pp)
-                min_american  = min_odds_info.get("min_book_american")
-                breakeven     = min_odds_info.get("breakeven_american")
-                if min_american is not None:
-                    other_books_text = (
-                        f"Need **{_fmt_american(min_american)}** or better\n"
-                        f"*(break-even: {_fmt_american(breakeven)})*"
-                    )
-                else:
-                    other_books_text = "Prob too low for this threshold"
-            except Exception:
-                other_books_text = "—"
-
-            fields.append({
-                "name": f"🔍 Other Books (min for {min_edge_pp:.0f}pp edge)",
-                "value": other_books_text,
-                "inline": False,
-            })
-
-        embed = {
-            "title": f"#{rank}  {batter}  — HR Over",
-            "color": colour,
-            "fields": fields,
-            "footer": {
-                "text": f"MLB HR Model • {pass_label} pass • {date_str}"
-            },
-        }
+        embed = _build_bet_embed(
+            rank, row,
+            colour=colour,
+            pass_label=pass_label,
+            date_str=date_str,
+            min_edge_pp=min_edge_pp,
+            has_odds=True,
+        )
         payloads.append({"embeds": [embed]})
+
+    # ---- Compact watch-list embed ----
+    if not watch.empty:
+        payloads.append({"embeds": [
+            _build_watchlist_embed(watch, date_str=date_str, pass_label=pass_label)
+        ]})
 
     return payloads
 
@@ -337,28 +359,13 @@ def send_to_discord(
     dry_run: bool = False,
     min_edge_pp: float = 3.0,
 ) -> bool:
-    """
-    Format picks and POST to Discord webhook.
-
-    Parameters
-    ----------
-    ranked_df   : predictions DataFrame from predict.py
-    pass_label  : "MORNING" or "FINAL"
-    date_str    : YYYY-MM-DD string for the display header
-    webhook_url : override env var
-    dry_run     : print payloads to console without sending
-    min_edge_pp : minimum edge for 'other books' minimum odds calculation
-
-    Returns True on success, False on failure.
-    """
     if webhook_url is None:
         key = f"DISCORD_WEBHOOK_{pass_label.upper()}"
         webhook_url = os.environ.get(key) or os.environ.get("DISCORD_WEBHOOK_URL")
 
     if not webhook_url and not dry_run:
         logger.info(
-            "No Discord webhook URL found. Set DISCORD_WEBHOOK_URL in .env to enable.\n"
-            "  export DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/TOKEN"
+            "No Discord webhook URL found. Set DISCORD_WEBHOOK_URL in .env to enable."
         )
         return False
 
@@ -385,20 +392,13 @@ def send_to_discord(
     success = True
     for i, payload in enumerate(payloads):
         try:
-            resp = requests.post(
-                webhook_url,
-                json=payload,
-                timeout=10,
-            )
+            resp = requests.post(webhook_url, json=payload, timeout=10)
             if resp.status_code == 204:
                 logger.debug("Discord message %d/%d sent OK", i + 1, len(payloads))
             else:
-                logger.warning(
-                    "Discord webhook returned %d for message %d: %s",
-                    resp.status_code, i + 1, resp.text[:200],
-                )
+                logger.warning("Discord webhook returned %d for message %d: %s",
+                               resp.status_code, i + 1, resp.text[:200])
                 success = False
-            # Discord rate-limit: 5 requests/2s → tiny sleep between embeds
             import time
             time.sleep(0.5)
         except requests.RequestException as e:
@@ -406,19 +406,19 @@ def send_to_discord(
             success = False
 
     if success:
-        logger.info("Discord: sent %d pick message(s) for %s [%s]", len(payloads), date_str, pass_label)
+        logger.info("Discord: sent %d pick message(s) for %s [%s]",
+                    len(payloads), date_str, pass_label)
     return success
 
 
 # ---------------------------------------------------------------------------
-# CLI (standalone test / manual trigger)
+# CLI
 # ---------------------------------------------------------------------------
 
-def _load_latest_predictions(date_str: str | None, pass_label: str) -> "pd.DataFrame":
+def _load_latest_predictions(date_str: str | None, pass_label: str):
     import pandas as pd
 
     if date_str is None:
-        # Find most recent predictions file
         files = sorted(PREDICTIONS_DIR.glob("predictions_????-??-??.csv"), reverse=True)
         if not files:
             raise FileNotFoundError(f"No prediction CSVs found in {PREDICTIONS_DIR}")
@@ -426,7 +426,7 @@ def _load_latest_predictions(date_str: str | None, pass_label: str) -> "pd.DataF
         date_str = path.stem.replace("predictions_", "")
     else:
         suffix_map = {"FINAL": "final", "MORNING": "morning"}
-        sfx = suffix_map.get(pass_label.upper())
+        sfx  = suffix_map.get(pass_label.upper())
         path = PREDICTIONS_DIR / f"predictions_{date_str}_{sfx}.csv" if sfx else None
         if path is None or not path.exists():
             path = PREDICTIONS_DIR / f"predictions_{date_str}.csv"
@@ -446,12 +446,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Send HR picks to Discord")
     parser.add_argument("--date",      default=None, help="YYYY-MM-DD (default: latest)")
     parser.add_argument("--pass",      dest="pass_label", choices=["morning", "final"],
-                        default="final", help="Pass label (default: final)")
-    parser.add_argument("--min-edge",  type=float, default=3.0,
-                        help="Min edge pp for other-books minimum odds (default 3.0)")
-    parser.add_argument("--dry-run",   action="store_true",
-                        help="Print payloads to console without sending")
-    parser.add_argument("--webhook",   default=None, help="Override webhook URL")
+                        default="final")
+    parser.add_argument("--min-edge",  type=float, default=3.0)
+    parser.add_argument("--dry-run",   action="store_true")
+    parser.add_argument("--webhook",   default=None)
     args = parser.parse_args()
 
     df, resolved_date = _load_latest_predictions(args.date, args.pass_label.upper())
