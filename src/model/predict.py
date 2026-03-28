@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import glob
 import joblib
@@ -133,6 +133,55 @@ def load_model():
     raise FileNotFoundError(
         "No trained model found in models/. Run src/model/train.py first."
     )
+
+
+# ---------------------------------------------------------------------------
+# Game status filter
+# ---------------------------------------------------------------------------
+
+def fetch_upcoming_game_pks(date_str: str) -> set[int] | None:
+    """
+    Query the MLB Stats API for today's games and return the set of game_pks
+    whose status is NOT yet Live or Final.
+
+    Returns None if the API call fails (caller should skip the filter).
+    A 30-minute buffer is NOT needed here — the API status field is the
+    ground truth: 'Preview' / 'Warmup' = upcoming, 'Live' / 'Final' = skip.
+    """
+    import requests as _req
+
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=game(status)"
+    try:
+        resp = _req.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"⚠️  Game status fetch failed (filter skipped): {e}")
+        return None
+
+    upcoming: set[int] = set()
+    skipped:  list[str] = []
+
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            pk     = int(game["gamePk"])
+            state  = game.get("status", {}).get("abstractGameState", "Preview")
+            detail = game.get("status", {}).get("detailedState", "")
+            away   = game.get("teams", {}).get("away",  {}).get("team", {}).get("abbreviation", "?")
+            home   = game.get("teams", {}).get("home",  {}).get("team", {}).get("abbreviation", "?")
+            matchup = f"{away}@{home}"
+
+            if state in ("Live", "Final"):
+                skipped.append(f"{matchup} ({detail})")
+            else:
+                upcoming.add(pk)
+
+    if skipped:
+        print(f"ℹ️  Skipping {len(skipped)} game(s) already in progress or final:")
+        for g in skipped:
+            print(f"     • {g}")
+
+    return upcoming
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +397,30 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
+    # ------------------------------------------------------------------
+    # Filter out games that are already Live or Final
+    # This prevents the no-edge fallback (and any other pass) from surfacing
+    # picks for games that have already started or finished.
+    # ------------------------------------------------------------------
+    date_str = str(target_date.date())
+
+    if "game_pk" in today_df.columns:
+        upcoming_pks = fetch_upcoming_game_pks(date_str)
+        if upcoming_pks is not None:
+            before = len(today_df)
+            today_df = today_df[today_df["game_pk"].astype(int).isin(upcoming_pks)].copy()
+            dropped = before - len(today_df)
+            if dropped:
+                print(f"  Removed {dropped} batter row(s) for games already started or final.")
+            if today_df.empty:
+                print(
+                    f"\n  ℹ️  All games for {date_str} are already Live or Final. "
+                    "No predictions to score.\n"
+                )
+                sys.exit(0)
+    else:
+        print("⚠️  game_pk column not found — skipping game status filter.")
+
     print(f"Scoring {len(today_df)} batter rows for {target_date.date()} ...")
 
     # ------------------------------------------------------------------
@@ -380,7 +453,6 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Odds enrichment
     # ------------------------------------------------------------------
-    date_str = str(target_date.date())
     has_odds = False
 
     odds_api_key = os.environ.get("ODDS_API_KEY")
