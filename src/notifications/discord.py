@@ -8,8 +8,8 @@ Pick tiers
   🟢 BET    edge > 0pp         — positive edge, post as full pick embed
   🟡 WATCH  -2pp ≤ edge ≤ 0pp — near-edge, worth monitoring or shopping
   (below -2pp is not shown)
-  🔵 MODEL FAVOURITE           — always shown: highest hr_prob on the slate,
-                                 no odds checked, purely model-based
+  📊 TOP 10 MODEL PLAYS        — only when no edge bets: top 10 hr_prob,
+                                 no odds checked, purely model-based, posted after watchlist
 
 The watch-list is posted as a compact single embed (not individual cards)
 so it doesn't flood the channel on days with no strong edges.
@@ -258,36 +258,28 @@ def _build_watchlist_embed(
     }
 
 
-def _build_model_favourite_embed(row, *, date_str: str, pass_label: str) -> dict:
+def _build_top10_model_embed(top_rows, *, date_str: str, pass_label: str) -> dict:
     """
-    Compact embed for the player the model gives the highest HR probability
-    on today's slate — shown every run regardless of odds or edge.
+    Compact embed showing the top 10 players by model HR probability.
+    Only posted when there are no positive-edge bets today.
     No odds API is consulted; this is purely model output.
     """
-    batter  = _safe_name(row.get("batter_name"), fallback="Unknown")
-    pitcher = _safe_name(row.get("pitcher_name"), fallback="TBD")
-    slot    = int(row.get("batting_order_pos", 0)) or "?"
-    prob    = _fmt_pct(row.get("hr_prob"))
-    hand    = str(row.get("batter_hand", "—")) or "—"
-    p_hand  = str(row.get("pitcher_hand", "—")) or "—"
-
-    matchup_hand = "—"
-    if hand not in ("—", "None", "nan") and p_hand not in ("—", "None", "nan"):
-        matchup_hand = f"{hand} vs {p_hand}"
+    lines = []
+    for rank, (_, row) in enumerate(top_rows.iterrows(), start=1):
+        batter  = _safe_name(row.get("batter_name"), fallback="Unknown")
+        pitcher = _safe_name(row.get("pitcher_name"), fallback="TBD")
+        prob    = _fmt_pct(row.get("hr_prob"))
+        slot    = int(row.get("batting_order_pos", 0)) or "?"
+        lines.append(f"**{rank}.** **{batter}** vs {pitcher} (slot {slot}) — {prob}")
 
     return {
-        "title": f"🔵 Model Favourite — {batter}",
+        "title":       f"📊 Top 10 Model Plays — {date_str}",
         "description": (
-            f"Highest model HR probability on today's slate. "
-            f"No odds data used — check your book before betting."
+            "No edge plays today. Here are the top 10 players by model HR probability.\n"
+            "No odds data used — not a bet recommendation.\n\n"
+            + "\n".join(lines)
         ),
         "color": COLOUR_MODEL,
-        "fields": [
-            {"name": "🆚 vs Pitcher",    "value": pitcher,       "inline": True},
-            {"name": "📍 Batting Slot",  "value": str(slot),     "inline": True},
-            {"name": "🤖 Model Prob",    "value": prob,          "inline": True},
-            {"name": "🤜 Matchup",       "value": matchup_hand,  "inline": True},
-        ],
         "footer": {
             "text": f"MLB HR Model • {pass_label} pass • {date_str} • model only — not a bet recommendation"
         },
@@ -313,7 +305,7 @@ def build_picks_payload(
       WATCH_FLOOR ≤ edge ≤ 0 → compact watch-list embed (amber) — monitor
       edge < WATCH_FLOOR     → not shown
       no odds at all         → top-10 model-only fallback (grey)
-      always                 → model favourite embed (blue) — top hr_prob, no odds
+      no edge bets today     → top-10 model plays embed (blue) posted after watch list
     """
     import pandas as pd
 
@@ -398,11 +390,12 @@ def build_picks_payload(
             _build_watchlist_embed(watch, date_str=date_str, pass_label=pass_label)
         ]})
 
-    # ---- Model favourite — always posted, no odds check ----
-    top_row = ranked_df.sort_values("hr_prob", ascending=False).iloc[0]
-    payloads.append({"embeds": [
-        _build_model_favourite_embed(top_row, date_str=date_str, pass_label=pass_label)
-    ]})
+    # ---- Top 10 model plays — only when no positive-edge bets today ----
+    if bets.empty:
+        top10 = ranked_df.sort_values("hr_prob", ascending=False).head(10)
+        payloads.append({"embeds": [
+            _build_top10_model_embed(top10, date_str=date_str, pass_label=pass_label)
+        ]})
 
     return payloads
 

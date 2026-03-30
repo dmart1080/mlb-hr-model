@@ -163,6 +163,7 @@ cython_debug/
 data/cache/
 data/processed/
 data/backtest/*_results.csv
+data/predictions/
 models/
 logs/
 patch_*\.py
