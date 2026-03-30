@@ -168,3 +168,4 @@ models/
 logs/
 patch_*\.py
 debug_*\.py
+data/predictions/
