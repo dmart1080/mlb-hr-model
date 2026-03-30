@@ -289,6 +289,16 @@ def build_today_features(
                 h_start = s.iloc[0].get("home_starter_id", h_start)
                 a_start = s.iloc[0].get("away_starter_id", a_start)
 
+        # Capture probable pitcher names from the schedule (used as display
+        # fallback when the MLBAM ID lookup fails in predict.py).
+        h_start_name = str(game.get("home_starter_name", "")).strip() or None
+        a_start_name = str(game.get("away_starter_name", "")).strip() or None
+        # Normalise "nan" strings that pandas writes for missing values
+        if h_start_name and h_start_name.lower() in ("nan", "none"):
+            h_start_name = None
+        if a_start_name and a_start_name.lower() in ("nan", "none"):
+            a_start_name = None
+
         # Get batters for this game
         game_batters = batting_df[batting_df["game_pk"] == gp] if not batting_df.empty else pd.DataFrame()
 
@@ -308,31 +318,34 @@ def build_today_features(
 
             # Resolve pitcher: batters face the opposing team's starter
             if team_side == "home":
-                pitcher_id = a_start  # home batters face away starter
-                is_home    = 1
+                pitcher_id   = a_start       # home batters face away starter
+                pitcher_name = a_start_name
+                is_home      = 1
             else:
-                pitcher_id = h_start  # away batters face home starter
-                is_home    = 0
+                pitcher_id   = h_start       # away batters face home starter
+                pitcher_name = h_start_name
+                is_home      = 0
 
             if pitcher_id is None or pd.isna(pitcher_id):
                 pitcher_id = None  # will be filled with league avg
 
             rows.append({
-                "game_date":         target_ts,
-                "game_pk":           gp,
-                "batter":            batter_id,
-                "pitcher":           int(pitcher_id) if pitcher_id is not None else None,
-                "home_team":         home,
-                "batter_team":       home if is_home else away,
-                "is_home_game":      is_home,
-                "batting_order_pos": bat_order,
-                "is_top_of_order":   int(bat_order in range(1, 5)),
-                "expected_pa_today": _EXPECTED_PA.get(bat_order, _EXPECTED_PA_DEFAULT),
-                "hr_hit":            0,    # unknown — game not played yet
-                "relief_pa_pct":     0.0,  # pre-game: no relief PAs yet
-                "p_is_short_rest":   0,
-                "b_days_rest":       _LEAGUE_FILL["b_days_rest"],
-                "p_days_rest":       _LEAGUE_FILL["p_days_rest"],
+                "game_date":              target_ts,
+                "game_pk":                gp,
+                "batter":                 batter_id,
+                "pitcher":                int(pitcher_id) if pitcher_id is not None else None,
+                "probable_pitcher_name":  pitcher_name,
+                "home_team":              home,
+                "batter_team":            home if is_home else away,
+                "is_home_game":           is_home,
+                "batting_order_pos":      bat_order,
+                "is_top_of_order":        int(bat_order in range(1, 5)),
+                "expected_pa_today":      _EXPECTED_PA.get(bat_order, _EXPECTED_PA_DEFAULT),
+                "hr_hit":                 0,    # unknown — game not played yet
+                "relief_pa_pct":          0.0,  # pre-game: no relief PAs yet
+                "p_is_short_rest":        0,
+                "b_days_rest":            _LEAGUE_FILL["b_days_rest"],
+                "p_days_rest":            _LEAGUE_FILL["p_days_rest"],
             })
 
     if not rows:
@@ -470,7 +483,7 @@ def build_today_features(
     non_stat = {
         "game_date", "game_pk", "batter", "pitcher", "home_team",
         "batter_team", "hr_hit", "pitcher_hand", "batter_hand",
-        "pitcher_mode",
+        "pitcher_mode", "probable_pitcher_name",
     }
     stat_cols = [c for c in today_df.columns if c not in non_stat]
     today_df[stat_cols] = today_df[stat_cols].fillna(0.0)
@@ -562,7 +575,8 @@ def _append_to_combined(today_df: pd.DataFrame, target_date: str) -> None:
         if col not in today_copy.columns:
             today_copy[col] = (
                 0.0 if col not in
-                {"pitcher_hand", "batter_hand", "pitcher_mode", "batter_team", "home_team"}
+                {"pitcher_hand", "batter_hand", "pitcher_mode", "batter_team",
+                 "home_team", "probable_pitcher_name"}
                 else None
             )
     for col in today_copy.columns:

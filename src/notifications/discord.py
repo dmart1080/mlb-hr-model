@@ -8,6 +8,8 @@ Pick tiers
   🟢 BET    edge > 0pp         — positive edge, post as full pick embed
   🟡 WATCH  -2pp ≤ edge ≤ 0pp — near-edge, worth monitoring or shopping
   (below -2pp is not shown)
+  🔵 MODEL FAVOURITE           — always shown: highest hr_prob on the slate,
+                                 no odds checked, purely model-based
 
 The watch-list is posted as a compact single embed (not individual cards)
 so it doesn't flood the channel on days with no strong edges.
@@ -47,6 +49,7 @@ COLOUR_FINAL    = 0x00B16A   # green  — confirmed bets
 COLOUR_MORNING  = 0xF39C12   # amber  — early / unconfirmed
 COLOUR_WATCH    = 0xF39C12   # amber  — near-edge watch list
 COLOUR_NO_ODDS  = 0x95A5A6   # grey   — model-only run
+COLOUR_MODEL    = 0x3498DB   # blue   — model favourite (no odds check)
 
 # Near-edge window: picks between WATCH_FLOOR and 0pp are shown as watch list
 WATCH_FLOOR_PP = -2.0
@@ -136,6 +139,20 @@ def _fmt_edge(val) -> str:
         return "—"
 
 
+def _safe_name(val, fallback: str = "TBD") -> str:
+    """Return a clean player name string, replacing NaN/None/empty with fallback."""
+    if val is None:
+        return fallback
+    if isinstance(val, float):
+        import math
+        if math.isnan(val):
+            return fallback
+    s = str(val).strip()
+    if s.lower() in ("nan", "none", ""):
+        return fallback
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Embed builders
 # ---------------------------------------------------------------------------
@@ -151,8 +168,8 @@ def _build_bet_embed(
     has_odds: bool,
 ) -> dict:
     """Build a full pick embed for a positive-edge bet."""
-    batter  = str(row.get("batter_name", "Unknown"))
-    pitcher = str(row.get("pitcher_name", "Unknown"))
+    batter  = _safe_name(row.get("batter_name"), fallback="Unknown")
+    pitcher = _safe_name(row.get("pitcher_name"), fallback="TBD")
     slot    = int(row.get("batting_order_pos", 0)) or "?"
     model   = _fmt_pct(row.get("hr_prob"))
     market  = _fmt_pct(row.get("market_fair_prob")) if has_odds else "—"
@@ -217,8 +234,8 @@ def _build_watchlist_embed(
     """
     lines = []
     for _, row in watch_rows.iterrows():
-        name    = str(row.get("batter_name",  "?"))
-        pitcher = str(row.get("pitcher_name", "?"))
+        name    = _safe_name(row.get("batter_name"),  fallback="Unknown")
+        pitcher = _safe_name(row.get("pitcher_name"), fallback="TBD")
         model   = _fmt_pct(row.get("hr_prob"))
         edge    = _fmt_edge(row.get("edge"))
         odds    = _fmt_american(row.get("market_over_price"))
@@ -241,6 +258,42 @@ def _build_watchlist_embed(
     }
 
 
+def _build_model_favourite_embed(row, *, date_str: str, pass_label: str) -> dict:
+    """
+    Compact embed for the player the model gives the highest HR probability
+    on today's slate — shown every run regardless of odds or edge.
+    No odds API is consulted; this is purely model output.
+    """
+    batter  = _safe_name(row.get("batter_name"), fallback="Unknown")
+    pitcher = _safe_name(row.get("pitcher_name"), fallback="TBD")
+    slot    = int(row.get("batting_order_pos", 0)) or "?"
+    prob    = _fmt_pct(row.get("hr_prob"))
+    hand    = str(row.get("batter_hand", "—")) or "—"
+    p_hand  = str(row.get("pitcher_hand", "—")) or "—"
+
+    matchup_hand = "—"
+    if hand not in ("—", "None", "nan") and p_hand not in ("—", "None", "nan"):
+        matchup_hand = f"{hand} vs {p_hand}"
+
+    return {
+        "title": f"🔵 Model Favourite — {batter}",
+        "description": (
+            f"Highest model HR probability on today's slate. "
+            f"No odds data used — check your book before betting."
+        ),
+        "color": COLOUR_MODEL,
+        "fields": [
+            {"name": "🆚 vs Pitcher",    "value": pitcher,       "inline": True},
+            {"name": "📍 Batting Slot",  "value": str(slot),     "inline": True},
+            {"name": "🤖 Model Prob",    "value": prob,          "inline": True},
+            {"name": "🤜 Matchup",       "value": matchup_hand,  "inline": True},
+        ],
+        "footer": {
+            "text": f"MLB HR Model • {pass_label} pass • {date_str} • model only — not a bet recommendation"
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main payload builder
 # ---------------------------------------------------------------------------
@@ -260,6 +313,7 @@ def build_picks_payload(
       WATCH_FLOOR ≤ edge ≤ 0 → compact watch-list embed (amber) — monitor
       edge < WATCH_FLOOR     → not shown
       no odds at all         → top-10 model-only fallback (grey)
+      always                 → model favourite embed (blue) — top hr_prob, no odds
     """
     import pandas as pd
 
@@ -276,7 +330,7 @@ def build_picks_payload(
         lines = []
         for _, row in top.iterrows():
             lines.append(
-                f"**{row.get('batter_name','?')}** vs {row.get('pitcher_name','?')} "
+                f"**{_safe_name(row.get('batter_name'))}** vs {_safe_name(row.get('pitcher_name'), fallback='TBD')} "
                 f"— {_fmt_pct(row.get('hr_prob'))} (slot {int(row.get('batting_order_pos',0))})"
             )
         payloads.append({"embeds": [{
@@ -284,6 +338,7 @@ def build_picks_payload(
             "description": "**Model-only picks** (no odds data)\n\n" + "\n".join(lines),
             "color":       COLOUR_NO_ODDS,
         }]})
+        # Model favourite is already the first line above; no separate embed needed
         return payloads
 
     # ---- Split into bet / watch tiers ----
@@ -342,6 +397,12 @@ def build_picks_payload(
         payloads.append({"embeds": [
             _build_watchlist_embed(watch, date_str=date_str, pass_label=pass_label)
         ]})
+
+    # ---- Model favourite — always posted, no odds check ----
+    top_row = ranked_df.sort_values("hr_prob", ascending=False).iloc[0]
+    payloads.append({"embeds": [
+        _build_model_favourite_embed(top_row, date_str=date_str, pass_label=pass_label)
+    ]})
 
     return payloads
 
