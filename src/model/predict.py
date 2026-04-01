@@ -455,8 +455,19 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     has_odds = False
 
+    # Gate: don't burn Odds API tokens until rolling windows are full.
+    # The longest rolling window is 30 days; require at least 30 days of
+    # season data before fetching odds so predictions have meaningful features.
+    _ROLLING_WINDOW_DAYS = 30
+    _SEASON_STARTS = {2025: (3, 27), 2026: (3, 26)}
+    _pred_date = datetime.strptime(date_str, "%Y-%m-%d")
+    _month, _day = _SEASON_STARTS.get(_pred_date.year, (3, 27))
+    _season_start = datetime(_pred_date.year, _month, _day)
+    _days_into_season = (_pred_date - _season_start).days
+    _windows_ready = _days_into_season >= _ROLLING_WINDOW_DAYS
+
     odds_api_key = os.environ.get("ODDS_API_KEY")
-    if odds_api_key:
+    if odds_api_key and _windows_ready:
         try:
             from src.data_sources.odds import enrich_predictions_with_odds
             ranked = enrich_predictions_with_odds(
@@ -468,6 +479,12 @@ if __name__ == "__main__":
             has_odds = ranked["edge"].notna().any()
         except Exception as e:
             print(f"⚠️  Odds enrichment failed: {e}")
+    elif odds_api_key and not _windows_ready:
+        print(
+            f"ℹ️  Skipping odds enrichment — only {_days_into_season}d into season "
+            f"(need {_ROLLING_WINDOW_DAYS}d for rolling windows to fill).\n"
+            "   Odds API tokens will be conserved until features are reliable."
+        )
     else:
         print(
             "ℹ️  No ODDS_API_KEY found — running without odds data.\n"
