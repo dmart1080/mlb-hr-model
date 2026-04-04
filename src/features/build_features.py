@@ -189,6 +189,97 @@ def _compute_days_rest(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFram
 
 
 # ---------------------------------------------------------------------------
+# Pitcher workload + opener flag
+# ---------------------------------------------------------------------------
+
+def _compute_pitcher_workload(
+    pitches_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: pitcher, game_date
+) -> pd.DataFrame:
+    """
+    For each (pitcher, game_date), compute workload features derived from
+    their most recent prior outing and rolling 30-day starts.
+
+    Uses pitches_df (one row per pitch) for accurate pitch counts.
+
+    Returns DataFrame with columns:
+        pitcher, game_date,
+        p_pitches_last_start   - total pitches thrown in last outing
+        p_ip_last_start        - innings proxy (PA faced / 3.0) in last outing
+        p_is_opener            - 1 if avg IP/start < 3.0 over last 30d (opener/bulk arm)
+        p_workload_score       - pitches per inning in last outing (fatigue proxy)
+    """
+    # Count pitches per (pitcher, game_pk, game_date) from pitch-level data
+    pitch_counts = (
+        pitches_df.groupby(["pitcher", "game_pk", "game_date"])
+        .size()
+        .reset_index(name="total_pitches")
+    )
+
+    # PA count per game as innings proxy (pa_faced / 3.0)
+    # Use pitches_df grouped by at_bat_number to get unique PAs
+    pa_counts = (
+        pitches_df.groupby(["pitcher", "game_pk", "game_date"])["at_bat_number"]
+        .nunique()
+        .reset_index(name="pa_faced")
+    )
+
+    game_stats = pitch_counts.merge(pa_counts, on=["pitcher", "game_pk", "game_date"])
+    game_stats["ip_proxy"] = game_stats["pa_faced"] / 3.0
+    game_stats["game_date"] = pd.to_datetime(game_stats["game_date"])
+
+    need = target_dates[["pitcher", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    pitcher_games = {
+        pid: grp.sort_values("game_date")
+        for pid, grp in game_stats.groupby("pitcher", sort=False)
+    }
+
+    rows = []
+    for _, r in need.iterrows():
+        pid   = int(r["pitcher"])
+        gdate = r["game_date"]
+        base  = {
+            "pitcher":              pid,
+            "game_date":            gdate,
+            "p_pitches_last_start": np.nan,
+            "p_ip_last_start":      np.nan,
+            "p_is_opener":          0,
+            "p_workload_score":     np.nan,
+        }
+
+        grp = pitcher_games.get(pid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        last = prior.iloc[-1]
+        base["p_pitches_last_start"] = float(last["total_pitches"])
+        base["p_ip_last_start"]      = float(last["ip_proxy"])
+
+        # Rolling 30d: is this pitcher an opener/bulk arm?
+        w30 = prior[prior["game_date"] >= gdate - pd.Timedelta(days=30)]
+        if len(w30) >= 2:
+            avg_ip = w30["ip_proxy"].mean()
+            base["p_is_opener"] = int(avg_ip < 3.0)
+        # else: not enough data — default 0 (assume starter)
+
+        # Workload score: pitches per inning last outing (higher = less efficient / more taxed)
+        if base["p_ip_last_start"] and base["p_ip_last_start"] > 0:
+            base["p_workload_score"] = base["p_pitches_last_start"] / base["p_ip_last_start"]
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Parallelised weather fetch
 # ---------------------------------------------------------------------------
 
@@ -433,6 +524,24 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     if avail_matchup:
         df["matchup_best_30"] = df[avail_matchup].max(axis=1)
 
+    # Pitcher fatigue interactions
+    # High pitch count + short rest = tired pitcher → more hittable
+    if "p_pitches_last_start" in df.columns and "p_days_rest" in df.columns:
+        # Fatigue index: pitches thrown scaled by how little rest they got
+        # Short rest (3d) with high pitch count (110+) maximises this
+        df["p_fatigue_index"] = (
+            _col("p_pitches_last_start") * (1.0 / _col("p_days_rest").clip(lower=1))
+        )
+    if "p_workload_score" in df.columns and "p_days_rest" in df.columns:
+        # Inefficiency × rest: was the pitcher laboured AND came back quickly?
+        df["p_workload_x_rest"] = _col("p_workload_score") * (1.0 / _col("p_days_rest").clip(lower=1))
+
+    # Opener flag × batter hard-hit rate: opener means more reliever exposure
+    # A hard-hitting batter benefits more from facing a bullpen-heavy game
+    if "p_is_opener" in df.columns:
+        df["opener_x_hardhit"] = _col("p_is_opener") * _col("b_hardhit_rate_14")
+        df["opener_x_barrel"]  = _col("p_is_opener") * _col("b_barrel_rate_14")
+
     return df
 
 
@@ -600,6 +709,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     pitcher_velo = precompute_pitcher_velo_fast(pitches_df, pitcher_need)
 
     # ------------------------------------------------------------------
+    # Pitcher workload + opener flag
+    # ------------------------------------------------------------------
+    logger.info("Computing pitcher workload + opener flags ...")
+    pitcher_workload = _compute_pitcher_workload(pitches_df, pitcher_need)
+
+    # ------------------------------------------------------------------
     # Pulled air ball rate
     # ------------------------------------------------------------------
     logger.info("Precomputing pulled air ball rates ...")
@@ -633,6 +748,10 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         )
         .merge(
             pitcher_velo.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(
+            pitcher_workload.rename(columns={"pitcher": merge_pitcher_col}),
             on=[merge_pitcher_col, "game_date"], how="left",
         )
         .merge(pull_stats, on=["batter", "game_date"], how="left")
