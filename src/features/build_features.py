@@ -71,7 +71,10 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "p_throws", "stand",
             "release_speed", "pitch_type",
             "game_type",
-            "hc_x", "hc_y", "bb_type",   # spray chart + batted ball type for pull-airball features
+            "hc_x", "hc_y", "bb_type",      # spray chart + batted ball type
+            "release_spin_rate",              # pitcher stuff quality
+            "release_extension",              # extension toward plate
+            "pfx_x", "pfx_z",                # horizontal + vertical movement
         ],
         regular_season_only=True,
     ).df.copy()
@@ -280,6 +283,435 @@ def _compute_pitcher_workload(
 
 
 # ---------------------------------------------------------------------------
+# ISO (Isolated Power) rolling windows
+# ---------------------------------------------------------------------------
+
+def _compute_batter_iso(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Compute Isolated Power (ISO = extra bases per AB) for each (batter, game_date).
+    ISO captures raw power more cleanly than HR rate in small windows because
+    it counts doubles and triples too, giving more signal from fewer PA.
+
+    ISO = (2B*1 + 3B*2 + HR*3) / AB   (extra bases above singles)
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_iso_14    - ISO over last 14 days
+        b_iso_szn   - ISO season-to-date
+        b_iso_career - ISO over all available history (career proxy)
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+
+    ev_str = pa["events"].astype("string")
+    pa["is_double"] = (ev_str == "double").fillna(False).astype(int)
+    pa["is_triple"] = (ev_str == "triple").fillna(False).astype(int)
+    pa["is_hr_"]    = (ev_str == "home_run").fillna(False).astype(int)
+    # AB = PA excluding walks, HBP, sac flies (approximate: exclude BB)
+    pa["is_ab"]     = (~ev_str.isin(["walk", "hit_by_pitch", "sac_fly",
+                                      "sac_bunt", "intent_walk"])).fillna(True).astype(int)
+    pa["extra_bases"] = pa["is_double"] * 1 + pa["is_triple"] * 2 + pa["is_hr_"] * 3
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    batter_pa = {pid: grp for pid, grp in pa.groupby("batter", sort=False)}
+
+    MIN_AB_ISO = 10  # minimum AB before reporting ISO (cold-start guard)
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        base  = {
+            "batter":      bid,
+            "game_date":   gdate,
+            "b_iso_14":    np.nan,
+            "b_iso_szn":   np.nan,
+            "b_iso_career": np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        def _iso(subset):
+            ab = subset["is_ab"].sum()
+            if ab < MIN_AB_ISO:
+                return np.nan
+            return float(subset["extra_bases"].sum()) / ab
+
+        # 14-day window
+        w14 = prior[prior["game_date"] >= gdate - pd.Timedelta(days=14)]
+        base["b_iso_14"] = _iso(w14)
+
+        # Season window
+        szn_start = pd.Timestamp(gdate.year, 3, 1)
+        wszn = prior[prior["game_date"] > szn_start]
+        base["b_iso_szn"] = _iso(wszn)
+
+        # Career (all history)
+        base["b_iso_career"] = _iso(prior)
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Sweet spot rate (launch angle 8-32°, EV >= 98 mph)
+# ---------------------------------------------------------------------------
+
+def _compute_sweet_spot(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Sweet spot = batted ball with launch angle 8-32° AND exit velo >= 98 mph.
+    This is the tightest "home run corridor" metric — more precise than barrel
+    rate (which includes slow grounders at extreme angles) and more predictive
+    than EV or LA alone.
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_sweet_spot_rate_14   - % sweet spot contact last 14 days
+        b_sweet_spot_rate_szn  - % sweet spot contact season-to-date
+        b_sweet_spot_rate_30   - % sweet spot contact last 30 days
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+    ev = pd.to_numeric(pa["launch_speed"], errors="coerce")
+    la = pd.to_numeric(pa["launch_angle"], errors="coerce")
+    pa["is_sweet_spot"] = (
+        (la >= 8) & (la <= 32) & (ev >= 98)
+    ).fillna(False).astype(int)
+    pa["has_contact"] = (ev.notna() & la.notna()).astype(int)
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    batter_pa = {pid: grp for pid, grp in pa.groupby("batter", sort=False)}
+    MIN_CONTACT = 8  # minimum batted balls before reporting rate
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        base  = {
+            "batter":                bid,
+            "game_date":             gdate,
+            "b_sweet_spot_rate_14":  np.nan,
+            "b_sweet_spot_rate_30":  np.nan,
+            "b_sweet_spot_rate_szn": np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        def _ss_rate(subset):
+            contact = subset["has_contact"].sum()
+            if contact < MIN_CONTACT:
+                return np.nan
+            return float(subset["is_sweet_spot"].sum()) / contact
+
+        w14  = prior[prior["game_date"] >= gdate - pd.Timedelta(days=14)]
+        w30  = prior[prior["game_date"] >= gdate - pd.Timedelta(days=30)]
+        szn_start = pd.Timestamp(gdate.year, 3, 1)
+        wszn = prior[prior["game_date"] > szn_start]
+
+        base["b_sweet_spot_rate_14"]  = _ss_rate(w14)
+        base["b_sweet_spot_rate_30"]  = _ss_rate(w30)
+        base["b_sweet_spot_rate_szn"] = _ss_rate(wszn)
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Batter 30-day rolling window
+# ---------------------------------------------------------------------------
+
+def _compute_batter_30d(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Compute batter stats over a 30-day rolling window.
+    Fills the gap between 14d (noisy) and season (slow to update).
+    30d is the sweet spot for capturing real form while smoothing hot/cold streaks.
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_hr_rate_30, b_barrel_rate_30, b_ev_mean_30,
+        b_hardhit_rate_30, b_k_rate_30, b_bb_rate_30,
+        b_pa_30
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+    ev_num = pd.to_numeric(pa["launch_speed"], errors="coerce")
+    pa["launch_speed"] = ev_num
+
+    ev_str = pa["events"].astype("string")
+    pa["is_hr_"]  = (ev_str == "home_run").fillna(False).astype(int)
+    pa["is_so_"]  = ev_str.str.contains("strikeout", na=False).astype(int)
+    pa["is_bb_"]  = (ev_str == "walk").fillna(False).astype(int)
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    batter_pa = {pid: grp for pid, grp in pa.groupby("batter", sort=False)}
+    MIN_PA = 10
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        base  = {
+            "batter":           bid,
+            "game_date":        gdate,
+            "b_pa_30":          0,
+            "b_hr_rate_30":     np.nan,
+            "b_barrel_rate_30": np.nan,
+            "b_ev_mean_30":     np.nan,
+            "b_hardhit_rate_30":np.nan,
+            "b_k_rate_30":      np.nan,
+            "b_bb_rate_30":     np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        w30 = grp[
+            (grp["game_date"] < gdate) &
+            (grp["game_date"] >= gdate - pd.Timedelta(days=30))
+        ]
+
+        pa_count = len(w30)
+        base["b_pa_30"] = pa_count
+        if pa_count < MIN_PA:
+            rows.append(base)
+            continue
+
+        ev = w30["launch_speed"].dropna()
+        base["b_hr_rate_30"]      = float(w30["is_hr_"].sum())  / pa_count
+        base["b_barrel_rate_30"]  = float(w30["is_barrel"].sum()) / pa_count if "is_barrel" in w30.columns else np.nan
+        base["b_ev_mean_30"]      = float(ev.mean()) if len(ev) > 0 else np.nan
+        base["b_hardhit_rate_30"] = float((ev >= 95).mean()) if len(ev) > 0 else np.nan
+        base["b_k_rate_30"]       = float(w30["is_so_"].sum()) / pa_count
+        base["b_bb_rate_30"]      = float(w30["is_bb_"].sum()) / pa_count
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pitcher command metric (K% - BB%)
+# ---------------------------------------------------------------------------
+
+def _compute_pitcher_command(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: pitcher, game_date
+) -> pd.DataFrame:
+    """
+    K% - BB% is the best single process metric for pitcher quality.
+    Unlike HR allowed rate it isn't park/defence dependent, and unlike
+    ERA it doesn't confound with run support or bullpen.
+
+    Higher = better command. League average is roughly 0.14 (22% K - 8% BB).
+
+    Returns DataFrame with columns:
+        pitcher, game_date,
+        p_command_30    - K% minus BB% over last 30 days
+        p_command_szn   - K% minus BB% season-to-date
+        p_kbb_ratio_30  - K/BB ratio last 30d (inf-capped at 10.0)
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+
+    ev_str = pa["events"].astype("string")
+    pa["is_so_"] = ev_str.str.contains("strikeout", na=False).astype(int)
+    pa["is_bb_"] = (ev_str == "walk").fillna(False).astype(int)
+
+    need = target_dates[["pitcher", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    pitcher_pa = {pid: grp for pid, grp in pa.groupby("pitcher", sort=False)}
+    MIN_PA = 15
+
+    rows = []
+    for _, r in need.iterrows():
+        pid   = int(r["pitcher"])
+        gdate = r["game_date"]
+        base  = {
+            "pitcher":        pid,
+            "game_date":      gdate,
+            "p_command_30":   np.nan,
+            "p_command_szn":  np.nan,
+            "p_kbb_ratio_30": np.nan,
+        }
+
+        grp = pitcher_pa.get(pid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        def _command(subset):
+            n = len(subset)
+            if n < MIN_PA:
+                return np.nan, np.nan
+            k_pct  = float(subset["is_so_"].sum()) / n
+            bb_pct = float(subset["is_bb_"].sum()) / n
+            bb_cnt = subset["is_bb_"].sum()
+            k_cnt  = subset["is_so_"].sum()
+            ratio  = float(k_cnt / bb_cnt) if bb_cnt > 0 else 10.0
+            return k_pct - bb_pct, min(ratio, 10.0)
+
+        w30 = prior[prior["game_date"] >= gdate - pd.Timedelta(days=30)]
+        szn_start = pd.Timestamp(gdate.year, 3, 1)
+        wszn = prior[prior["game_date"] > szn_start]
+
+        base["p_command_30"],  base["p_kbb_ratio_30"] = _command(w30)
+        base["p_command_szn"], _                       = _command(wszn)
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Career platoon splits
+# ---------------------------------------------------------------------------
+
+def _compute_career_platoon_splits(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Compute career-level platoon splits for each (batter, game_date).
+    Uses all available history prior to game_date as a career proxy.
+
+    Career splits stabilise early-season predictions when 14d rolling
+    windows have too few PA to be reliable.
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_hr_rate_career_vsL   - career HR rate vs LHP
+        b_hr_rate_career_vsR   - career HR rate vs RHP
+        b_iso_career_vsL       - career ISO vs LHP
+        b_iso_career_vsR       - career ISO vs RHP
+        b_hardhit_career_vsL   - career hard-hit rate vs LHP
+        b_hardhit_career_vsR   - career hard-hit rate vs RHP
+        b_platoon_hr_edge      - career HR rate advantage vs today's pitcher hand
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+
+    ev_str = pa["events"].astype("string")
+    pa["is_double"] = (ev_str == "double").fillna(False).astype(int)
+    pa["is_triple"] = (ev_str == "triple").fillna(False).astype(int)
+    pa["is_hr_"]    = (ev_str == "home_run").fillna(False).astype(int)
+    pa["is_ab"]     = (~ev_str.isin(["walk", "hit_by_pitch", "sac_fly",
+                                      "sac_bunt", "intent_walk"])).fillna(True).astype(int)
+    pa["extra_bases"] = pa["is_double"] * 1 + pa["is_triple"] * 2 + pa["is_hr_"] * 3
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    # Include pitcher_hand from target_dates if available
+    has_hand = "pitcher_hand" in target_dates.columns
+    if has_hand:
+        need = target_dates[["batter", "game_date", "pitcher_hand"]].drop_duplicates(
+            subset=["batter", "game_date"]
+        ).copy()
+
+    batter_pa = {pid: grp for pid, grp in pa.groupby("batter", sort=False)}
+    MIN_AB = 20
+
+    def _rate(subset, col):
+        ab = subset["is_ab"].sum()
+        if ab < MIN_AB:
+            return np.nan
+        return float(subset[col].sum()) / ab
+
+    def _hardhit(subset):
+        ev = subset["launch_speed"].dropna()
+        if len(ev) < MIN_AB:
+            return np.nan
+        return float((ev >= 95).mean())
+
+    rows = []
+    for _, r in need.iterrows():
+        bid        = int(r["batter"])
+        gdate      = r["game_date"]
+        pitch_hand = r.get("pitcher_hand", None) if has_hand else None
+
+        base = {
+            "batter":               bid,
+            "game_date":            gdate,
+            "b_hr_rate_career_vsL": np.nan,
+            "b_hr_rate_career_vsR": np.nan,
+            "b_iso_career_vsL":     np.nan,
+            "b_iso_career_vsR":     np.nan,
+            "b_hardhit_career_vsL": np.nan,
+            "b_hardhit_career_vsR": np.nan,
+            "b_platoon_hr_edge":    np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        vs_L = prior[prior["p_throws"] == "L"]
+        vs_R = prior[prior["p_throws"] == "R"]
+
+        base["b_hr_rate_career_vsL"] = _rate(vs_L, "is_hr_")
+        base["b_hr_rate_career_vsR"] = _rate(vs_R, "is_hr_")
+        base["b_iso_career_vsL"]     = _rate(vs_L, "extra_bases")
+        base["b_iso_career_vsR"]     = _rate(vs_R, "extra_bases")
+        base["b_hardhit_career_vsL"] = _hardhit(vs_L)
+        base["b_hardhit_career_vsR"] = _hardhit(vs_R)
+
+        # Platoon edge: today's matchup hand vs opposite
+        if pitch_hand in ("L", "R"):
+            favoured = base[f"b_hr_rate_career_vs{pitch_hand}"]
+            opposite = base[f"b_hr_rate_career_vs{'R' if pitch_hand == 'L' else 'L'}"]
+            if pd.notna(favoured) and pd.notna(opposite):
+                base["b_platoon_hr_edge"] = favoured - opposite
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Parallelised weather fetch
 # ---------------------------------------------------------------------------
 
@@ -457,6 +889,346 @@ def _compute_relief_pa_pct(pa_df: pd.DataFrame, labels: pd.DataFrame) -> pd.Data
 
 
 # ---------------------------------------------------------------------------
+# Pitcher stuff quality (spin rate, extension, movement)
+# ---------------------------------------------------------------------------
+
+def _compute_pitcher_stuff(
+    pitches_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: pitcher, game_date
+) -> pd.DataFrame:
+    """
+    Compute pitcher stuff quality metrics from pitch-level Statcast data.
+
+    Stuff metrics are process signals that don't depend on outcomes — a
+    pitcher with elite spin/movement will suppress HRs even if recent HR
+    allowed rate is high due to bad luck.
+
+    Returns DataFrame with columns:
+        pitcher, game_date,
+        p_spin_rate_fb_30      - avg fastball spin rate last 30d
+        p_extension_30         - avg release extension last 30d
+        p_pfx_z_fb_30          - avg vertical movement (rise/drop) on FB last 30d
+        p_pfx_x_fb_30          - avg horizontal break on FB last 30d
+        p_stuff_score_30       - composite: spin × extension proxy
+    """
+    p = pitches_df.copy()
+    p["game_date"] = pd.to_datetime(p["game_date"])
+
+    for col in ("release_spin_rate", "release_extension", "pfx_x", "pfx_z"):
+        if col in p.columns:
+            p[col] = pd.to_numeric(p[col], errors="coerce")
+        else:
+            p[col] = np.nan
+
+    is_fb = p["pitch_type"].isin(FASTBALL_TYPES)
+
+    need = target_dates[["pitcher", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+    pitcher_groups = {pid: grp for pid, grp in p.groupby("pitcher", sort=False)}
+
+    rows = []
+    for _, r in need.iterrows():
+        pid   = int(r["pitcher"])
+        gdate = r["game_date"]
+        base  = {
+            "pitcher":          pid,
+            "game_date":        gdate,
+            "p_spin_rate_fb_30": np.nan,
+            "p_extension_30":    np.nan,
+            "p_pfx_z_fb_30":     np.nan,
+            "p_pfx_x_fb_30":     np.nan,
+            "p_stuff_score_30":  np.nan,
+        }
+
+        grp = pitcher_groups.get(pid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        w30 = grp[
+            (grp["game_date"] < gdate) &
+            (grp["game_date"] >= gdate - pd.Timedelta(days=30))
+        ]
+        if w30.empty:
+            rows.append(base)
+            continue
+
+        fb30 = w30[w30["pitch_type"].isin(FASTBALL_TYPES)]
+
+        if not fb30.empty:
+            base["p_spin_rate_fb_30"] = float(fb30["release_spin_rate"].dropna().mean()) if fb30["release_spin_rate"].notna().any() else np.nan
+            base["p_pfx_z_fb_30"]     = float(fb30["pfx_z"].dropna().mean()) if fb30["pfx_z"].notna().any() else np.nan
+            base["p_pfx_x_fb_30"]     = float(fb30["pfx_x"].dropna().mean()) if fb30["pfx_x"].notna().any() else np.nan
+
+        if w30["release_extension"].notna().any():
+            base["p_extension_30"] = float(w30["release_extension"].dropna().mean())
+
+        # Composite stuff score: normalised spin × extension
+        # League avg spin ~2300 rpm, extension ~6.0 ft
+        spin = base["p_spin_rate_fb_30"]
+        ext  = base["p_extension_30"]
+        if pd.notna(spin) and pd.notna(ext):
+            base["p_stuff_score_30"] = (spin / 2300.0) * (ext / 6.0)
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Batter streaks & consistency (hot/cold flags, HR recency)
+# ---------------------------------------------------------------------------
+
+def _compute_batter_streaks(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Compute streak and consistency features for each batter.
+
+    Hot/cold flags are important because the model currently treats a batter
+    hitting .350 in the last week the same as one hitting .150. HR recency
+    captures momentum that rolling averages smooth over.
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        b_hr_last_7d          - HRs hit in last 7 days (raw count)
+        b_games_since_last_hr - games played since last HR (recency)
+        b_ev_hot_flag         - 1 if avg EV last 7d > avg EV last 30d by 2+ mph
+        b_contact_hot_flag    - 1 if hard-hit rate last 7d > last 30d by 5%+
+        b_hr_streak           - consecutive games with HR (current streak)
+        b_avg_ev_7d           - avg EV last 7 days
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+    pa["launch_speed"] = pd.to_numeric(pa["launch_speed"], errors="coerce")
+    ev_str = pa["events"].astype("string")
+    pa["is_hr_"] = (ev_str == "home_run").fillna(False).astype(int)
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+    batter_pa = {pid: grp.sort_values("game_date") for pid, grp in pa.groupby("batter", sort=False)}
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        base  = {
+            "batter":                bid,
+            "game_date":             gdate,
+            "b_hr_last_7d":          0,
+            "b_games_since_last_hr": np.nan,
+            "b_ev_hot_flag":         0,
+            "b_contact_hot_flag":    0,
+            "b_hr_streak":           0,
+            "b_avg_ev_7d":           np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        w7  = prior[prior["game_date"] >= gdate - pd.Timedelta(days=7)]
+        w30 = prior[prior["game_date"] >= gdate - pd.Timedelta(days=30)]
+
+        # HR count last 7d
+        base["b_hr_last_7d"] = int(w7["is_hr_"].sum())
+
+        # EV stats
+        ev7  = w7["launch_speed"].dropna()
+        ev30 = w30["launch_speed"].dropna()
+        if len(ev7) >= 3:
+            base["b_avg_ev_7d"] = float(ev7.mean())
+        if len(ev7) >= 3 and len(ev30) >= 8:
+            ev7_mean  = float(ev7.mean())
+            ev30_mean = float(ev30.mean())
+            base["b_ev_hot_flag"]      = int(ev7_mean - ev30_mean >= 2.0)
+            hh7  = float((ev7  >= 95).mean())
+            hh30 = float((ev30 >= 95).mean())
+            base["b_contact_hot_flag"] = int(hh7 - hh30 >= 0.05)
+
+        # Games since last HR
+        hr_games = prior[prior["is_hr_"] == 1]["game_date"]
+        if not hr_games.empty:
+            last_hr_date = hr_games.max()
+            # Count distinct game dates between last HR and today
+            games_after = prior[prior["game_date"] > last_hr_date]["game_date"].nunique()
+            base["b_games_since_last_hr"] = float(games_after)
+
+        # Current HR streak (consecutive games with HR, going back)
+        game_dates = sorted(prior["game_date"].unique(), reverse=True)
+        streak = 0
+        for gd in game_dates:
+            day_hrs = prior[prior["game_date"] == gd]["is_hr_"].sum()
+            if day_hrs > 0:
+                streak += 1
+            else:
+                break
+        base["b_hr_streak"] = streak
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Recent lineup context (team HR rate, lineup power around batter)
+# ---------------------------------------------------------------------------
+
+def _compute_lineup_context(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date, game_pk
+) -> pd.DataFrame:
+    """
+    Compute team-level and lineup-slot context features.
+
+    A batter in a powerful lineup gets better pitches to hit. Team HR rate
+    captures this lineup protection effect better than individual stats alone.
+
+    Returns DataFrame with columns:
+        batter, game_date,
+        t_hr_rate_14       - team HR rate per PA last 14 days
+        t_hr_rate_szn      - team HR rate per PA season-to-date
+        t_hardhit_rate_14  - team hard-hit rate last 14 days
+        t_ev_mean_14       - team avg exit velo last 14 days
+    """
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+    pa["launch_speed"] = pd.to_numeric(pa["launch_speed"], errors="coerce")
+    ev_str = pa["events"].astype("string")
+    pa["is_hr_"] = (ev_str == "home_run").fillna(False).astype(int)
+
+    # Need batter→team mapping — use home_team + game_pk to derive it
+    # We'll compute from pa_df game context: batter's team = mode of home_team
+    # when they bat at home, otherwise away. Use simple approach: look up
+    # from target_dates game_pk → home_team, then derive batter team from labels.
+    has_game_pk = "game_pk" in target_dates.columns
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    if has_game_pk:
+        need = target_dates[["batter", "game_date", "game_pk"]].drop_duplicates(
+            subset=["batter", "game_date"]
+        ).copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    # Build batter→team lookup from pa_df (mode of home_team for home batters)
+    # Simpler: group by (home_team, game_date) to get all batters per team per game
+    # Then for each batter, look at their team's aggregate stats
+    # We'll approximate: for each batter, compute stats for all batters
+    # who played on the same home_team in the same date range
+
+    # Build batter→team from pa_df
+    batter_team = (
+        pa.dropna(subset=["home_team"])
+        .groupby("batter")["home_team"]
+        .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else None)
+        .to_dict()
+    )
+
+    # Group pa by team
+    pa["team"] = pa["batter"].map(batter_team)
+    team_pa = {t: g for t, g in pa.dropna(subset=["team"]).groupby("team", sort=False)}
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        team  = batter_team.get(bid)
+        base  = {
+            "batter":           bid,
+            "game_date":        gdate,
+            "t_hr_rate_14":     np.nan,
+            "t_hr_rate_szn":    np.nan,
+            "t_hardhit_rate_14":np.nan,
+            "t_ev_mean_14":     np.nan,
+        }
+
+        if team is None:
+            rows.append(base)
+            continue
+
+        grp = team_pa.get(team)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        def _team_stats(subset):
+            n = len(subset)
+            if n < 10:
+                return np.nan, np.nan, np.nan
+            hr_rate = float(subset["is_hr_"].sum()) / n
+            ev = subset["launch_speed"].dropna()
+            hh_rate = float((ev >= 95).mean()) if len(ev) >= 5 else np.nan
+            ev_mean = float(ev.mean()) if len(ev) >= 5 else np.nan
+            return hr_rate, hh_rate, ev_mean
+
+        w14 = prior[prior["game_date"] >= gdate - pd.Timedelta(days=14)]
+        szn_start = pd.Timestamp(gdate.year, 3, 1)
+        wszn = prior[prior["game_date"] > szn_start]
+
+        hr14, hh14, ev14 = _team_stats(w14)
+        hrszn, _, _      = _team_stats(wszn)
+
+        base["t_hr_rate_14"]      = hr14
+        base["t_hr_rate_szn"]     = hrszn
+        base["t_hardhit_rate_14"] = hh14
+        base["t_ev_mean_14"]      = ev14
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Ballpark HR tendency by direction (pull vs oppo)
+# ---------------------------------------------------------------------------
+
+# Static park HR tendency by spray direction.
+# Values represent the ratio of HR probability for pulled balls vs oppo balls
+# in each park. Derived from Statcast hit data patterns.
+# >1.0 = pull-friendly, <1.0 = more balanced/oppo-friendly
+_PARK_PULL_FACTOR: dict[str, float] = {
+    "LAD": 1.35, "NYY": 1.28, "COL": 1.15, "CIN": 1.20, "PHI": 1.18,
+    "TOR": 1.22, "BAL": 1.19, "MIN": 1.16, "ATL": 1.12, "DET": 1.14,
+    "MIL": 1.10, "ARI": 1.08, "NYM": 1.06, "HOU": 1.05, "BOS": 1.04,
+    "CLE": 1.02, "CHC": 1.00, "WSN": 0.98, "STL": 0.97, "KCR": 0.96,
+    "SFG": 0.95, "MIA": 0.94, "SDP": 0.93, "LAA": 0.92, "SEA": 0.91,
+    "OAK": 0.90, "TEX": 0.89, "CWS": 0.88, "PIT": 0.85, "TBR": 1.02,
+    "ATH": 1.10,
+}
+
+
+def _compute_park_direction_factor(
+    features_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add park pull-factor and pull×park interaction to features_df.
+    Uses home_team column + _PARK_PULL_FACTOR lookup.
+    Also computes pull_air_x_park_direction: pull rate × park pull factor.
+    """
+    df = features_df.copy()
+    if "home_team" in df.columns:
+        df["park_pull_factor"] = df["home_team"].map(_PARK_PULL_FACTOR).fillna(1.0)
+        if "b_pull_air_rate_szn" in df.columns:
+            pull = df["b_pull_air_rate_szn"].fillna(df.get("b_pull_air_rate_14", pd.Series(0.0, index=df.index)))
+            df["pull_x_park_direction"] = pull * df["park_pull_factor"]
+    else:
+        df["park_pull_factor"] = 1.0
+        df["pull_x_park_direction"] = np.nan
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Edge features
 # ---------------------------------------------------------------------------
 
@@ -542,6 +1314,86 @@ def _add_edge_features(df: pd.DataFrame) -> pd.DataFrame:
         df["opener_x_hardhit"] = _col("p_is_opener") * _col("b_hardhit_rate_14")
         df["opener_x_barrel"]  = _col("p_is_opener") * _col("b_barrel_rate_14")
 
+    # ISO interactions
+    # ISO × park factor: power hitters benefit more in hitter-friendly parks
+    if "b_iso_szn" in df.columns and "park_factor_hr" in df.columns:
+        iso = _col("b_iso_szn").fillna(_col("b_iso_14")).fillna(_col("b_iso_career"))
+        df["iso_x_park"] = iso * _col("park_factor_hr")
+
+    # ISO × wind: power hitters benefit more from wind blowing out
+    if "b_iso_szn" in df.columns and "wind_hr_impact" in df.columns:
+        iso = _col("b_iso_szn").fillna(_col("b_iso_14")).fillna(_col("b_iso_career"))
+        df["iso_x_wind"] = iso * _col("wind_hr_impact")
+
+    # Career platoon edge × season ISO: batter with strong platoon advantage + power
+    if "b_platoon_hr_edge" in df.columns and "b_iso_szn" in df.columns:
+        iso = _col("b_iso_szn").fillna(_col("b_iso_career"))
+        df["platoon_edge_x_iso"] = _col("b_platoon_hr_edge") * iso
+
+    # Blend career + recent platoon HR rate (weighted toward recent when sample exists)
+    # If batter has enough recent PA use 14d, otherwise fall back to career
+    for hand in ("L", "R"):
+        recent = f"b_hr_rate_14_vs{hand}"
+        career = f"b_hr_rate_career_vs{hand}"
+        blend  = f"b_hr_rate_blend_vs{hand}"
+        if recent in df.columns and career in df.columns:
+            df[blend] = np.where(
+                df[recent].notna(),
+                df[recent] * 0.6 + df[career].fillna(df[recent]) * 0.4,
+                df[career],
+            )
+
+    # Sweet spot interactions
+    if "b_sweet_spot_rate_szn" in df.columns:
+        ss = _col("b_sweet_spot_rate_szn").fillna(_col("b_sweet_spot_rate_30")).fillna(_col("b_sweet_spot_rate_14"))
+        if "park_factor_hr" in df.columns:
+            df["sweet_spot_x_park"] = ss * _col("park_factor_hr")
+        if "wind_hr_impact" in df.columns:
+            df["sweet_spot_x_wind"] = ss * _col("wind_hr_impact")
+        # Sweet spot vs pitcher command — good contact vs poor command = high HR risk
+        if "p_command_30" in df.columns:
+            df["sweet_spot_x_poor_command"] = ss * (1.0 - _col("p_command_30").clip(lower=0, upper=1))
+
+    # Pitcher command edges
+    if "p_command_30" in df.columns:
+        # Low command pitcher facing high-barrel batter = danger zone
+        df["barrel_x_poor_command"] = _col("b_barrel_rate_14") * (1.0 - _col("p_command_30").clip(lower=0, upper=1))
+        # 30d batter HR rate edge over pitcher command
+        if "b_hr_rate_30" in df.columns:
+            df["hr30_x_poor_command"] = _col("b_hr_rate_30") * (1.0 - _col("p_command_30").clip(lower=0, upper=1))
+
+    # 30d batter window edges vs 30d pitcher
+    if "b_hr_rate_30" in df.columns:
+        df["hr_rate_edge_30_30"]     = _edge("b_hr_rate_30",      "p_hr_allowed_rate_30")
+        df["hardhit_edge_30_30"]     = _edge("b_hardhit_rate_30", "p_hardhit_allowed_rate_30")
+        df["barrel_edge_30_30"]      = _edge("b_barrel_rate_30",  "p_barrel_allowed_rate_30")
+
+    # Pitcher stuff interactions
+    # Low spin + low extension = hittable pitcher → HR risk up
+    if "p_stuff_score_30" in df.columns:
+        # Stuff score below league avg (1.0) × batter barrel rate = danger
+        df["barrel_x_weak_stuff"] = (
+            _col("b_barrel_rate_14") * (2.0 - _col("p_stuff_score_30").clip(lower=0.5, upper=2.0))
+        )
+        df["sweet_spot_x_weak_stuff"] = (
+            _col("b_sweet_spot_rate_szn").fillna(_col("b_sweet_spot_rate_14")) *
+            (2.0 - _col("p_stuff_score_30").clip(lower=0.5, upper=2.0))
+        )
+
+    # Batter streak interactions
+    if "b_ev_hot_flag" in df.columns:
+        df["hot_x_park"]    = _col("b_ev_hot_flag") * _col("park_factor_hr")
+        df["hot_x_iso"]     = _col("b_ev_hot_flag") * _col("b_iso_szn").fillna(_col("b_iso_career"))
+    if "b_hr_last_7d" in df.columns and "park_factor_hr" in df.columns:
+        df["hr7d_x_park"]   = _col("b_hr_last_7d") * _col("park_factor_hr")
+
+    # Team HR rate × batter quality (lineup protection)
+    if "t_hr_rate_14" in df.columns:
+        df["team_hr_x_batter_barrel"] = _col("t_hr_rate_14") * _col("b_barrel_rate_14")
+        df["team_hr_x_sweet_spot"]    = _col("t_hr_rate_14") * _col("b_sweet_spot_rate_szn").fillna(
+            _col("b_sweet_spot_rate_14")
+        )
+
     return df
 
 
@@ -580,8 +1432,19 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
 
     logger.info(
         "Labels built: %d batter-game rows, HR rate=%.4f",
-        len(labels), labels["hr_hit"].mean(),
+        len(labels), labels["hr_hit"].mean() if len(labels) > 0 else float("nan"),
     )
+
+    # Guard: empty date ranges (e.g. Oct 1 single-day stub with no games)
+    # Write an empty parquet so the builder skips this chunk on resume.
+    if labels.empty:
+        logger.warning(
+            "No label rows for %s -> %s — writing empty parquet and skipping.",
+            start_date, end_date,
+        )
+        out_path = PROCESSED_DIR / f"train_table_{start_date}_to_{end_date}.parquet"
+        pd.DataFrame().to_parquet(out_path, index=False)
+        return FeaturesBuildResult(features_df=pd.DataFrame(), output_path=out_path)
 
     # FIX 4: Consolidate pitcher identity to a single column called
     # `pitcher_id` used consistently throughout the pipeline.
@@ -715,6 +1578,75 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     pitcher_workload = _compute_pitcher_workload(pitches_df, pitcher_need)
 
     # ------------------------------------------------------------------
+    # Batter ISO windows
+    # ------------------------------------------------------------------
+    logger.info("Computing batter ISO windows ...")
+    batter_iso = _compute_batter_iso(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Career platoon splits
+    # ------------------------------------------------------------------
+    logger.info("Computing career platoon splits ...")
+    career_platoon = _compute_career_platoon_splits(
+        pa_df,
+        labels[["batter", "game_date", "pitcher_hand"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Sweet spot rate
+    # ------------------------------------------------------------------
+    logger.info("Computing sweet spot rates ...")
+    sweet_spot_stats = _compute_sweet_spot(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Batter 30-day window
+    # ------------------------------------------------------------------
+    logger.info("Computing batter 30-day windows ...")
+    batter_30d = _compute_batter_30d(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Pitcher command metric (K% - BB%)
+    # ------------------------------------------------------------------
+    logger.info("Computing pitcher command metrics ...")
+    pitcher_command = _compute_pitcher_command(
+        pa_df,
+        pitcher_need[["pitcher", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Pitcher stuff quality (spin, extension, movement)
+    # ------------------------------------------------------------------
+    logger.info("Computing pitcher stuff quality ...")
+    pitcher_stuff = _compute_pitcher_stuff(pitches_df, pitcher_need)
+
+    # ------------------------------------------------------------------
+    # Batter streaks & consistency
+    # ------------------------------------------------------------------
+    logger.info("Computing batter streaks ...")
+    batter_streaks = _compute_batter_streaks(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
+    # Lineup context (team HR rate)
+    # ------------------------------------------------------------------
+    logger.info("Computing lineup context ...")
+    lineup_context = _compute_lineup_context(
+        pa_df,
+        labels[["batter", "game_date", "game_pk"]],
+    )
+
+    # ------------------------------------------------------------------
     # Pulled air ball rate
     # ------------------------------------------------------------------
     logger.info("Precomputing pulled air ball rates ...")
@@ -754,7 +1686,21 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
             pitcher_workload.rename(columns={"pitcher": merge_pitcher_col}),
             on=[merge_pitcher_col, "game_date"], how="left",
         )
-        .merge(pull_stats, on=["batter", "game_date"], how="left")
+        .merge(
+            pitcher_command.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(
+            pitcher_stuff.rename(columns={"pitcher": merge_pitcher_col}),
+            on=[merge_pitcher_col, "game_date"], how="left",
+        )
+        .merge(batter_iso,      on=["batter", "game_date"], how="left")
+        .merge(career_platoon,  on=["batter", "game_date"], how="left")
+        .merge(sweet_spot_stats, on=["batter", "game_date"], how="left")
+        .merge(batter_30d,      on=["batter", "game_date"], how="left")
+        .merge(batter_streaks,  on=["batter", "game_date"], how="left")
+        .merge(lineup_context,  on=["batter", "game_date"], how="left")
+        .merge(pull_stats,      on=["batter", "game_date"], how="left")
         .merge(
             pitch_matchup.rename(columns={"pitcher": merge_pitcher_col}),
             on=[merge_pitcher_col, "batter", "game_date"], how="left",
@@ -786,6 +1732,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         features_df["park_factor_hr"] = np.nan
 
     features_df = _add_edge_features(features_df)
+    features_df = _compute_park_direction_factor(features_df)
 
     # FIX 4: Normalise the pitcher column to a single name `pitcher`.
     # Drop starter_pitcher_id and pitcher_id; keep one clean `pitcher` column.

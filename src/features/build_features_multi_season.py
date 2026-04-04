@@ -28,7 +28,7 @@ SEASONS = [
 # before committing to a full multi-season rebuild.
 # ---------------------------------------------------------------------------
 TEST_MODE = False
-TEST_RANGE = ("2026-03-26", "2026-03-31")
+TEST_RANGE = ("2026-03-27", "2026-04-30")
 
 
 def _build_month_ranges(seasons: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -52,12 +52,16 @@ def build_month(start: str, end: str) -> Path:
         return out_path
 
     result = build_features_for_range(start, end)
-    logger.info(
-        "Saved: %s | rows=%d | hr_rate=%.4f",
-        result.output_path.name,
-        len(result.features_df),
-        result.features_df["hr_hit"].mean(),
-    )
+
+    if result.features_df.empty:
+        logger.info("Skipping (no rows): %s", result.output_path.name)
+    else:
+        logger.info(
+            "Saved: %s | rows=%d | hr_rate=%.4f",
+            result.output_path.name,
+            len(result.features_df),
+            result.features_df["hr_hit"].mean(),
+        )
     return result.output_path
 
 
@@ -85,7 +89,16 @@ def build_multi_season(output_name: str = "train_table_2021_2026_full.parquet") 
         out_name = output_name
 
     logger.info("Concatenating %d month files ...", len(month_files))
-    dfs = [pd.read_parquet(p) for p in month_files]
+    dfs = []
+    for p in month_files:
+        try:
+            df = pd.read_parquet(p)
+            if not df.empty:
+                dfs.append(df)
+        except Exception as e:
+            logger.warning("Skipping unreadable parquet %s: %s", p.name, e)
+    if not dfs:
+        raise ValueError("All month files are empty — nothing to concatenate.")
     combined = pd.concat(dfs, ignore_index=True)
     combined["game_date"] = pd.to_datetime(combined["game_date"])
     combined = combined.sort_values("game_date").reset_index(drop=True)

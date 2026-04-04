@@ -605,6 +605,42 @@ def train_baseline(train_path: Path) -> TrainResult:
         "matchup_best_30",
         # Pulled air ball rate × park factor
         "pull_air_x_park",
+        # Pitcher workload + opener flag
+        "p_pitches_last_start", "p_ip_last_start", "p_is_opener", "p_workload_score",
+        "p_fatigue_index", "p_workload_x_rest",
+        "opener_x_hardhit", "opener_x_barrel",
+        # ISO (Isolated Power)
+        "b_iso_14", "b_iso_szn", "b_iso_career",
+        "b_iso_career_vsL", "b_iso_career_vsR",
+        "iso_x_park", "iso_x_wind",
+        # Career platoon splits
+        "b_hr_rate_career_vsL", "b_hr_rate_career_vsR",
+        "b_hardhit_career_vsL", "b_hardhit_career_vsR",
+        "b_platoon_hr_edge", "platoon_edge_x_iso",
+        "b_hr_rate_blend_vsL", "b_hr_rate_blend_vsR",
+        # Sweet spot rate (LA 8-32°, EV >= 98 mph)
+        "b_sweet_spot_rate_14", "b_sweet_spot_rate_30", "b_sweet_spot_rate_szn",
+        "sweet_spot_x_park", "sweet_spot_x_wind", "sweet_spot_x_poor_command",
+        # Batter 30-day rolling window
+        "b_pa_30", "b_hr_rate_30", "b_barrel_rate_30", "b_ev_mean_30",
+        "b_hardhit_rate_30", "b_k_rate_30", "b_bb_rate_30",
+        "hr_rate_edge_30_30", "hardhit_edge_30_30", "barrel_edge_30_30",
+        # Pitcher command (K% - BB%)
+        "p_command_30", "p_command_szn", "p_kbb_ratio_30",
+        "barrel_x_poor_command", "hr30_x_poor_command",
+        # Pitcher stuff quality (spin, extension, movement)
+        "p_spin_rate_fb_30", "p_extension_30", "p_pfx_z_fb_30",
+        "p_pfx_x_fb_30", "p_stuff_score_30",
+        "barrel_x_weak_stuff", "sweet_spot_x_weak_stuff",
+        # Batter streaks & consistency
+        "b_hr_last_7d", "b_games_since_last_hr", "b_ev_hot_flag",
+        "b_contact_hot_flag", "b_hr_streak", "b_avg_ev_7d",
+        "hot_x_park", "hot_x_iso", "hr7d_x_park",
+        # Lineup context (team HR rate)
+        "t_hr_rate_14", "t_hr_rate_szn", "t_hardhit_rate_14", "t_ev_mean_14",
+        "team_hr_x_batter_barrel", "team_hr_x_sweet_spot",
+        # Ballpark direction factor
+        "park_pull_factor", "pull_x_park_direction",
     ]
 
     available = set(df.columns)
