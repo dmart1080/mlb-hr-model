@@ -474,6 +474,29 @@ def build_today_features(
             on="pitcher",
             how="left",
         )
+    # Latest team features (keyed on batter_team)
+    team_feat_cols = [c for c in train_df.columns if c.startswith("t_")]
+    team_feat_cols = [c for c in team_feat_cols if c not in today_df.columns]
+    if team_feat_cols and "batter_team" in train_df.columns and "batter_team" in today_df.columns:
+        team_src = train_df[["batter_team", "game_date"] + team_feat_cols].copy() \
+            if "game_date" in train_df.columns \
+            else train_df[["batter_team"] + team_feat_cols].copy()
+        if "game_date" in team_src.columns:
+            team_src = team_src.sort_values("game_date")
+        team_latest = (
+            team_src
+            .groupby("batter_team", sort=False)
+            .last()
+            .reset_index()
+        )
+        team_merge_cols = ["batter_team"] + [
+            c for c in team_feat_cols if c in team_latest.columns
+        ]
+        today_df = today_df.merge(
+            team_latest[team_merge_cols],
+            on="batter_team",
+            how="left",
+        )
 
     # Fill missing values with league averages
     for col, fill_val in _LEAGUE_FILL.items():
