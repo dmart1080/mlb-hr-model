@@ -512,10 +512,10 @@ def build_today_features(
     today_df.to_parquet(out_path, index=False)
     logger.info("Written: %s", out_path.name)
 
-    # Also append to the multi-season table so predict.py finds it without
-    # needing code changes (predict.py uses latest_train_table() which prefers
-    # the full combined file — we overwrite it here with today appended).
-    _append_to_combined(today_df, target_date)
+    # NOTE: _append_to_combined is skipped — predict.py already prefers
+    # train_table_YYYY-MM-DD_today.parquet over the combined table, so
+    # appending is unnecessary and too memory-intensive for a 2GB VPS.
+    # _append_to_combined(today_df, target_date)
 
     return out_path
 
