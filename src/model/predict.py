@@ -377,17 +377,17 @@ if __name__ == "__main__":
 
     df["game_date"] = pd.to_datetime(df["game_date"])
 
-    if apply_shrinkage_flag:
-        from src.model.train import apply_shrinkage as _apply_shrinkage
-        print("Applying empirical Bayes shrinkage ...")
-        df = _apply_shrinkage(df)
-
     if args.date:
         target_date = pd.Timestamp(args.date)
     else:
         target_date = df["game_date"].max()
 
     today_df = df[df["game_date"] == target_date].copy()
+
+    if apply_shrinkage_flag:
+        from src.model.train import apply_shrinkage as _apply_shrinkage
+        print("Applying empirical Bayes shrinkage ...")
+        today_df = _apply_shrinkage(today_df)
 
     if today_df.empty:
         print(f"\nNo rows found for {target_date.date()} in {train_path.name}.")
