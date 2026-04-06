@@ -39,7 +39,7 @@ from pathlib import Path
 import glob
 import joblib
 import pandas as pd
-
+from src.model.train import _IsotonicWrappedModel # noqa: F401
 from dotenv import load_dotenv
 load_dotenv()
 
