@@ -116,16 +116,19 @@ def _today_str() -> str:
 
 
 def _load_latest_train_table() -> pd.DataFrame:
-    """Load the best available train table."""
+    """Load the best available train table, filtered to last 60 days only.
+    We only need recent rows for carry-forward (latest row per player).
+    """
     candidates = [
         PROCESSED_DIR / "train_table_2021_2026_full.parquet",
         PROCESSED_DIR / "train_table_2021_2025_full.parquet",
         PROCESSED_DIR / "train_table_2024_full_season.parquet",
     ]
+    cutoff = (pd.Timestamp.today() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
     for c in candidates:
         if c.exists() and c.stat().st_size > 10_000:
-            logger.info("Loading train table: %s", c.name)
-            df = pd.read_parquet(c)
+            logger.info("Loading train table: %s (last 60 days only)", c.name)
+            df = pd.read_parquet(c, filters=[("game_date", ">=", cutoff)])
             df["game_date"] = pd.to_datetime(df["game_date"])
             return df
 
@@ -140,8 +143,8 @@ def _load_latest_train_table() -> pd.DataFrame:
             "No train_table_*.parquet found in data/processed/.\n"
             "Run build_features_multi_season.py first."
         )
-    logger.info("Loading train table (fallback): %s", files[0].name)
-    df = pd.read_parquet(files[0])
+    logger.info("Loading train table (fallback): %s (last 60 days only)", files[0].name)
+    df = pd.read_parquet(files[0], filters=[("game_date", ">=", cutoff)])
     df["game_date"] = pd.to_datetime(df["game_date"])
     return df
 
