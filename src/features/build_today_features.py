@@ -124,7 +124,7 @@ def _load_latest_train_table() -> pd.DataFrame:
         PROCESSED_DIR / "train_table_2021_2025_full.parquet",
         PROCESSED_DIR / "train_table_2024_full_season.parquet",
     ]
-    cutoff = (pd.Timestamp.today() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    cutoff = pd.Timestamp.today() - pd.Timedelta(days=60)
     for c in candidates:
         if c.exists() and c.stat().st_size > 10_000:
             logger.info("Loading train table: %s (last 60 days only)", c.name)
