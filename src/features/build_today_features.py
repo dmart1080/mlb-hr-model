@@ -54,7 +54,7 @@ from src.data_sources.mlb_schedule import (
 )
 from src.data_sources.weather import INDOOR_PARKS
 from src.features.park_factors import get_park_factors, DEFAULT_PARK_FACTOR
-from src.features.build_features import fetch_weather_for_games_fast
+from src.features.build_features import fetch_weather_for_games_fast, _compute_park_direction_factor
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +223,72 @@ def _recompute_edges(df: pd.DataFrame) -> pd.DataFrame:
         b_br = df.get("b_barrel_rate_14",  pd.Series(np.nan, index=df.index))
         df["hardhit_x_wind"] = b_hh * df["wind_hr_impact"]
         df["barrel_x_wind"]  = b_br * df["wind_hr_impact"]
+
+    def _col(c):
+        return df[c] if c in df.columns else pd.Series(np.nan, index=df.index)
+
+    def _edge(a, b):
+        return _col(a) - _col(b)
+
+    # Opener interactions
+    if "p_is_opener" in df.columns:
+        df["opener_x_hardhit"] = _col("p_is_opener") * _col("b_hardhit_rate_14")
+        df["opener_x_barrel"]  = _col("p_is_opener") * _col("b_barrel_rate_14")
+
+    # ISO interactions
+    if "b_iso_szn" in df.columns and "park_factor_hr" in df.columns:
+        iso = _col("b_iso_szn").fillna(_col("b_iso_14")).fillna(_col("b_iso_career"))
+        df["iso_x_park"] = iso * _col("park_factor_hr")
+        df["iso_x_wind"] = iso * _col("wind_hr_impact")
+        df["platoon_edge_x_iso"] = _col("b_platoon_hr_edge") * iso
+
+    # Sweet spot interactions
+    if "b_sweet_spot_rate_szn" in df.columns:
+        ss = _col("b_sweet_spot_rate_szn").fillna(_col("b_sweet_spot_rate_14"))
+        if "park_factor_hr" in df.columns:
+            df["sweet_spot_x_park"] = ss * _col("park_factor_hr")
+        if "wind_hr_impact" in df.columns:
+            df["sweet_spot_x_wind"] = ss * _col("wind_hr_impact")
+        if "p_command_30" in df.columns:
+            df["sweet_spot_x_poor_command"] = ss * (1.0 - _col("p_command_30").clip(lower=0, upper=1))
+        if "p_weak_stuff_rate" in df.columns:
+            df["sweet_spot_x_weak_stuff"] = ss * _col("p_weak_stuff_rate")
+
+    # 30-day edges
+    df["hr_rate_edge_30_30"]  = _edge("b_hr_rate_30",      "p_hr_allowed_rate_30")
+    df["hardhit_edge_30_30"]  = _edge("b_hardhit_rate_30", "p_hardhit_allowed_rate_30")
+    df["barrel_edge_30_30"]   = _edge("b_barrel_rate_30",  "p_barrel_allowed_rate_30")
+
+    # Barrel / HR interactions with poor command
+    if "p_command_30" in df.columns:
+        poor_cmd = 1.0 - _col("p_command_30").clip(lower=0, upper=1)
+        df["barrel_x_poor_command"] = _col("b_barrel_rate_14") * poor_cmd
+        df["hr30_x_poor_command"]   = _col("b_hr_rate_30") * poor_cmd
+
+    # Weak stuff interactions
+    if "p_weak_stuff_rate" in df.columns:
+        df["barrel_x_weak_stuff"] = _col("b_barrel_rate_14") * _col("p_weak_stuff_rate")
+
+    # Hot streak interactions
+    if "b_ev_hot_flag" in df.columns:
+        df["hot_x_park"] = _col("b_ev_hot_flag") * _col("park_factor_hr")
+        df["hot_x_iso"]  = _col("b_ev_hot_flag") * _col("b_iso_szn").fillna(_col("b_iso_career"))
+
+    # Recent HR × park
+    if "b_hr_last_7d" in df.columns and "park_factor_hr" in df.columns:
+        df["hr7d_x_park"] = _col("b_hr_last_7d") * _col("park_factor_hr")
+
+    # Team HR rate interactions
+    if "t_hr_rate_14" in df.columns:
+        df["team_hr_x_batter_barrel"] = _col("t_hr_rate_14") * _col("b_barrel_rate_14")
+        df["team_hr_x_sweet_spot"]    = _col("t_hr_rate_14") * _col("b_sweet_spot_rate_szn").fillna(
+            _col("b_sweet_spot_rate_14")
+        )
+
+    # Park pull factor
+    if "b_pull_air_rate_szn" in df.columns and "park_pull_factor" in df.columns:
+        pull = _col("b_pull_air_rate_szn").fillna(_col("b_pull_air_rate_14"))
+        df["pull_x_park_direction"] = pull * _col("park_pull_factor")
 
     return df
 
@@ -478,6 +544,7 @@ def build_today_features(
     # ------------------------------------------------------------------
     # 8. Recompute edge features
     # ------------------------------------------------------------------
+    today_df = _compute_park_direction_factor(today_df)
     today_df = _recompute_edges(today_df)
 
     # ------------------------------------------------------------------
