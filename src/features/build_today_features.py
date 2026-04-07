@@ -130,6 +130,17 @@ def _load_latest_train_table() -> pd.DataFrame:
             logger.info("Loading train table: %s (last 60 days only)", c.name)
             df = pd.read_parquet(c, filters=[("game_date", ">=", cutoff)])
             df["game_date"] = pd.to_datetime(df["game_date"])
+            if not df.empty:
+                return df
+            # 60-day window is empty (season start / offseason gap) —
+            # fall back to the last 60 days of actual data in the file.
+            logger.warning(
+                "60-day window empty (season start?) — loading last 60 days of available data"
+            )
+            df = pd.read_parquet(c)
+            df["game_date"] = pd.to_datetime(df["game_date"])
+            max_date = df["game_date"].max()
+            df = df[df["game_date"] >= max_date - pd.Timedelta(days=60)]
             return df
 
     # Glob fallback
@@ -146,6 +157,13 @@ def _load_latest_train_table() -> pd.DataFrame:
     logger.info("Loading train table (fallback): %s (last 60 days only)", files[0].name)
     df = pd.read_parquet(files[0], filters=[("game_date", ">=", cutoff)])
     df["game_date"] = pd.to_datetime(df["game_date"])
+    if not df.empty:
+        return df
+    # Same season-start fallback for glob path
+    df = pd.read_parquet(files[0])
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    max_date = df["game_date"].max()
+    df = df[df["game_date"] >= max_date - pd.Timedelta(days=60)]
     return df
 
 
