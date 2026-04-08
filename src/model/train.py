@@ -33,9 +33,10 @@ TEST_START_DATE = "2026-03-26"
 
 # Minimum number of matched (prediction, outcome) pairs needed before the
 # isotonic recalibration step is attempted. Below this threshold the fit
-# is too noisy to be useful and we skip it silently.
-# At ~150 batter-games per day this is reached after roughly 3-4 weeks.
-_MIN_RECAL_SAMPLES = 500
+# produces a coarse step function (e.g. 7 output bins for 316 batters)
+# that destroys ranking granularity.
+# At ~150 batter-games per day, 2000 samples ≈ ~2 weeks of season data.
+_MIN_RECAL_SAMPLES = 2000
 
 # Current season year — recalibration only pulls data from this year's
 # prediction CSVs so it doesn't mix in stale prior-season probs.
@@ -525,14 +526,38 @@ class _IsotonicWrappedModel:
     Thin wrapper that applies a fitted isotonic recalibrator on top of an
     existing model's predict_proba output. Saved inside the joblib bundle
     so predict.py requires zero changes — it just calls predict_proba() as normal.
+
+    When the isotonic fit has too few distinct steps (< _MIN_ISO_STEPS),
+    the recalibrator is a coarse step function that destroys ranking
+    granularity — e.g. mapping 315 unique base probs into 7 buckets.
+    In that case we fall back to the base model's output directly.
     """
+    _MIN_ISO_STEPS = 20
+
     def __init__(self, base_model, recalibrator: IsotonicRegression):
         self.base_model   = base_model
         self.recalibrator = recalibrator
 
+    def _iso_is_usable(self) -> bool:
+        """True when the isotonic fit has enough steps to preserve ranking."""
+        thresholds = getattr(self.recalibrator, "y_thresholds_", None)
+        if thresholds is None:
+            return False
+        n_unique = len(np.unique(thresholds))
+        return n_unique >= self._MIN_ISO_STEPS
+
     def predict_proba(self, X) -> np.ndarray:
-        base_probs  = self.base_model.predict_proba(X)[:, 1]
-        recal_probs = self.recalibrator.predict(base_probs)
+        base_probs = self.base_model.predict_proba(X)[:, 1]
+        if self._iso_is_usable():
+            recal_probs = self.recalibrator.predict(base_probs)
+        else:
+            logger.warning(
+                "Isotonic recalibrator has only %d unique steps (need %d) "
+                "— using base model probabilities to preserve ranking granularity.",
+                len(np.unique(getattr(self.recalibrator, "y_thresholds_", []))),
+                self._MIN_ISO_STEPS,
+            )
+            recal_probs = base_probs
         return np.column_stack([1 - recal_probs, recal_probs])
 
     def predict(self, X) -> np.ndarray:
@@ -586,7 +611,12 @@ def train_baseline(train_path: Path) -> TrainResult:
         "temp_f", "wind_hr_impact", "wind_out_strong", "wind_in_strong",
         "temp_above_75", "temp_above_85", "is_indoor",
         "park_factor_hr",
-        "batting_order_pos", "is_top_of_order", "expected_pa_today", "relief_pa_pct",
+        "batting_order_pos", "is_top_of_order", "expected_pa_today",
+        # NOTE: relief_pa_pct removed — it's computed from the completed game
+        # (fraction of PAs against relievers) so it's unavailable at inference
+        # time (always 0.0). It was the #1 feature by importance (6.7%) which
+        # means the model was heavily relying on a signal that vanishes at
+        # prediction time, degrading live accuracy.
         "p_fb_velo_30", "p_fb_pct_30", "p_offspeed_pct_30", "p_fb_velo_trend",
         "b_days_rest", "p_days_rest", "p_is_short_rest",
         # Pulled air ball rate (fly ball + line drive to pull side only)

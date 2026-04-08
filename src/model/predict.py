@@ -426,6 +426,17 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Score
     # ------------------------------------------------------------------
+    # Warn about leaked features that are always 0 at inference time.
+    # These are computed from completed-game data and unavailable pre-game.
+    _LEAKED_FEATURES = {"relief_pa_pct"}
+    leaked_present = _LEAKED_FEATURES & set(feature_cols)
+    if leaked_present:
+        print(
+            f"⚠️  Model uses {len(leaked_present)} leaked feature(s) that are "
+            f"unavailable at inference (always 0): {sorted(leaked_present)}\n"
+            "   Retrain the model to remove these — predictions are degraded."
+        )
+
     missing = [c for c in feature_cols if c not in today_df.columns]
     if missing:
         print(f"⚠️  {len(missing)} feature(s) missing at inference — filling with 0:")
