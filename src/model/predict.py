@@ -53,6 +53,11 @@ PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 _LOOKUP_CHUNK_SIZE = 500
 TOP_N = 20
 
+# Minimum model probability to flag a bet. Positive edge on low-probability
+# predictions is usually calibration noise — the model is least reliable in
+# the tails. This filters out "edge" that isn't actionable.
+MIN_BET_PROB = 0.08
+
 
 # ---------------------------------------------------------------------------
 # Model + table loading
@@ -262,9 +267,11 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         )
         print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
 
-        bettable = ranked[ranked["edge"].notna() & (ranked["edge"] > 0)].sort_values(
-            ["edge", "hr_prob"], ascending=False
-        )
+        bettable = ranked[
+            ranked["edge"].notna()
+            & (ranked["edge"] > 0)
+            & (ranked["hr_prob"] >= MIN_BET_PROB)
+        ].sort_values(["edge", "hr_prob"], ascending=False)
         rest    = ranked[~ranked.index.isin(bettable.index)].sort_values("hr_prob", ascending=False)
         display = pd.concat([bettable, rest]).head(TOP_N)
 
@@ -277,7 +284,9 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
             odds    = _format_odds(row.get("market_over_price"))
             kelly   = _format_pct(row.get("kelly_stake"))
             pos     = int(row.get("batting_order_pos", 0))
-            flag    = "  ← BET" if (pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0) else ""
+            _has_edge = pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0
+            _above_floor = float(row.get("hr_prob", 0)) >= MIN_BET_PROB
+            flag = "  ← BET" if (_has_edge and _above_floor) else ""
             print(
                 f"  {batter:<26} {pitcher:<22} "
                 f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {kelly:>6}  {pos:>4}{flag}"
@@ -348,7 +357,17 @@ if __name__ == "__main__":
         "--date", default=None,
         help="Score a specific date (YYYY-MM-DD) instead of the latest in the train table.",
     )
+    parser.add_argument(
+        "--min-prob", type=float, default=None,
+        help=(
+            f"Minimum model probability to flag a bet (default {MIN_BET_PROB:.0%}). "
+            "Filters out low-confidence 'edge' that is likely calibration noise."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.min_prob is not None:
+        MIN_BET_PROB = args.min_prob
 
     # Final passes should always bypass caches — confirmed lineups and the
     # latest odds lines must be fetched fresh, not served from a stale cache.
@@ -466,10 +485,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     has_odds = False
 
-    # Gate: don't burn Odds API tokens until rolling windows are full.
-    # The longest rolling window is 30 days; require at least 30 days of
-    # season data before fetching odds so predictions have meaningful features.
-    _ROLLING_WINDOW_DAYS = 30
+    # Gate: don't burn Odds API tokens until rolling windows are filling.
+    # 14-day features are reliable after ~14 days; 30-day features benefit
+    # from empirical Bayes shrinkage so partial windows are usable.
+    _ROLLING_WINDOW_DAYS = 14
     _SEASON_STARTS = {2025: (3, 27), 2026: (3, 26)}
     _pred_date = datetime.strptime(date_str, "%Y-%m-%d")
     _month, _day = _SEASON_STARTS.get(_pred_date.year, (3, 27))

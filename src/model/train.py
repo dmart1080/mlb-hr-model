@@ -23,6 +23,9 @@ from src.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
+# Silence Optuna's internal logs (only show our summary)
+logging.getLogger("optuna").setLevel(logging.WARNING)
+
 PROJECT_ROOT  = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
@@ -565,10 +568,82 @@ class _IsotonicWrappedModel:
 
 
 # ---------------------------------------------------------------------------
+# Optuna hyperparameter tuning
+# ---------------------------------------------------------------------------
+
+_TUNE_N_TRIALS = 100
+_TUNE_TIMEOUT  = 1800  # 30 minutes max
+
+
+def _tune_lgbm(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    n_trials: int = _TUNE_N_TRIALS,
+    timeout: int = _TUNE_TIMEOUT,
+) -> dict:
+    """
+    Run Optuna Bayesian search over LightGBM hyperparameters.
+    Optimises ROC-AUC on the validation set (same calib split used for
+    early stopping in the main pipeline).
+
+    Returns the best param dict ready to unpack into LGBMClassifier().
+    """
+    import optuna
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "n_estimators":     2000,
+            "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
+            "num_leaves":       trial.suggest_int("num_leaves", 15, 127),
+            "min_child_samples": trial.suggest_int("min_child_samples", 100, 800),
+            "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq":   1,
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 0.8),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 50.0, log=True),
+            "min_split_gain":   trial.suggest_float("min_split_gain", 0.0, 0.1),
+            "max_depth":        trial.suggest_int("max_depth", -1, 12),
+            "random_state":     42,
+            "verbosity":        -1,
+        }
+        clf = LGBMClassifier(**params)
+        clf.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric="auc",
+            callbacks=[early_stopping(50, verbose=False), log_evaluation(period=-1)],
+        )
+        preds = clf.predict_proba(X_val)[:, 1]
+        return float(roc_auc_score(y_val, preds))
+
+    study = optuna.create_study(direction="maximize", study_name="lgbm_hr_tune")
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
+
+    best = study.best_trial
+    logger.info(
+        "Optuna tuning complete: %d trials | best ROC-AUC=%.4f (trial #%d)",
+        len(study.trials), best.value, best.number,
+    )
+    logger.info("Best params: %s", best.params)
+
+    # Merge with fixed params
+    final_params = {
+        "n_estimators":    2000,
+        "subsample_freq":  1,
+        "random_state":    42,
+        "verbosity":       -1,
+        **best.params,
+    }
+    return final_params
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
-def train_baseline(train_path: Path) -> TrainResult:
+def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
     df = pd.read_parquet(train_path)
 
     logger.info("Applying empirical Bayes shrinkage to rate features ...")
@@ -752,12 +827,20 @@ def train_baseline(train_path: Path) -> TrainResult:
     logger.info("LogReg (raw) ROC-AUC: %.3f", roc_lr_raw)
 
     # LightGBM
-    lgbm = LGBMClassifier(
-        n_estimators=1000, learning_rate=0.02, num_leaves=31,
-        min_child_samples=300, subsample=0.8, subsample_freq=1,
-        colsample_bytree=0.6, reg_alpha=0.1, reg_lambda=10.0,
-        min_split_gain=0.01, random_state=42, verbosity=-1,
-    )
+    if tune:
+        logger.info("=" * 30)
+        logger.info("OPTUNA HYPERPARAMETER TUNING")
+        logger.info("=" * 30)
+        lgbm_params = _tune_lgbm(X_train_core, y_train_core, X_calib, y_calib)
+    else:
+        lgbm_params = dict(
+            n_estimators=1000, learning_rate=0.02, num_leaves=31,
+            min_child_samples=300, subsample=0.8, subsample_freq=1,
+            colsample_bytree=0.6, reg_alpha=0.1, reg_lambda=10.0,
+            min_split_gain=0.01, random_state=42, verbosity=-1,
+        )
+
+    lgbm = LGBMClassifier(**lgbm_params)
     lgbm.fit(
         X_train_core, y_train_core,
         eval_set=[(X_calib, y_calib)],
@@ -768,6 +851,46 @@ def train_baseline(train_path: Path) -> TrainResult:
     p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
     roc_lgbm_raw    = float(roc_auc_score(y_test, p_test_lgbm_raw))
     logger.info("LightGBM (raw) ROC-AUC: %.3f", roc_lgbm_raw)
+
+    # ------------------------------------------------------------------
+    # Feature pruning — drop zero-importance features and retrain
+    # ------------------------------------------------------------------
+    importances_raw = pd.Series(lgbm.feature_importances_, index=feature_cols)
+    zero_imp = importances_raw[importances_raw == 0].index.tolist()
+    if zero_imp:
+        logger.info(
+            "Pruning %d zero-importance features: %s",
+            len(zero_imp), zero_imp,
+        )
+        feature_cols = [c for c in feature_cols if c not in zero_imp]
+        X_train_core = train_core_df[feature_cols].fillna(0.0)
+        X_calib      = calib_df[feature_cols].fillna(0.0)
+        X_test       = test_df[feature_cols].fillna(0.0)
+
+        lgbm = LGBMClassifier(**lgbm_params)
+        lgbm.fit(
+            X_train_core, y_train_core,
+            eval_set=[(X_calib, y_calib)],
+            eval_metric="auc",
+            callbacks=[early_stopping(50, verbose=False), log_evaluation(period=-1)],
+        )
+        p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
+        roc_lgbm_pruned = float(roc_auc_score(y_test, p_test_lgbm_raw))
+        logger.info(
+            "After pruning: %d features, ROC-AUC: %.4f (was %.4f, Δ%+.4f)",
+            len(feature_cols), roc_lgbm_pruned, roc_lgbm_raw,
+            roc_lgbm_pruned - roc_lgbm_raw,
+        )
+        roc_lgbm_raw = roc_lgbm_pruned
+
+        # Refit LogReg on pruned feature set so column counts match
+        base_pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=3000, class_weight="balanced")),
+        ])
+        base_pipeline.fit(X_train_core, y_train_core)
+        p_test_lr_raw = base_pipeline.predict_proba(X_test)[:, 1]
+        roc_lr_raw    = float(roc_auc_score(y_test, p_test_lr_raw))
 
     # Sigmoid calibration (layer 1 — same as before)
     calibrated_lr = CalibratedClassifierCV(
@@ -883,8 +1006,22 @@ def train_baseline(train_path: Path) -> TrainResult:
 
 
 if __name__ == "__main__":
+    import argparse as _ap
+    parser = _ap.ArgumentParser(description="Train MLB HR model")
+    parser.add_argument("--tune", action="store_true",
+                        help="Run Optuna hyperparameter tuning before training")
+    parser.add_argument("--tune-trials", type=int, default=_TUNE_N_TRIALS,
+                        help=f"Number of Optuna trials (default {_TUNE_N_TRIALS})")
+    parser.add_argument("--tune-timeout", type=int, default=_TUNE_TIMEOUT,
+                        help=f"Optuna timeout in seconds (default {_TUNE_TIMEOUT})")
+    args = parser.parse_args()
+
+    if args.tune:
+        _TUNE_N_TRIALS = args.tune_trials
+        _TUNE_TIMEOUT  = args.tune_timeout
+
     configure_logging()
     train_path = latest_train_table()
     logger.info("Training from: %s", train_path.name)
-    result = train_baseline(train_path)
+    result = train_baseline(train_path, tune=args.tune)
     print_summary(train_path, result.model_path, result.feature_cols, result.metrics, result.extra)
