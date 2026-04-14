@@ -336,9 +336,13 @@ def build_picks_payload(
     # ---- Split into bet / watch tiers ----
     watch_floor = WATCH_FLOOR_PP / 100.0
 
+    from src.model.predict import MIN_BET_PROB, MIN_REL_EDGE
     bets = ranked_df[
-        ranked_df["edge"].notna() & (ranked_df["edge"] > 0)
-    ].sort_values(["edge", "hr_prob"], ascending=False).copy()
+        ranked_df["edge"].notna()
+        & (ranked_df["edge"] > 0)
+        & (ranked_df["hr_prob"] >= MIN_BET_PROB)
+        & (ranked_df.get("rel_edge", pd.Series([float("nan")] * len(ranked_df))).fillna(0) >= MIN_REL_EDGE)
+    ].sort_values(["rel_edge", "edge"], ascending=False).copy()
 
     watch = ranked_df[
         ranked_df["edge"].notna() &
