@@ -86,6 +86,11 @@ ET      = ZoneInfo("America/New_York")
 # How far before first pitch to fire the final pass for a wave
 FINAL_PASS_LEAD_MINUTES = 90
 
+# CLV snapshot: fire this many minutes before each wave's first pitch.
+# The closing line = the last snapshot captured before games go Live.
+# Runs on its own Task Scheduler cadence (every 15 min is fine).
+CLV_SNAPSHOT_LEAD_MINUTES = 15
+
 # Games within this many minutes of each other are grouped into the same wave
 WAVE_GAP_MINUTES = 60
 
@@ -637,6 +642,13 @@ def main() -> None:
         ),
     )
     mode.add_argument(
+        "--auto-clv", action="store_true",
+        help=(
+            "Snapshot current odds vs bet-time lines for today's picks if a "
+            "wave's first pitch is within the CLV window. Schedule every 15 min."
+        ),
+    )
+    mode.add_argument(
         "--show-waves", action="store_true",
         help="Print today's game waves and their scheduled pass times, then exit.",
     )
@@ -715,6 +727,43 @@ def main() -> None:
             if rc != 0:
                 logger.warning("Pass %s exited with code %d", wave["pass_name"], rc)
 
+        return
+
+    # ---- --auto-clv ----
+    if args.auto_clv:
+        game_times = fetch_game_times(date_str, force_refresh=False)
+        waves      = build_waves(game_times)
+
+        if not waves:
+            print(f"No games found for {date_str} — nothing to do.")
+            return
+
+        # Fire CLV snapshot if any wave's first pitch is imminent
+        # (within CLV_SNAPSHOT_LEAD_MINUTES) and not yet Live.
+        now = now_et()
+        imminent = [
+            w for w in waves
+            if now >= w["earliest"] - timedelta(minutes=CLV_SNAPSHOT_LEAD_MINUTES)
+            and now <= w["earliest"]
+        ]
+
+        if not imminent:
+            now_str = now.strftime("%I:%M %p ET")
+            print(f"[{now_str}] No CLV snapshot due — no wave within {CLV_SNAPSHOT_LEAD_MINUTES} min of first pitch.")
+            return
+
+        wave_labels = ", ".join(f"{w['label']}" for w in imminent)
+        print(f"⏰  CLV snapshot — wave(s) imminent: {wave_labels}")
+
+        cmd = [sys.executable, "-m", "src.analysis.clv_tracker", "--date", date_str]
+        if args.dry_run:
+            print(f"[DRY RUN] Would run: {' '.join(cmd)}")
+            return
+
+        try:
+            subprocess.run(cmd, cwd=PROJECT_ROOT)
+        except Exception as e:
+            logger.error("clv_tracker crashed: %s", e)
         return
 
     # No mode specified — print help

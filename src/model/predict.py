@@ -58,6 +58,13 @@ TOP_N = 20
 # the tails. This filters out "edge" that isn't actionable.
 MIN_BET_PROB = 0.08
 
+# Minimum relative edge (edge / fair_prob) to flag a bet.
+# Absolute edge alone misleads: 3pp edge on a 20% fair prob = 15% relative,
+# but 3pp on 7% fair prob = 43% relative. The latter is much more likely to
+# be noise. Requiring a minimum relative edge keeps bet quality consistent
+# across probability buckets.
+MIN_REL_EDGE = 0.20  # 20% relative edge
+
 
 # ---------------------------------------------------------------------------
 # Model + table loading
@@ -267,11 +274,16 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         )
         print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
 
+        # Relative edge = edge / fair_prob — normalises for probability scale
+        if "rel_edge" not in ranked.columns:
+            ranked["rel_edge"] = ranked["edge"] / ranked["market_fair_prob"].replace(0, float("nan"))
+
         bettable = ranked[
             ranked["edge"].notna()
             & (ranked["edge"] > 0)
             & (ranked["hr_prob"] >= MIN_BET_PROB)
-        ].sort_values(["edge", "hr_prob"], ascending=False)
+            & (ranked["rel_edge"] >= MIN_REL_EDGE)
+        ].sort_values(["rel_edge", "edge"], ascending=False)
         rest    = ranked[~ranked.index.isin(bettable.index)].sort_values("hr_prob", ascending=False)
         display = pd.concat([bettable, rest]).head(TOP_N)
 
@@ -286,7 +298,8 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
             pos     = int(row.get("batting_order_pos", 0))
             _has_edge = pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0
             _above_floor = float(row.get("hr_prob", 0)) >= MIN_BET_PROB
-            flag = "  ← BET" if (_has_edge and _above_floor) else ""
+            _rel_ok = pd.notna(row.get("rel_edge")) and float(row.get("rel_edge", 0)) >= MIN_REL_EDGE
+            flag = "  ← BET" if (_has_edge and _above_floor and _rel_ok) else ""
             print(
                 f"  {batter:<26} {pitcher:<22} "
                 f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {kelly:>6}  {pos:>4}{flag}"
@@ -544,7 +557,7 @@ if __name__ == "__main__":
     ]
     if has_odds:
         save_cols += [
-            "market_over_price", "market_fair_prob", "edge",
+            "market_over_price", "market_fair_prob", "edge", "rel_edge",
             "odds_bookmaker", "kelly_stake",
         ]
 
