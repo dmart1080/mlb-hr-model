@@ -189,9 +189,8 @@ def _build_bet_embed(
             {"name": "📊 Market Fair", "value": market, "inline": True},
             {"name": "📈 Edge",        "value": edge,   "inline": True},
             {"name": "💰 Kelly Stake", "value": kelly,  "inline": True},
-            {"name": "🟢 DraftKings",  "value": odds,   "inline": True},
-            {"name": "🔵 FanDuel",     "value": odds,   "inline": True},
-            {"name": "📖 Source Book", "value": book,   "inline": True},
+            {"name": "💵 Best Price",  "value": odds,   "inline": True},
+            {"name": "📖 Book",         "value": book,   "inline": True},
         ]
 
         try:
@@ -358,7 +357,7 @@ def build_picks_payload(
         desc = (
             f"**{len(bets)} bet{'s' if len(bets) != 1 else ''} with positive edge** "
             f"| avg edge **{avg_edge:+.1f}pp**\n"
-            f"✅ DraftKings & FanDuel odds shown directly.\n"
+            f"✅ Best price across US books shown per pick.\n"
             f"📋 Other books: check minimum odds listed per pick."
         )
     else:
