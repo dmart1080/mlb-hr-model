@@ -197,6 +197,9 @@ def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
                 continue
             outcomes = market.get("outcomes", [])
 
+            # Keep only the 0.5 (To Hit A HR) line. Many books offer alt
+            # lines (1.5, 2.5) as separate "Over" outcomes under the same
+            # player name, which corrupt by_name if we key only by name.
             by_name: dict[str, dict] = {}
             for outcome in outcomes:
                 name  = outcome.get("description", "").strip()
@@ -205,15 +208,19 @@ def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
                 line  = outcome.get("point", 0.5)
                 if not name or price is None:
                     continue
+                if float(line) != 0.5:
+                    continue
                 if name not in by_name:
-                    by_name[name] = {"line": line, "over": None, "under": None}
+                    by_name[name] = {"line": 0.5, "over": None, "under": None}
                 if side == "over":
                     by_name[name]["over"] = int(price)
                 elif side == "under":
                     by_name[name]["under"] = int(price)
 
             for name, sides in by_name.items():
-                if sides["over"] is None or sides["under"] is None:
+                # Over price is required; under is optional (some books
+                # like BetOnline only post Over on HR props).
+                if sides["over"] is None:
                     continue
                 if name not in all_prices:
                     all_prices[name] = {}
@@ -230,8 +237,14 @@ def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
         best      = book_prices[best_book]
 
         p_over  = american_to_implied_prob(best["over"])
-        p_under = american_to_implied_prob(best["under"])
-        fair_over, _ = remove_vig(p_over, p_under)
+        if best["under"] is not None:
+            p_under = american_to_implied_prob(best["under"])
+            fair_over, _ = remove_vig(p_over, p_under)
+        else:
+            # Over-only market (e.g. BetOnline): no under price to de-vig
+            # against. Apply a flat assumed vig (_VIG_PCT) to the over
+            # side so fair_prob stays comparable to two-sided quotes.
+            fair_over = p_over / (1 + _VIG_PCT)
 
         rows.append({
             "batter_name":       name,
