@@ -352,6 +352,15 @@ def build_today_features(
         game_pks, force_refresh=force_refresh
     )
 
+    # If cached rosters were written before lineups were posted they'll be
+    # empty forever (no TTL). Retry once with force_refresh when no batting
+    # orders came back so cron self-heals later in the day.
+    if not force_refresh and (batting_df is None or batting_df.empty):
+        logger.info("Cached rosters empty — retrying with force_refresh=True")
+        starters_df, batting_df = fetch_rosters_for_games(
+            game_pks, force_refresh=True
+        )
+
     # Build game_pk → home_team lookup
     game_pk_to_home: dict[int, str] = dict(
         zip(schedule_df["game_pk"].astype(int), schedule_df["home_team"])
