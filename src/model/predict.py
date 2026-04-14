@@ -56,14 +56,14 @@ TOP_N = 20
 # Minimum model probability to flag a bet. Positive edge on low-probability
 # predictions is usually calibration noise — the model is least reliable in
 # the tails. This filters out "edge" that isn't actionable.
-MIN_BET_PROB = 0.08
+MIN_BET_PROB = 0.10
 
 # Minimum relative edge (edge / fair_prob) to flag a bet.
 # Absolute edge alone misleads: 3pp edge on a 20% fair prob = 15% relative,
 # but 3pp on 7% fair prob = 43% relative. The latter is much more likely to
 # be noise. Requiring a minimum relative edge keeps bet quality consistent
 # across probability buckets.
-MIN_REL_EDGE = 0.20  # 20% relative edge
+MIN_REL_EDGE = 0.30  # 30% relative edge
 
 
 # ---------------------------------------------------------------------------
