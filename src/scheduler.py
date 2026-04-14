@@ -738,13 +738,15 @@ def main() -> None:
             print(f"No games found for {date_str} — nothing to do.")
             return
 
-        # Fire CLV snapshot if any wave's first pitch is imminent
-        # (within CLV_SNAPSHOT_LEAD_MINUTES) and not yet Live.
+        # Fire CLV snapshot if any wave's first pitch is within the window:
+        # from T-lead through T+5min. The trailing +5min grace period handles
+        # cron drift and the fact that books keep lines live briefly after
+        # first pitch (picks for later waves still get clean snapshots).
         now = now_et()
         imminent = [
             w for w in waves
             if now >= w["earliest"] - timedelta(minutes=CLV_SNAPSHOT_LEAD_MINUTES)
-            and now <= w["earliest"]
+            and now <= w["earliest"] + timedelta(minutes=5)
         ]
 
         if not imminent:

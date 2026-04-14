@@ -274,10 +274,7 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         )
         print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
 
-        # Relative edge = edge / fair_prob — normalises for probability scale
-        if "rel_edge" not in ranked.columns:
-            ranked["rel_edge"] = ranked["edge"] / ranked["market_fair_prob"].replace(0, float("nan"))
-
+        # rel_edge was added at odds-enrichment time (see below in main)
         bettable = ranked[
             ranked["edge"].notna()
             & (ranked["edge"] > 0)
@@ -520,6 +517,9 @@ if __name__ == "__main__":
                 force_refresh=args.force_refresh,
             )
             has_odds = ranked["edge"].notna().any()
+            # Relative edge = edge / fair_prob. Computed once here so every
+            # downstream consumer (CSV, Discord, display) sees it consistently.
+            ranked["rel_edge"] = ranked["edge"] / ranked["market_fair_prob"].replace(0, float("nan"))
         except Exception as e:
             print(f"⚠️  Odds enrichment failed: {e}")
     elif odds_api_key and not _windows_ready:
