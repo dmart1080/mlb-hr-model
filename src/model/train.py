@@ -833,11 +833,12 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         logger.info("=" * 30)
         lgbm_params = _tune_lgbm(X_train_core, y_train_core, X_calib, y_calib)
     else:
+        # Optuna-tuned defaults (2026-04-12, 100 trials, trial #55)
         lgbm_params = dict(
-            n_estimators=1000, learning_rate=0.02, num_leaves=31,
-            min_child_samples=300, subsample=0.8, subsample_freq=1,
-            colsample_bytree=0.6, reg_alpha=0.1, reg_lambda=10.0,
-            min_split_gain=0.01, random_state=42, verbosity=-1,
+            n_estimators=2000, learning_rate=0.0275, num_leaves=15,
+            min_child_samples=226, subsample=0.888, subsample_freq=1,
+            colsample_bytree=0.385, reg_alpha=0.002, reg_lambda=2.024,
+            min_split_gain=0.054, max_depth=2, random_state=42, verbosity=-1,
         )
 
     lgbm = LGBMClassifier(**lgbm_params)
