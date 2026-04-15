@@ -642,6 +642,13 @@ def main() -> None:
         ),
     )
     mode.add_argument(
+        "--auto-final-once", action="store_true",
+        help=(
+            "Fire final pass ONCE per day when 90 min before earliest first "
+            "pitch. Cheap to run hourly — uses a sentinel file to dedupe."
+        ),
+    )
+    mode.add_argument(
         "--auto-clv", action="store_true",
         help=(
             "Snapshot current odds vs bet-time lines for today's picks if a "
@@ -727,6 +734,53 @@ def main() -> None:
             if rc != 0:
                 logger.warning("Pass %s exited with code %d", wave["pass_name"], rc)
 
+        return
+
+    # ---- --auto-final-once ----
+    # Cheap hourly check: fire ONE final pass per day, 90 min before the
+    # earliest first pitch. Uses a sentinel file so multiple hourly ticks
+    # inside the window don't re-fire. No Odds API cost for the check itself
+    # (MLB schedule is free); Odds API is only hit when the pass fires.
+    if args.auto_final_once:
+        sentinel = PROJECT_ROOT / "data" / f".final_fired_{date_str}"
+        if sentinel.exists():
+            print(f"Final pass already fired today ({date_str}) — skipping.")
+            return
+
+        game_times = fetch_game_times(date_str, force_refresh=False)
+        waves      = build_waves(game_times)
+        if not waves:
+            print(f"No games found for {date_str} — nothing to do.")
+            return
+
+        earliest_first_pitch = min(w["earliest"] for w in waves)
+        fire_at = earliest_first_pitch - timedelta(minutes=FINAL_PASS_LEAD_MINUTES)
+        now = now_et()
+
+        if now < fire_at:
+            mins_until = int((fire_at - now).total_seconds() / 60)
+            print(
+                f"[{now.strftime('%I:%M %p ET')}] Too early — earliest first pitch "
+                f"{earliest_first_pitch.strftime('%I:%M %p ET')}, fire at "
+                f"{fire_at.strftime('%I:%M %p ET')} ({mins_until} min from now)."
+            )
+            return
+
+        print(
+            f"\n⏰  Final pass fired — earliest first pitch "
+            f"{earliest_first_pitch.strftime('%I:%M %p ET')}"
+        )
+        rc = run_pass(
+            "final",
+            dry_run=args.dry_run,
+            force_refresh=True,
+            description=f"Daily final pass (earliest first pitch {earliest_first_pitch.strftime('%I:%M %p ET')})",
+        )
+        if rc == 0 and not args.dry_run:
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
+        elif rc != 0:
+            logger.warning("Final pass exited with code %d", rc)
         return
 
     # ---- --auto-clv ----
