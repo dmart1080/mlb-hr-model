@@ -64,7 +64,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _API_BASE        = "https://api.the-odds-api.com/v4"
 _SPORT           = "baseball_mlb"
 _MARKET          = "batter_home_runs"
-_CACHE_TTL_HOURS = 2
+_CACHE_TTL_HOURS = 12  # extended from 2h → 12h to conserve free-tier API credits
 
 # Reduced from 4.5% → 3.5%: HR props on DK/FD/BetMGM typically run
 # 3–4% total margin. The previous 4.5% was pessimistic and suppressed edge.

@@ -731,6 +731,12 @@ def main() -> None:
 
     # ---- --auto-clv ----
     if args.auto_clv:
+        # CLV snapshots re-fetch odds and cost ~16 API credits each. On the
+        # free tier (500/mo) that's unaffordable. Gate behind CLV_ENABLED.
+        if os.environ.get("CLV_ENABLED", "false").lower() not in ("1", "true", "yes"):
+            print("CLV disabled (set CLV_ENABLED=true to enable — costs API credits).")
+            return
+
         game_times = fetch_game_times(date_str, force_refresh=False)
         waves      = build_waves(game_times)
 

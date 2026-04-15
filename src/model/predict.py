@@ -507,7 +507,13 @@ if __name__ == "__main__":
     _windows_ready = _days_into_season >= _ROLLING_WINDOW_DAYS
 
     odds_api_key = os.environ.get("ODDS_API_KEY")
-    if odds_api_key and _windows_ready:
+    # Skip odds fetch on morning pass to conserve free-tier API credits
+    # (500/mo budget — one full fetch/day is all we can afford). Lineups
+    # aren't confirmed that early anyway, so edge calc would be unreliable.
+    _skip_odds_morning = args.run_type == "morning"
+    if _skip_odds_morning:
+        print("ℹ️  Morning pass — skipping odds fetch (conserves API budget).")
+    if odds_api_key and _windows_ready and not _skip_odds_morning:
         try:
             from src.data_sources.odds import enrich_predictions_with_odds
             ranked = enrich_predictions_with_odds(
