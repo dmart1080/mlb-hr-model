@@ -54,7 +54,7 @@ def compute_rolling_gamelog_features(
         out["b_hr_last_3g"]  = 0
         out["b_hr_last_7g"]  = 0
         out["b_hr_last_14g"] = 0
-        out["b_ab_since_last_hr"] = float("nan")
+        out["b_ab_since_last_hr"] = 200  # no games → treat as long drought
         return out
 
     last3  = prior[-3:]
@@ -77,13 +77,16 @@ def compute_rolling_gamelog_features(
     k7  = sum(g["k"]  for g in last7)
     out["b_k_rate_last_7g"] = (k7 / (ab7 + sum(g["bb"] for g in last7))) if ab7 > 0 else float("nan")
 
+    # Count ABs since last HR. If the batter has never homered in prior games,
+    # use 200 as a "long drought" sentinel — preserves monotonic semantics
+    # (higher = bigger drought) and survives the downstream NaN→0 fill.
     ab_since = 0
+    found_hr = False
     for g in reversed(prior):
         if g["hr"] > 0:
+            found_hr = True
             break
         ab_since += g["ab"]
-    else:
-        ab_since = float("nan")
-    out["b_ab_since_last_hr"] = ab_since
+    out["b_ab_since_last_hr"] = ab_since if found_hr else 200
 
     return out
