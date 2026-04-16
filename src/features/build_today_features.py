@@ -453,6 +453,29 @@ def build_today_features(
     logger.info("Built %d batter matchup rows for %s", len(today_df), target_date)
 
     # ------------------------------------------------------------------
+    # 3b. Rolling outcome features from MLB gamelogs API
+    # (fills the 1-2 day Statcast lag for hot/cold signals)
+    # ------------------------------------------------------------------
+    from src.data_sources.mlb_gamelogs import fetch_batter_gamelog
+    from src.features.gamelog_features import (
+        compute_rolling_gamelog_features,
+        empty_features as _empty_gl_features,
+    )
+    season = pd.to_datetime(target_date).year
+    gl_rows = []
+    unique_batters = today_df["batter"].drop_duplicates().astype(int).tolist()
+    logger.info("Fetching MLB gamelogs for %d batters ...", len(unique_batters))
+    for bid in unique_batters:
+        games = fetch_batter_gamelog(bid, season, force_refresh=force_refresh)
+        feats = compute_rolling_gamelog_features(games, cutoff_date=str(target_date))
+        feats["batter"] = bid
+        gl_rows.append(feats)
+    gl_df = pd.DataFrame(gl_rows) if gl_rows else pd.DataFrame(
+        columns=["batter"] + list(_empty_gl_features().keys())
+    )
+    today_df = today_df.merge(gl_df, on="batter", how="left")
+
+    # ------------------------------------------------------------------
     # 4. Carry-forward rolling features from train table
     # ------------------------------------------------------------------
     logger.info("Loading train table for feature carry-forward ...")

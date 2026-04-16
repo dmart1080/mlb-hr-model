@@ -523,6 +523,72 @@ def _compute_batter_30d(
 
 
 # ---------------------------------------------------------------------------
+# Rolling gamelog outcome features (last 3/7/14 games)
+# Aggregates Statcast PA data to per-game totals, then calls the shared
+# gamelog_features helper so train-time and predict-time formulas match.
+# ---------------------------------------------------------------------------
+def _compute_gamelog_rolling(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,
+) -> pd.DataFrame:
+    from src.features.gamelog_features import (
+        compute_rolling_gamelog_features,
+        empty_features,
+    )
+
+    pa = pa_df.copy()
+    pa["game_date"] = pd.to_datetime(pa["game_date"])
+    ev_str = pa["events"].astype("string")
+
+    # Derive per-PA outcome flags
+    pa["_hr"] = (ev_str == "home_run").fillna(False).astype(int)
+    pa["_bb"] = (ev_str == "walk").fillna(False).astype(int)
+    pa["_k"]  = ev_str.str.contains("strikeout", na=False).astype(int)
+    # Hits: single/double/triple/home_run
+    pa["_h"]  = ev_str.isin(["single", "double", "triple", "home_run"]).fillna(False).astype(int)
+    pa["_tb"] = (
+        (ev_str == "single").fillna(False).astype(int) * 1
+        + (ev_str == "double").fillna(False).astype(int) * 2
+        + (ev_str == "triple").fillna(False).astype(int) * 3
+        + (ev_str == "home_run").fillna(False).astype(int) * 4
+    )
+    # AB excludes walks and HBP (Statcast doesn't split HBP from walks cleanly;
+    # approximation: PA minus walks)
+    pa["_ab"] = (1 - pa["_bb"]).astype(int)
+
+    per_game = (
+        pa.groupby(["batter", "game_date"], sort=False)
+          .agg(hr=("_hr", "sum"), ab=("_ab", "sum"), bb=("_bb", "sum"),
+               k=("_k", "sum"), h=("_h", "sum"), tb=("_tb", "sum"))
+          .reset_index()
+    )
+    per_game["date"] = per_game["game_date"].dt.strftime("%Y-%m-%d")
+    per_game["pa"]   = per_game["ab"] + per_game["bb"]
+
+    # Build per-batter sorted lists of game dicts
+    batter_games: dict[int, list[dict]] = {}
+    for bid, grp in per_game.sort_values("date").groupby("batter", sort=False):
+        batter_games[int(bid)] = grp[
+            ["date", "hr", "ab", "bb", "k", "h", "tb", "pa"]
+        ].to_dict("records")
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    rows = []
+    for _, r in need.iterrows():
+        bid = int(r["batter"])
+        gdate = r["game_date"].strftime("%Y-%m-%d")
+        games = batter_games.get(bid, [])
+        feats = compute_rolling_gamelog_features(games, cutoff_date=gdate)
+        feats["batter"] = bid
+        feats["game_date"] = r["game_date"]
+        rows.append(feats)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Pitcher command metric (K% - BB%)
 # ---------------------------------------------------------------------------
 
@@ -1613,6 +1679,12 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         labels[["batter", "game_date"]],
     )
 
+    logger.info("Computing batter gamelog rolling features ...")
+    batter_gamelog = _compute_gamelog_rolling(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
     # ------------------------------------------------------------------
     # Pitcher command metric (K% - BB%)
     # ------------------------------------------------------------------
@@ -1698,6 +1770,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(career_platoon,  on=["batter", "game_date"], how="left")
         .merge(sweet_spot_stats, on=["batter", "game_date"], how="left")
         .merge(batter_30d,      on=["batter", "game_date"], how="left")
+        .merge(batter_gamelog,  on=["batter", "game_date"], how="left")
         .merge(batter_streaks,  on=["batter", "game_date"], how="left")
         .merge(lineup_context,  on=["batter", "game_date"], how="left")
         .merge(pull_stats,      on=["batter", "game_date"], how="left")
