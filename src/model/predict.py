@@ -65,6 +65,13 @@ MIN_BET_PROB = 0.10
 # across probability buckets.
 MIN_REL_EDGE = 0.30  # 30% relative edge
 
+# Hard ceiling on predicted HR probability. The model is well-calibrated up to
+# ~0.20 but becomes increasingly overconfident above that: predictions of 0.35+
+# actually convert at ~0.25, and 0.45+ at ~0.14. Even the best power hitter in
+# MLB (Judge) tops out around 0.32 HR/game over a full season. Capping prevents
+# inflated edge calculations that make mediocre matchups look like must-bets.
+MAX_PRED_PROB = 0.30
+
 
 # ---------------------------------------------------------------------------
 # Model + table loading
@@ -474,7 +481,12 @@ if __name__ == "__main__":
             today_df[c] = 0.0
 
     X = today_df[feature_cols].fillna(0.0)
-    today_df["hr_prob"] = model.predict_proba(X)[:, 1]
+    raw_probs = model.predict_proba(X)[:, 1]
+    n_capped = int((raw_probs > MAX_PRED_PROB).sum())
+    today_df["hr_prob"] = raw_probs.clip(max=MAX_PRED_PROB)
+    if n_capped:
+        print(f"ℹ️  Capped {n_capped} predictions from "
+              f"{raw_probs.max():.1%} → {MAX_PRED_PROB:.0%} ceiling")
 
     # ------------------------------------------------------------------
     # Resolve player names
