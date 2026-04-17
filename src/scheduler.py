@@ -738,9 +738,14 @@ def main() -> None:
 
     # ---- --auto-final-once ----
     # Cheap hourly check: fire ONE final pass per day, 90 min before the
-    # earliest first pitch. Uses a sentinel file so multiple hourly ticks
-    # inside the window don't re-fire. No Odds API cost for the check itself
-    # (MLB schedule is free); Odds API is only hit when the pass fires.
+    # **biggest wave's** first pitch. Uses a sentinel file so multiple hourly
+    # ticks inside the window don't re-fire. No Odds API cost for the check
+    # itself (MLB schedule is free); Odds API is only hit when the pass fires.
+    #
+    # Why the biggest wave, not the earliest? Mixed schedules (e.g. 1 afternoon
+    # game + 14 night games) used to burn the daily fire on the lone afternoon
+    # game — producing a Discord post with 1 pick and missing the full slate.
+    # Targeting the largest wave ensures the fire covers the most matchups.
     if args.auto_final_once:
         sentinel = PROJECT_ROOT / "data" / f".final_fired_{date_str}"
         if sentinel.exists():
@@ -753,28 +758,36 @@ def main() -> None:
             print(f"No games found for {date_str} — nothing to do.")
             return
 
-        earliest_first_pitch = min(w["earliest"] for w in waves)
-        fire_at = earliest_first_pitch - timedelta(minutes=FINAL_PASS_LEAD_MINUTES)
+        # Pick the wave with the most games. On ties (same game count), prefer
+        # the later wave — books typically have tighter lines closer to the
+        # main slate.
+        target_wave = max(waves, key=lambda w: (w["game_count"], w["earliest"]))
+        target_first_pitch = target_wave["earliest"]
+        fire_at = target_first_pitch - timedelta(minutes=FINAL_PASS_LEAD_MINUTES)
         now = now_et()
 
         if now < fire_at:
             mins_until = int((fire_at - now).total_seconds() / 60)
             print(
-                f"[{now.strftime('%I:%M %p ET')}] Too early — earliest first pitch "
-                f"{earliest_first_pitch.strftime('%I:%M %p ET')}, fire at "
+                f"[{now.strftime('%I:%M %p ET')}] Too early — biggest wave "
+                f"({target_wave['game_count']} games) first pitch "
+                f"{target_first_pitch.strftime('%I:%M %p ET')}, fire at "
                 f"{fire_at.strftime('%I:%M %p ET')} ({mins_until} min from now)."
             )
             return
 
         print(
-            f"\n⏰  Final pass fired — earliest first pitch "
-            f"{earliest_first_pitch.strftime('%I:%M %p ET')}"
+            f"\n⏰  Final pass fired — biggest wave ({target_wave['game_count']} games) "
+            f"first pitch {target_first_pitch.strftime('%I:%M %p ET')}"
         )
         rc = run_pass(
             "final",
             dry_run=args.dry_run,
             force_refresh=True,
-            description=f"Daily final pass (earliest first pitch {earliest_first_pitch.strftime('%I:%M %p ET')})",
+            description=(
+                f"Daily final pass — {target_wave['game_count']} games, "
+                f"first pitch {target_first_pitch.strftime('%I:%M %p ET')}"
+            ),
         )
         if rc == 0 and not args.dry_run:
             sentinel.parent.mkdir(parents=True, exist_ok=True)
