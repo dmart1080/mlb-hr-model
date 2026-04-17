@@ -175,8 +175,16 @@ def _build_bet_embed(
     market  = _fmt_pct(row.get("market_fair_prob")) if has_odds else "—"
     edge    = _fmt_edge(row.get("edge")) if has_odds else "—"
     odds    = _fmt_american(row.get("market_over_price")) if has_odds else "—"
-    kelly   = _fmt_pct(row.get("kelly_stake")) if has_odds else "—"
     book    = str(row.get("odds_bookmaker", "")).upper() or "—"
+
+    # Suggested unit size from Kelly fraction
+    try:
+        from src.model.predict import kelly_to_units
+        kelly_val = float(row.get("kelly_stake", 0))
+        units = kelly_to_units(kelly_val) if has_odds else 0.0
+        units_str = f"**{units:.1f}u**" if units > 0 else "—"
+    except (TypeError, ValueError):
+        units_str = "—"
 
     fields = [
         {"name": "🆚 vs Pitcher",   "value": pitcher,   "inline": True},
@@ -186,11 +194,11 @@ def _build_bet_embed(
 
     if has_odds:
         fields += [
-            {"name": "📊 Market Fair", "value": market, "inline": True},
-            {"name": "📈 Edge",        "value": edge,   "inline": True},
-            {"name": "💰 Kelly Stake", "value": kelly,  "inline": True},
-            {"name": "💵 Best Price",  "value": odds,   "inline": True},
-            {"name": "📖 Book",         "value": book,   "inline": True},
+            {"name": "📊 Market Fair", "value": market,     "inline": True},
+            {"name": "📈 Edge",        "value": edge,       "inline": True},
+            {"name": "🎯 Suggested",   "value": units_str,  "inline": True},
+            {"name": "💵 Best Price",  "value": odds,       "inline": True},
+            {"name": "📖 Book",         "value": book,       "inline": True},
         ]
 
         try:

@@ -270,6 +270,41 @@ def _format_edge(val) -> str:
         return "  —  "
 
 
+def kelly_to_units(kelly: float) -> float:
+    """Map fractional-Kelly stake to a clean unit size (0.5–3u).
+
+    Kelly fractions from our ¼-Kelly formula range roughly 0–0.10.
+    We bucket into intuitive bet sizes:
+        kelly < 0.005  → 0   (skip / no bet)
+        0.005–0.015    → 0.5u (low confidence)
+        0.015–0.030    → 1u   (standard)
+        0.030–0.050    → 1.5u (above average)
+        0.050–0.070    → 2u   (strong)
+        0.070+         → 3u   (max)
+    """
+    if kelly < 0.005:
+        return 0.0
+    elif kelly < 0.015:
+        return 0.5
+    elif kelly < 0.030:
+        return 1.0
+    elif kelly < 0.050:
+        return 1.5
+    elif kelly < 0.070:
+        return 2.0
+    else:
+        return 3.0
+
+
+def _format_units(val) -> str:
+    try:
+        k = float(val)
+        u = kelly_to_units(k)
+        return f"{u:.1f}u" if u > 0 else "  —  "
+    except (TypeError, ValueError):
+        return "  —  "
+
+
 def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
     if has_odds:
         print(f"\n{'='*85}")
@@ -277,9 +312,9 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         print(f"{'='*85}")
         print(
             f"  {'Batter':<26} {'Pitcher':<22} "
-            f"{'Model':>7}  {'Market':>7}  {'Edge':>8}  {'Odds':>6}  {'Kelly':>6}  {'Slot':>4}"
+            f"{'Model':>7}  {'Market':>7}  {'Edge':>8}  {'Odds':>6}  {'Units':>5}  {'Slot':>4}"
         )
-        print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
+        print(f"  {'-'*26} {'-'*22} {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*5}  {'-'*4}")
 
         # rel_edge was added at odds-enrichment time (see below in main)
         bettable = ranked[
@@ -298,7 +333,7 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
             market  = _format_pct(row.get("market_fair_prob"))
             edge    = _format_edge(row.get("edge"))
             odds    = _format_odds(row.get("market_over_price"))
-            kelly   = _format_pct(row.get("kelly_stake"))
+            units   = _format_units(row.get("kelly_stake"))
             pos     = int(row.get("batting_order_pos", 0))
             _has_edge = pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0
             _above_floor = float(row.get("hr_prob", 0)) >= MIN_BET_PROB
@@ -306,7 +341,7 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
             flag = "  ← BET" if (_has_edge and _above_floor and _rel_ok) else ""
             print(
                 f"  {batter:<26} {pitcher:<22} "
-                f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {kelly:>6}  {pos:>4}{flag}"
+                f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {units:>5}  {pos:>4}{flag}"
             )
 
         n_edge = len(bettable)
@@ -538,6 +573,9 @@ if __name__ == "__main__":
             # Relative edge = edge / fair_prob. Computed once here so every
             # downstream consumer (CSV, Discord, display) sees it consistently.
             ranked["rel_edge"] = ranked["edge"] / ranked["market_fair_prob"].replace(0, float("nan"))
+            ranked["suggested_units"] = ranked["kelly_stake"].apply(
+                lambda k: kelly_to_units(k) if pd.notna(k) else 0.0
+            )
         except Exception as e:
             print(f"⚠️  Odds enrichment failed: {e}")
     elif odds_api_key and not _windows_ready:
@@ -576,7 +614,7 @@ if __name__ == "__main__":
     if has_odds:
         save_cols += [
             "market_over_price", "market_fair_prob", "edge", "rel_edge",
-            "odds_bookmaker", "kelly_stake",
+            "odds_bookmaker", "kelly_stake", "suggested_units",
         ]
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
