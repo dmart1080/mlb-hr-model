@@ -178,16 +178,21 @@ scp .env root@YOUR_SERVER_IP:/root/mlb-hr-model/.env
 crontab -e
 ```
 
-Add these three lines:
+Add the following. Note the `ODDS_API_KEY=` line at the top — cron doesn't source `.env`, so the key must be injected inline (or use `env -i … source .env …` in each job).
+
 ```
+# Odds API key — cron doesn't source .env, inject here
+ODDS_API_KEY=your_key_here
+
 # Nightly retrain — 4:00 AM ET (refreshes isotonic recalibration with live outcomes)
 0 8 * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.model.train >> /root/mlb-hr-model/cron.log 2>&1
 
 # Morning pass — 10:00 AM ET (UTC-4 in summer)
 0 14 * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.scheduler --pass morning >> /root/mlb-hr-model/cron.log 2>&1
 
-# Auto final — every 30 min, 10 AM–11 PM ET
-*/30 14-23 * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.scheduler --auto-final >> /root/mlb-hr-model/cron.log 2>&1
+# Auto final — every 30 min, all day. Fires each wave 90 min before first pitch.
+# All 24 hours needed because late games (9+ PM ET) fire their pass after midnight UTC.
+*/30 * * * * cd /root/mlb-hr-model && /root/mlb-hr-model/.venv/bin/python -m src.scheduler --auto-final >> /root/mlb-hr-model/cron.log 2>&1
 ```
 
 > **Note:** Server runs UTC. 10 AM ET = 14:00 UTC in summer (EDT). Change `14` → `15` when clocks fall back in November.
@@ -246,12 +251,38 @@ Each pick is posted as a rich embed:
 #1  Aaron Judge — HR Over
 ┌─────────────────────────────────────────────────────┐
 │ vs Pitcher     Gerrit Cole        Batting Slot  3   │
-│ Model Prob     14.2%              Market Fair   9.8%│
-│ Edge           +4.4pp             Kelly Stake   6.1%│
-│ DraftKings     +115               FanDuel       +115│
+│ Model Prob     14.2%              Market Fair  9.8% │
+│ Edge           +4.4pp             Suggested    1.0u │
+│ Best Price     +115               Book         DK   │
 │ Other Books    Need +105 or better (break-even -108)│
 └─────────────────────────────────────────────────────┘
 ```
+
+Unit sizing is derived from fractional Kelly:
+
+| Kelly fraction | Units |
+|----------------|-------|
+| < 0.5%         | skip  |
+| 0.5–1.5%       | 0.5u  |
+| 1.5–3.0%       | 1.0u  |
+| 3.0–5.0%       | 1.5u  |
+| 5.0–7.0%       | 2.0u  |
+| ≥ 7.0%         | 3.0u  |
+
+---
+
+## Bet quality gates
+
+Calibration analysis on live 2026 data showed the model overshoots in the top probability bucket and that huge "edges" are usually calibration noise rather than real mispricings. Four filters gate every bet:
+
+| Gate | Value | Rationale |
+|------|-------|-----------|
+| `MAX_PRED_PROB` | 0.20 | Empirical ceiling — top calibration bucket converts at ~20% actual |
+| `MIN_BET_PROB`  | 0.10 | Below the MLB base rate, positive edge is usually noise |
+| `MIN_REL_EDGE`  | 0.30 | Edge must be ≥30% of fair prob (keeps quality constant across buckets) |
+| `MAX_BET_EDGE`  | 0.10 | Edges > +10pp are typically model errors, not market mispricings |
+
+All four live in [src/model/predict.py](src/model/predict.py) as module constants — adjust there and both the terminal output and Discord embeds will follow.
 
 ---
 
