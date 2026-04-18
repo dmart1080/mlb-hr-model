@@ -65,12 +65,19 @@ MIN_BET_PROB = 0.10
 # across probability buckets.
 MIN_REL_EDGE = 0.30  # 30% relative edge
 
-# Hard ceiling on predicted HR probability. The model is well-calibrated up to
-# ~0.20 but becomes increasingly overconfident above that: predictions of 0.35+
-# actually convert at ~0.25, and 0.45+ at ~0.14. Even the best power hitter in
-# MLB (Judge) tops out around 0.32 HR/game over a full season. Capping prevents
-# inflated edge calculations that make mediocre matchups look like must-bets.
-MAX_PRED_PROB = 0.30
+# Hard ceiling on predicted HR probability. Weekly-recap calibration on 780
+# batter-games shows the top bucket (pred 0.17–0.58) converts at 20.0% actual
+# vs 25.4% predicted — a 5pp overshoot at the high end. Even the best power
+# hitter in MLB (Judge) tops out around 0.20 HR/game in practice. Cap at the
+# empirical ceiling so edge calculations stay honest.
+MAX_PRED_PROB = 0.20
+
+# Hard ceiling on edge (hr_prob - market_fair_prob). Edges above this are
+# almost always calibration noise — the market prices HR props efficiently,
+# so a "+15pp edge" usually means the model is wrong, not that we found a
+# mispricing. Recap shows bets at +10pp+ edges run -54% ROI vs -34% at the
+# +7pp threshold.
+MAX_BET_EDGE = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +327,7 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
         bettable = ranked[
             ranked["edge"].notna()
             & (ranked["edge"] > 0)
+            & (ranked["edge"] <= MAX_BET_EDGE)
             & (ranked["hr_prob"] >= MIN_BET_PROB)
             & (ranked["rel_edge"] >= MIN_REL_EDGE)
         ].sort_values(["rel_edge", "edge"], ascending=False)
@@ -336,9 +344,10 @@ def print_ranked_table(ranked: pd.DataFrame, *, has_odds: bool) -> None:
             units   = _format_units(row.get("kelly_stake"))
             pos     = int(row.get("batting_order_pos", 0))
             _has_edge = pd.notna(row.get("edge")) and float(row.get("edge", 0)) > 0
+            _edge_ok = pd.notna(row.get("edge")) and float(row.get("edge", 0)) <= MAX_BET_EDGE
             _above_floor = float(row.get("hr_prob", 0)) >= MIN_BET_PROB
             _rel_ok = pd.notna(row.get("rel_edge")) and float(row.get("rel_edge", 0)) >= MIN_REL_EDGE
-            flag = "  ← BET" if (_has_edge and _above_floor and _rel_ok) else ""
+            flag = "  ← BET" if (_has_edge and _edge_ok and _above_floor and _rel_ok) else ""
             print(
                 f"  {batter:<26} {pitcher:<22} "
                 f"{model:>7}  {market:>7}  {edge:>8}  {odds:>6}  {units:>5}  {pos:>4}{flag}"
