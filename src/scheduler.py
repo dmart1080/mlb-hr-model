@@ -451,7 +451,8 @@ def run_pass(
             f"python -m src.features.build_today_features"
             + (" --force-refresh" if force_refresh else "")
             + f"\npython -m src.model.predict --date {date_str} --run-type {predict_run_type}"
-            + (" --force-refresh" if force_refresh else "")
+            + (" --force-refresh" if force_refresh
+               else (" --no-force-refresh" if predict_run_type == "final" else ""))
         )
         print(f"\n  [DRY RUN] Would run:\n    {cmd_str}")
         print(f"{'='*72}\n")
@@ -491,6 +492,10 @@ def run_pass(
     cmd = [sys.executable, "-m", "src.model.predict", "--date", date_str, "--run-type", predict_run_type]
     if force_refresh:
         cmd.append("--force-refresh")
+    elif predict_run_type == "final":
+        # Suppress predict.py's auto-force so subsequent waves hit the 12h
+        # odds cache instead of spending ~16 credits on a fresh pull.
+        cmd.append("--no-force-refresh")
 
     logger.info("Running predict: %s", " ".join(cmd))
     print(f"\n  Step 2/2 — Scoring predictions ...")
@@ -717,15 +722,24 @@ def main() -> None:
                 show_waves(date_str)
             return
 
+        # Only the first final of the day force-refreshes the odds cache.
+        # Waves 2+ reuse the 12h cache (saves ~16 credits each, keeps us
+        # under the 500/mo free tier). Lines stay reasonably fresh because
+        # the cache TTL covers a typical single-day slate.
+        had_prior_final = any(p.startswith("final") for p in already)
+
         for wave in due:
             print(
                 f"\n⏰  Wave {wave['wave_id']} [{wave['label']}] final pass triggered "
                 f"({wave['game_count']} games, first pitch {wave['earliest'].strftime('%I:%M %p ET')})"
             )
+            force_refresh = not had_prior_final
+            if not force_refresh:
+                print("  (Reusing cached odds — not the first final of the day.)")
             rc = run_pass(
                 wave["pass_name"],
                 dry_run=args.dry_run,
-                force_refresh=True,
+                force_refresh=force_refresh,
                 description=(
                     f"Final pass for {wave['label']} wave — "
                     f"{wave['game_count']} game(s), first pitch {wave['earliest'].strftime('%I:%M %p ET')}"
@@ -733,6 +747,9 @@ def main() -> None:
             )
             if rc != 0:
                 logger.warning("Pass %s exited with code %d", wave["pass_name"], rc)
+            # After the first successful wave, subsequent waves in this same
+            # cron tick should also use cache.
+            had_prior_final = True
 
         return
 

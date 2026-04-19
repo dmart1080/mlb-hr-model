@@ -415,6 +415,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-force-refresh", action="store_true",
+        help=(
+            "Suppress the final-run auto-force-refresh. Use when the scheduler "
+            "has already refreshed once today and wants subsequent waves to hit "
+            "the 12h odds cache (saves API credits)."
+        ),
+    )
+    parser.add_argument(
         "--date", default=None,
         help="Score a specific date (YYYY-MM-DD) instead of the latest in the train table.",
     )
@@ -430,9 +438,10 @@ if __name__ == "__main__":
     if args.min_prob is not None:
         MIN_BET_PROB = args.min_prob
 
-    # Final passes should always bypass caches — confirmed lineups and the
-    # latest odds lines must be fetched fresh, not served from a stale cache.
-    if args.run_type == "final" and not args.force_refresh:
+    # Final passes default to bypassing caches so confirmed lineups and the
+    # latest odds lines are fresh. Caller can suppress with --no-force-refresh
+    # (scheduler does this for waves 2+ to stay under the Odds API free tier).
+    if args.run_type == "final" and not args.force_refresh and not args.no_force_refresh:
         args.force_refresh = True
         print("ℹ️  Final pass: --force-refresh enabled automatically.")
 

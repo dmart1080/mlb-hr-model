@@ -30,25 +30,30 @@ Remaining credits are logged at DEBUG from the `x-requests-remaining` response h
 ### Caching
 
 `_CACHE_TTL_HOURS = 12` in [src/data_sources/odds.py:67](../src/data_sources/odds.py#L67).
-Cached responses cost 0 credits. `--force-refresh` bypasses cache; final passes
-always force-refresh so each wave pays the full ~16 credits.
+Cached responses cost 0 credits. `--force-refresh` bypasses cache.
+
+**First-wave-only refresh:** the scheduler force-refreshes the first final pass
+of each day and passes `--no-force-refresh` to predict for every subsequent
+wave. Waves 2+ reuse the 12h cache so they cost 0 credits. See
+[src/scheduler.py](../src/scheduler.py) `--auto-final` branch.
 
 ### Monthly burn (current cron)
 
 Crontab on VPS:
 
-- `*/30 * * * * ... --auto-final` → fires each wave independently as due (1–4 waves/day)
+- `*/30 * * * * ... --auto-final` → fires each wave as due; first wave refreshes odds, waves 2+ use cache
 - `*/15 * * * * ... CLV_ENABLED=true --auto-clv` → once/day, latest wave only, deduped
 
 | Activity | Credits/day | Credits/month |
 |---|---|---|
-| Final passes (4 waves × ~16) | ~64 | ~1,920 |
-| CLV snapshot (1 × ~16) | ~16 | ~480 |
-| **Total** | **~80** | **~2,400** |
+| First final pass of day (force refresh) | ~16 | ~480 |
+| Subsequent waves (cache hit) | 0 | 0 |
+| CLV snapshot (once, pre-last-wave) | ~16 | ~480 |
+| **Total** | **~32** | **~960** |
 
-**This exceeds the 500/mo free tier when every wave runs.** Actual usage is
-lower on light slate days and when waves collapse (e.g., night-only slate =
-1 wave). A realistic floor is ~2 waves/day + CLV ≈ 48/day × 30 = ~1,440/mo.
+**Still over the 500/mo free tier with CLV on.** Realistic options:
+- **CLV on**: ~960/mo → needs the $30 20k tier, OR skip CLV on some days
+- **CLV off**: ~480/mo → fits free tier with thin margin
 
 ### Upgrade break-even
 
