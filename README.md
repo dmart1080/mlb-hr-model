@@ -286,6 +286,13 @@ All four live in [src/model/predict.py](src/model/predict.py) as module constant
 
 ---
 
+## Operating costs
+
+See [docs/costs.md](docs/costs.md) for VPS + Odds API credit math, free-tier
+headroom, and the upgrade break-even rule.
+
+---
+
 ## Key files
 
 | File | Purpose |
