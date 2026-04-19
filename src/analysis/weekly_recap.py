@@ -177,6 +177,40 @@ def load_predictions_for_dates(
     return preds
 
 
+def load_clv_for_dates(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Load CLV snapshot files in the date range. Returns one row per bet
+    (closing line = latest snapshot per date × batter)."""
+    files = sorted(PREDICTIONS_DIR.glob("clv_????-??-??.csv"))
+    dfs = []
+    for f in files:
+        date_str = f.stem.replace("clv_", "")
+        try:
+            dt = pd.Timestamp(date_str)
+        except Exception:
+            continue
+        if start <= dt <= end:
+            try:
+                df = pd.read_csv(f)
+                df["game_date"] = dt
+                dfs.append(df)
+            except Exception as e:
+                logger.warning("Could not load %s: %s", f, e)
+
+    if not dfs:
+        return pd.DataFrame()
+    snaps = pd.concat(dfs, ignore_index=True)
+    snaps["snap_time"] = pd.to_datetime(snaps["snap_time"], errors="coerce")
+    closing = (
+        snaps.sort_values("snap_time")
+        .groupby(["game_date", "batter_name"], as_index=False)
+        .tail(1)
+    )
+    return closing
+
+
 def load_outcomes_for_dates(
     start: pd.Timestamp,
     end: pd.Timestamp,
@@ -416,6 +450,7 @@ def print_weekly_report(
     week_start: pd.Timestamp,
     week_end: pd.Timestamp,
     min_edge: float = DEFAULT_MIN_EDGE,
+    clv: Optional[pd.DataFrame] = None,
 ) -> None:
     """Print a formatted weekly recap to stdout."""
     n_total    = len(results)
@@ -526,6 +561,26 @@ def print_weekly_report(
                 f"{_pct(row['roi_1u']):>8}{marker}"
             )
 
+    # --- CLV (Closing Line Value) ---
+    if clv is not None and not clv.empty:
+        n_clv    = len(clv)
+        avg_clv  = clv["clv_pp"].mean()
+        med_clv  = clv["clv_pp"].median()
+        pos_pct  = (clv["clv_pp"] > 0).mean() * 100
+        print(f"\n  ── Closing Line Value  ({n_clv} bets tracked) ──────────────────────")
+        print(f"  Average CLV     : {avg_clv:+.2f}pp")
+        print(f"  Median CLV      : {med_clv:+.2f}pp")
+        print(f"  Positive CLV    : {pos_pct:.1f}%  ({int(round(pos_pct/100*n_clv))}/{n_clv})")
+        if avg_clv > 1.0:
+            verdict = "strong +EV — market moves your way"
+        elif avg_clv > 0:
+            verdict = "mildly +EV — break-even to small profit long-run"
+        elif avg_clv > -1.0:
+            verdict = "~break-even — likely -EV after vig"
+        else:
+            verdict = "-EV — tighten thresholds or reduce volume"
+        print(f"  Verdict         : {verdict}")
+
     # --- Calibration ---
     cal = calibration_table(results)
     if not cal.empty:
@@ -559,6 +614,7 @@ def format_discord_recap(
     week_start: pd.Timestamp,
     week_end: pd.Timestamp,
     min_edge: float = DEFAULT_MIN_EDGE,
+    clv: Optional[pd.DataFrame] = None,
 ) -> list[dict]:
     """Build Discord webhook payloads for the weekly recap."""
     bettable = pd.DataFrame()
@@ -583,21 +639,33 @@ def format_discord_recap(
 
     pnl_emoji = "🟢" if flat_pnl > 0 else ("🔴" if flat_pnl < 0 else "⚪")
 
+    header_fields = [
+        {"name": "Bets Placed",    "value": str(n_bets),              "inline": True},
+        {"name": "Win Rate",       "value": _pct(win_rate),           "inline": True},
+        {"name": "Actual HR Rate", "value": _pct(hr_rate),            "inline": True},
+        {"name": f"{pnl_emoji} Flat P&L",
+         "value": f"{_u(flat_pnl)} (ROI: {_pct(flat_roi)})",         "inline": True},
+        {"name": "Avg Edge",       "value": _pp(avg_edge),            "inline": True},
+        {"name": "Min Edge Used",  "value": _pp(min_edge),            "inline": True},
+    ]
+
+    if clv is not None and not clv.empty:
+        avg_clv = clv["clv_pp"].mean()
+        pos_pct = (clv["clv_pp"] > 0).mean() * 100
+        clv_emoji = "🟢" if avg_clv > 0 else ("🔴" if avg_clv < 0 else "⚪")
+        header_fields.append({
+            "name": f"{clv_emoji} Avg CLV",
+            "value": f"{avg_clv:+.2f}pp ({pos_pct:.0f}% positive, n={len(clv)})",
+            "inline": False,
+        })
+
     header_embed = {
         "title": (
             f"⚾ MLB HR Model — Weekly Recap\n"
             f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
         ),
         "color": colour,
-        "fields": [
-            {"name": "Bets Placed",    "value": str(n_bets),              "inline": True},
-            {"name": "Win Rate",       "value": _pct(win_rate),           "inline": True},
-            {"name": "Actual HR Rate", "value": _pct(hr_rate),            "inline": True},
-            {"name": f"{pnl_emoji} Flat P&L",
-             "value": f"{_u(flat_pnl)} (ROI: {_pct(flat_roi)})",         "inline": True},
-            {"name": "Avg Edge",       "value": _pp(avg_edge),            "inline": True},
-            {"name": "Min Edge Used",  "value": _pp(min_edge),            "inline": True},
-        ],
+        "fields": header_fields,
         "footer": {"text": f"MLB HR Model • Weekly Recap • {week_start.strftime('%Y-W%W')}"},
     }
 
@@ -652,6 +720,7 @@ def post_recap_to_discord(
     week_end: pd.Timestamp,
     min_edge: float = DEFAULT_MIN_EDGE,
     webhook_url: Optional[str] = None,
+    clv: Optional[pd.DataFrame] = None,
 ) -> bool:
     """POST the weekly recap to Discord. Returns True on success."""
     import requests as req
@@ -663,7 +732,7 @@ def post_recap_to_discord(
         logger.warning("No DISCORD_WEBHOOK_URL set — cannot post recap.")
         return False
 
-    payloads = format_discord_recap(results, week_start, week_end, min_edge)
+    payloads = format_discord_recap(results, week_start, week_end, min_edge, clv=clv)
     import time
     for i, payload in enumerate(payloads):
         try:
@@ -753,14 +822,20 @@ def main() -> None:
         print("Could not join predictions to outcomes.")
         return
 
-    print_weekly_report(results, week_start, week_end, min_edge=args.min_edge)
+    clv = load_clv_for_dates(week_start, week_end)
+    if not clv.empty:
+        logger.info("Loaded %d CLV snapshots (closing lines only)", len(clv))
+
+    print_weekly_report(results, week_start, week_end, min_edge=args.min_edge, clv=clv)
 
     if args.save:
         path = save_recap_csv(results, week_start)
         print(f"  Results saved: {path.relative_to(PROJECT_ROOT)}")
 
     if args.discord:
-        sent = post_recap_to_discord(results, week_start, week_end, min_edge=args.min_edge)
+        sent = post_recap_to_discord(
+            results, week_start, week_end, min_edge=args.min_edge, clv=clv,
+        )
         print(f"  Discord: {'posted ✓' if sent else 'failed ✗'}")
 
 

@@ -811,24 +811,34 @@ def main() -> None:
             print(f"No games found for {date_str} — nothing to do.")
             return
 
-        # Fire CLV snapshot if any wave's first pitch is within the window:
-        # from T-lead through T+5min. The trailing +5min grace period handles
-        # cron drift and the fact that books keep lines live briefly after
-        # first pitch (picks for later waves still get clean snapshots).
+        # Fire one CLV snapshot per day — right before the LATEST wave's first
+        # pitch. clv_tracker snapshots every positive-edge pick for the date in
+        # a single pass, so we only need one run per day. Firing per-wave would
+        # cost ~16 credits each = 4×/day = blows past the 500/mo free tier.
         now = now_et()
-        imminent = [
-            w for w in waves
-            if now >= w["earliest"] - timedelta(minutes=CLV_SNAPSHOT_LEAD_MINUTES)
-            and now <= w["earliest"] + timedelta(minutes=5)
-        ]
+        latest_wave = max(waves, key=lambda w: w["earliest"])
+        in_window = (
+            now >= latest_wave["earliest"] - timedelta(minutes=CLV_SNAPSHOT_LEAD_MINUTES)
+            and now <= latest_wave["earliest"] + timedelta(minutes=5)
+        )
 
-        if not imminent:
+        if not in_window:
             now_str = now.strftime("%I:%M %p ET")
-            print(f"[{now_str}] No CLV snapshot due — no wave within {CLV_SNAPSHOT_LEAD_MINUTES} min of first pitch.")
+            fp_str  = latest_wave["earliest"].strftime("%I:%M %p ET")
+            print(
+                f"[{now_str}] No CLV snapshot due — latest wave first pitch {fp_str} "
+                f"(snapshot window opens {CLV_SNAPSHOT_LEAD_MINUTES} min prior)."
+            )
             return
 
-        wave_labels = ", ".join(f"{w['label']}" for w in imminent)
-        print(f"⏰  CLV snapshot — wave(s) imminent: {wave_labels}")
+        # Dedupe: clv_{date}.csv gets written once per snapshot run. If it
+        # already exists for today, we've already snapshotted — skip.
+        clv_file = PREDICTIONS_DIR / f"clv_{date_str}.csv"
+        if clv_file.exists():
+            print(f"CLV snapshot already taken for {date_str} ({clv_file.name}) — skipping.")
+            return
+
+        print(f"⏰  CLV snapshot — latest wave imminent: {latest_wave['label']}")
 
         cmd = [sys.executable, "-m", "src.analysis.clv_tracker", "--date", date_str]
         if args.dry_run:
