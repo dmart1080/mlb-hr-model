@@ -450,7 +450,7 @@ def run_pass(
         cmd_str = (
             f"python -m src.features.build_today_features"
             + (" --force-refresh" if force_refresh else "")
-            + f"\npython -m src.model.predict --run-type {predict_run_type}"
+            + f"\npython -m src.model.predict --date {date_str} --run-type {predict_run_type}"
             + (" --force-refresh" if force_refresh else "")
         )
         print(f"\n  [DRY RUN] Would run:\n    {cmd_str}")
@@ -488,7 +488,7 @@ def run_pass(
     # ------------------------------------------------------------------
     # Step 2: Score
     # ------------------------------------------------------------------
-    cmd = [sys.executable, "-m", "src.model.predict", "--run-type", predict_run_type]
+    cmd = [sys.executable, "-m", "src.model.predict", "--date", date_str, "--run-type", predict_run_type]
     if force_refresh:
         cmd.append("--force-refresh")
 
