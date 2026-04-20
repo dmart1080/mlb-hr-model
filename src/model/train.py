@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import glob
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,11 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PREDICTIONS_DIR = PROJECT_ROOT / "data" / "predictions"
 MODELS_DIR    = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Marker tracking the train_table.game_date.max() of the last successful train.
+# Committed with the model so the VPS's daily cron can skip when no new
+# Statcast data has landed since the last monthly_retrain.ps1.
+TRAIN_MARKER  = MODELS_DIR / "last_trained_game_date.txt"
 
 TEST_START_DATE = "2026-03-26"
 
@@ -177,6 +183,64 @@ def latest_train_table() -> Path:
         raise FileNotFoundError("No non-empty train_table_*.parquet found in data/processed/")
     files.sort(key=lambda p: p.stat().st_size, reverse=True)
     return files[0]
+
+
+def _train_table_max_date(train_path: Path) -> str | None:
+    """Return max game_date in the parquet as 'YYYY-MM-DD', or None if unreadable."""
+    try:
+        df = pd.read_parquet(train_path, columns=["game_date"])
+        if df.empty:
+            return None
+        return pd.to_datetime(df["game_date"]).max().strftime("%Y-%m-%d")
+    except Exception as e:
+        logger.warning("Could not read game_date from %s: %s", train_path.name, e)
+        return None
+
+
+def should_retrain(train_path: Path, *, force: bool = False) -> bool:
+    """
+    Silent retrain guard. Returns False (skip) when the train table's latest
+    game_date is not newer than the marker written by the last successful
+    train. The marker is committed alongside the model so VPS git-pulls
+    deploy it automatically; the VPS cron then no-ops until the next
+    monthly_retrain.ps1 advances the parquet.
+    """
+    if force:
+        return True
+    if not TRAIN_MARKER.exists():
+        return True
+    current = _train_table_max_date(train_path)
+    if current is None:
+        return True
+    try:
+        last = TRAIN_MARKER.read_text().strip()
+    except Exception:
+        return True
+    if not last:
+        return True
+    if current <= last:
+        logger.info(
+            "Skipping retrain: train table max game_date=%s not newer than "
+            "last trained=%s. Run with --force to retrain anyway.",
+            current, last,
+        )
+        return False
+    logger.info(
+        "Retrain warranted: train table advanced from %s → %s.",
+        last, current,
+    )
+    return True
+
+
+def _update_train_marker(train_path: Path) -> None:
+    current = _train_table_max_date(train_path)
+    if not current:
+        return
+    try:
+        TRAIN_MARKER.write_text(current + "\n")
+        logger.info("Train marker updated: last_trained_game_date=%s", current)
+    except Exception as e:
+        logger.warning("Could not update train marker: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1079,8 @@ if __name__ == "__main__":
                         help=f"Number of Optuna trials (default {_TUNE_N_TRIALS})")
     parser.add_argument("--tune-timeout", type=int, default=_TUNE_TIMEOUT,
                         help=f"Optuna timeout in seconds (default {_TUNE_TIMEOUT})")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass the retrain guard and always retrain")
     args = parser.parse_args()
 
     if args.tune:
@@ -1023,6 +1089,11 @@ if __name__ == "__main__":
 
     configure_logging()
     train_path = latest_train_table()
+
+    if not should_retrain(train_path, force=args.force):
+        sys.exit(0)
+
     logger.info("Training from: %s", train_path.name)
     result = train_baseline(train_path, tune=args.tune)
     print_summary(train_path, result.model_path, result.feature_cols, result.metrics, result.extra)
+    _update_train_marker(train_path)

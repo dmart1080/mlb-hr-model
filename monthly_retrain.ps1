@@ -149,6 +149,12 @@ if (-not $DryRun) {
     # Stage model and any changed source files
     Run "git add models\hr_model_lightgbm_calibrated_2021_2026.joblib" "Stage model"
 
+    # Stage the train marker so the VPS's daily cron sees the updated
+    # last-trained game_date and no-ops until the next monthly retrain.
+    if (Test-Path "models\last_trained_game_date.txt") {
+        Run "git add models\last_trained_game_date.txt" "Stage train marker"
+    }
+
     # Also stage any modified source files
     $changed = git diff --name-only 2>$null
     if ($changed) {
