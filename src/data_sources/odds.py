@@ -73,6 +73,13 @@ _VIG_PCT         = 0.035
 _FUZZY_THRESHOLD = 85
 _DEFAULT_BOOK    = "draftkings"
 
+# Odds API returns 401 for quota-exhausted and 429 for rate-limit.
+_QUOTA_STATUSES = {401, 429}
+
+
+class OddsApiQuotaExceeded(Exception):
+    """Raised when the Odds API responds with a quota/rate-limit status."""
+
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -89,6 +96,62 @@ def _cache_is_fresh(date_str: str) -> bool:
     mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
     age_h = (datetime.now(tz=timezone.utc) - mtime).total_seconds() / 3600
     return age_h < _CACHE_TTL_HOURS
+
+
+def _load_stale_fallback(date_str: str) -> list[dict]:
+    """
+    Return the most recent cached odds when live fetch is unavailable.
+    Preference order:
+      1. Today's cache (ignoring TTL) — same-day lines even if hours old.
+      2. Most recent cache of any prior date — yesterday's lines as last resort.
+      3. [] — no cache anywhere; caller runs without edge/EV.
+    """
+    today = _cache_path(date_str)
+    if today.exists():
+        try:
+            with open(today) as f:
+                stored = json.load(f)
+            props = stored.get("props", [])
+            if props:
+                logger.warning(
+                    "Odds API unavailable — using stale today-cache for %s "
+                    "(fetched %s, %d props).",
+                    date_str, stored.get("fetched_at", "?"), len(props),
+                )
+                return props
+        except Exception as e:
+            logger.warning("Could not read stale today-cache: %s", e)
+
+    try:
+        candidates = sorted(
+            CACHE_DIR.glob("odds_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        candidates = []
+    for cand in candidates:
+        if cand.name == f"odds_{date_str}.json":
+            continue
+        try:
+            with open(cand) as f:
+                stored = json.load(f)
+            props = stored.get("props", [])
+            if not props:
+                continue  # skip empty caches — keep searching for one with data
+            logger.warning(
+                "Odds API unavailable and no cache for %s — falling back to "
+                "%s (fetched %s, %d props). Lines may be significantly stale.",
+                date_str, cand.name, stored.get("fetched_at", "?"), len(props),
+            )
+            return props
+        except Exception as e:
+            logger.warning("Could not read fallback cache %s: %s", cand.name, e)
+
+    logger.warning(
+        "No odds cache available anywhere — predict will run without edge/EV."
+    )
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +205,12 @@ def _fetch_events_for_date(date_str: str, api_key: str) -> list[dict]:
         logger.warning("Odds API events timeout date=%s: %s", date_str, e)
         return []
     except requests.HTTPError as e:
-        logger.warning("Odds API events HTTP %d date=%s", e.response.status_code, date_str)
+        status = e.response.status_code
+        if status in _QUOTA_STATUSES:
+            raise OddsApiQuotaExceeded(
+                f"HTTP {status} from Odds API /events (quota or rate-limit)"
+            ) from e
+        logger.warning("Odds API events HTTP %d date=%s", status, date_str)
         return []
     except Exception as e:
         logger.error("Odds API events fetch failed date=%s: %s", date_str, e)
@@ -165,7 +233,12 @@ def _fetch_props_for_event(event_id: str, api_key: str) -> list[dict]:
         logger.warning("Odds API props timeout event=%s: %s", event_id, e)
         return []
     except requests.HTTPError as e:
-        logger.warning("Odds API props HTTP %d event=%s", e.response.status_code, event_id)
+        status = e.response.status_code
+        if status in _QUOTA_STATUSES:
+            raise OddsApiQuotaExceeded(
+                f"HTTP {status} from Odds API /odds (quota or rate-limit)"
+            ) from e
+        logger.warning("Odds API props HTTP %d event=%s", status, event_id)
         return []
     except Exception as e:
         logger.error("Odds API props fetch failed event=%s: %s", event_id, e)
@@ -299,22 +372,35 @@ def fetch_hr_props(
         key = _get_api_key(api_key)
     except EnvironmentError as e:
         logger.warning("%s", e)
-        return []
+        return _load_stale_fallback(date_str)
 
     logger.info("Fetching HR props from Odds API for %s ...", date_str)
-    events = _fetch_events_for_date(date_str, key)
+    try:
+        events = _fetch_events_for_date(date_str, key)
+    except OddsApiQuotaExceeded as e:
+        logger.warning("Odds API quota exhausted on events fetch: %s", e)
+        return _load_stale_fallback(date_str)
 
     if not events:
         logger.warning("No events found for %s — odds will be unavailable", date_str)
-        return []
+        return _load_stale_fallback(date_str)
 
     all_props: list[dict] = []
+    quota_hit = False
     for event in events:
         event_id = event.get("id")
         if not event_id:
             continue
-        bookmakers = _fetch_props_for_event(event_id, key)
-        props      = _parse_bookmaker_props(bookmakers)
+        try:
+            bookmakers = _fetch_props_for_event(event_id, key)
+        except OddsApiQuotaExceeded as e:
+            logger.warning(
+                "Odds API quota exhausted during props loop (%d/%d events done): %s",
+                len(all_props), len(events), e,
+            )
+            quota_hit = True
+            break
+        props = _parse_bookmaker_props(bookmakers)
         all_props.extend(props)
         logger.debug("Event %s (%s vs %s): %d props",
                      event_id,
@@ -322,16 +408,22 @@ def fetch_hr_props(
                      event.get("home_team", "?"),
                      len(props))
 
+    if quota_hit and not all_props:
+        return _load_stale_fallback(date_str)
+
     logger.info("Odds API: fetched %d HR props across %d events for %s",
                 len(all_props), len(events), date_str)
 
-    payload = {
-        "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-        "date":       date_str,
-        "props":      all_props,
-    }
-    with open(cache, "w") as f:
-        json.dump(payload, f, indent=2)
+    # Don't overwrite a valid prior cache with an empty result — keeps the
+    # stale-fallback path usable on later retries within the same day.
+    if all_props:
+        payload = {
+            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+            "date":       date_str,
+            "props":      all_props,
+        }
+        with open(cache, "w") as f:
+            json.dump(payload, f, indent=2)
 
     return all_props
 
