@@ -353,10 +353,17 @@ def build_today_features(
     )
 
     # If cached rosters were written before lineups were posted they'll be
-    # empty forever (no TTL). Retry once with force_refresh when no batting
-    # orders came back so cron self-heals later in the day.
-    if not force_refresh and (batting_df is None or batting_df.empty):
-        logger.info("Cached rosters empty — retrying with force_refresh=True")
+    # empty forever (no TTL). Retry with force_refresh when ANY game is
+    # missing batting orders — checking global emptiness misses the common
+    # case where one early/final game already has orders cached but later
+    # games do not.
+    games_covered = set(batting_df["game_pk"].astype(int).unique()) if batting_df is not None and not batting_df.empty else set()
+    games_missing = [gp for gp in game_pks if gp not in games_covered]
+    if not force_refresh and games_missing:
+        logger.info(
+            "Cached rosters missing batting orders for %d/%d games — retrying with force_refresh=True",
+            len(games_missing), len(game_pks),
+        )
         starters_df, batting_df = fetch_rosters_for_games(
             game_pks, force_refresh=True
         )
