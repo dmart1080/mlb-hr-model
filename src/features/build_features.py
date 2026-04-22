@@ -11,6 +11,7 @@ import pandas as pd
 
 from src.data_sources.statcast import fetch_statcast_events, REGULAR_SEASON_GAME_TYPE
 from src.data_sources.mlb_schedule import fetch_rosters_for_games, enrich_labels_with_roster
+from src.data_sources.mlb_umpires import fetch_hp_umpires_for_games
 from src.features.build_labels import build_batter_game_labels
 from src.features.park_factors import get_park_factors, DEFAULT_PARK_FACTOR
 from src.features.build_features_common import (
@@ -1580,6 +1581,19 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     # FIX 1 (part b): pass full pa_df (not target_pa) so at_bat_number is
     # present and the starter_pitcher_id join works correctly.
     labels = _compute_relief_pa_pct(pa_df, labels)
+
+    # ------------------------------------------------------------------
+    # Home-plate umpire (cached per game_pk; populated on new month-builds,
+    # NaN in older cached parquets until a one-off backfill is run)
+    # ------------------------------------------------------------------
+    logger.info("Fetching HP umpires for %d games ...", len(target_game_pks))
+    ump_df = fetch_hp_umpires_for_games(target_game_pks)
+    if not ump_df.empty:
+        ump_df["game_pk"] = ump_df["game_pk"].astype(int)
+        labels = labels.merge(ump_df, on="game_pk", how="left")
+    else:
+        labels["hp_ump_id"]   = pd.NA
+        labels["hp_ump_name"] = pd.NA
 
     # ------------------------------------------------------------------
     # Weather

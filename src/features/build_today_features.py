@@ -53,6 +53,7 @@ from src.data_sources.mlb_schedule import (
     _EXPECTED_PA_DEFAULT,
 )
 from src.data_sources.weather import INDOOR_PARKS
+from src.data_sources.mlb_umpires import fetch_hp_umpires_for_games
 from src.features.park_factors import get_park_factors, DEFAULT_PARK_FACTOR
 from src.features.build_features import fetch_weather_for_games_fast, _compute_park_direction_factor
 
@@ -373,6 +374,17 @@ def build_today_features(
         zip(schedule_df["game_pk"].astype(int), schedule_df["home_team"])
     )
 
+    # HP umpire per game. Assignment is usually posted a few hours before
+    # first pitch; empty rows stay NaN and LightGBM handles them.
+    ump_df = fetch_hp_umpires_for_games(game_pks, force_refresh=force_refresh)
+    ump_by_game: dict[int, dict] = {
+        int(row["game_pk"]): {
+            "hp_ump_id":   None if pd.isna(row["hp_ump_id"]) else int(row["hp_ump_id"]),
+            "hp_ump_name": row["hp_ump_name"],
+        }
+        for _, row in ump_df.iterrows()
+    }
+
     # ------------------------------------------------------------------
     # 3. Build matchup rows: one per (game_pk, batter, pitcher)
     # ------------------------------------------------------------------
@@ -432,6 +444,7 @@ def build_today_features(
             if pitcher_id is None or pd.isna(pitcher_id):
                 pitcher_id = None  # will be filled with league avg
 
+            ump_info = ump_by_game.get(gp, {})
             rows.append({
                 "game_date":              target_ts,
                 "game_pk":                gp,
@@ -449,6 +462,8 @@ def build_today_features(
                 "p_is_short_rest":        0,
                 "b_days_rest":            _LEAGUE_FILL["b_days_rest"],
                 "p_days_rest":            _LEAGUE_FILL["p_days_rest"],
+                "hp_ump_id":              ump_info.get("hp_ump_id"),
+                "hp_ump_name":            ump_info.get("hp_ump_name"),
             })
 
     if not rows:
