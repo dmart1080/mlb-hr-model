@@ -221,7 +221,11 @@ def _fetch_props_for_event(event_id: str, api_key: str) -> list[dict]:
     url = f"{_API_BASE}/sports/{_SPORT}/events/{event_id}/odds"
     params = {
         "apiKey":     api_key,
-        "regions":    "us",
+        # us+us2: HR-prop coverage in `us` collapsed (most books moved out
+        # or are gated behind higher tiers). `us2` still has espnbet/Fanatics/
+        # HardRock for batter_home_runs. Without us2 we get 0 books → credits
+        # burned for nothing → stale-cache fallback locks in week-old prices.
+        "regions":    "us,us2",
         "markets":    _MARKET,
         "oddsFormat": "american",
     }
