@@ -37,6 +37,7 @@ Edge cases handled
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from datetime import date, datetime
 from pathlib import Path
@@ -63,7 +64,29 @@ PROJECT_ROOT  = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
+# Target-encoded ump HR factor lookup — produced by train.py. Missing file
+# or missing ump → factor 1.0 (league-average neutral).
+UMP_FACTOR_LOOKUP = PROJECT_ROOT / "models" / "ump_factor_lookup.json"
+
 ET = ZoneInfo("America/New_York")
+
+
+def _load_ump_factor_lookup() -> dict[int, float]:
+    if not UMP_FACTOR_LOOKUP.exists():
+        return {}
+    try:
+        with open(UMP_FACTOR_LOOKUP) as f:
+            raw = json.load(f)
+    except Exception as e:
+        logger.warning("Could not read %s: %s", UMP_FACTOR_LOOKUP.name, e)
+        return {}
+    out: dict[int, float] = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = float(v)
+        except (TypeError, ValueError):
+            continue   # drops _league_hr_rate sentinel
+    return out
 
 # League-average fill values used when a player has no history in the
 # train table.  Mirrors the priors in train.py / build_features_common.py.
@@ -652,6 +675,20 @@ def build_today_features(
     }
     stat_cols = [c for c in today_df.columns if c not in non_stat]
     today_df[stat_cols] = today_df[stat_cols].fillna(0.0)
+
+    # Map HP ump id → target-encoded HR factor (1.0 = league average).
+    # Default to 1.0 for unknown umps (and for 0, which is how missing IDs
+    # land after the fillna above).
+    ump_factor_lookup = _load_ump_factor_lookup()
+    if "hp_ump_id" in today_df.columns:
+        today_df["hp_ump_hr_factor"] = (
+            today_df["hp_ump_id"]
+            .map(ump_factor_lookup)
+            .astype(float)
+            .fillna(1.0)
+        )
+    else:
+        today_df["hp_ump_hr_factor"] = 1.0
 
     today_df["game_date"] = pd.to_datetime(today_df["game_date"]).dt.date
 

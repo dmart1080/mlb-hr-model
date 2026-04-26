@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -37,6 +38,16 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # Committed with the model so the VPS's daily cron can skip when no new
 # Statcast data has landed since the last monthly_retrain.ps1.
 TRAIN_MARKER  = MODELS_DIR / "last_trained_game_date.txt"
+
+# Target-encoded HP umpire HR factor lookup (ump_id -> factor). Computed from
+# the train_core split only to avoid leakage, then merged as a numeric feature.
+# build_today_features.py reads the same file at inference time so unseen umps
+# default to factor=1.0 (league-average).
+UMP_FACTOR_LOOKUP    = MODELS_DIR / "ump_factor_lookup.json"
+# Smoothing constant for the ump HR factor (pseudo-PAs of prior at league avg).
+# With ~3k PAs per season per full-time ump, k=500 gives real umps most of
+# their signal while pulling 1-game umps firmly toward 1.0.
+_UMP_FACTOR_SMOOTHING = 500
 
 TEST_START_DATE = "2026-03-26"
 
@@ -241,6 +252,68 @@ def _update_train_marker(train_path: Path) -> None:
         logger.info("Train marker updated: last_trained_game_date=%s", current)
     except Exception as e:
         logger.warning("Could not update train marker: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# HP umpire target encoding
+#
+# For each ump: smoothed HR rate / league HR rate → unitless multiplier where
+# 1.0 == league average, >1 means HR-friendly, <1 means HR-suppressing.
+# Computed from the train_core split ONLY so the test set stays clean.
+# ---------------------------------------------------------------------------
+
+def _compute_ump_factor_lookup(
+    train_core_df: pd.DataFrame,
+    *,
+    smoothing: int = _UMP_FACTOR_SMOOTHING,
+) -> dict:
+    if "hp_ump_id" not in train_core_df.columns:
+        logger.info("No hp_ump_id column — skipping ump factor encoding.")
+        return {"_league_hr_rate": float(train_core_df["hr_hit"].mean())}
+
+    df = train_core_df[["hp_ump_id", "hr_hit"]].dropna(subset=["hp_ump_id"])
+    if df.empty:
+        logger.info("No populated hp_ump_id in train_core — skipping ump factor encoding.")
+        return {"_league_hr_rate": float(train_core_df["hr_hit"].mean())}
+
+    league = float(df["hr_hit"].mean())
+    grouped = df.groupby("hp_ump_id")["hr_hit"].agg(["mean", "count"])
+    # Bayesian shrinkage to league avg with `smoothing` pseudo-PAs
+    smoothed = (
+        (grouped["mean"] * grouped["count"] + league * smoothing)
+        / (grouped["count"] + smoothing)
+    )
+    factors = (smoothed / league).astype(float)
+
+    lookup: dict = {int(k): float(v) for k, v in factors.items()}
+    lookup["_league_hr_rate"] = league
+    logger.info(
+        "Ump factor lookup: %d umps, league HR rate=%.4f, factor range=[%.3f, %.3f]",
+        len(factors), league, float(factors.min()), float(factors.max()),
+    )
+    return lookup
+
+
+def _apply_ump_factor(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
+    """Return df with hp_ump_hr_factor column; default 1.0 for unknown umps."""
+    df = df.copy()
+    if "hp_ump_id" not in df.columns:
+        df["hp_ump_hr_factor"] = 1.0
+        return df
+    id_series = df["hp_ump_id"]
+    # Drop the sentinel league-rate key before mapping
+    id_to_factor = {k: v for k, v in lookup.items() if isinstance(k, int)}
+    df["hp_ump_hr_factor"] = id_series.map(id_to_factor).astype(float).fillna(1.0)
+    return df
+
+
+def _save_ump_factor_lookup(lookup: dict) -> None:
+    try:
+        with open(UMP_FACTOR_LOOKUP, "w") as f:
+            json.dump({str(k): v for k, v in lookup.items()}, f)
+        logger.info("Ump factor lookup saved: %s", UMP_FACTOR_LOOKUP.name)
+    except Exception as e:
+        logger.warning("Could not save ump factor lookup: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +786,14 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
     logger.info("Applying empirical Bayes shrinkage to rate features ...")
     df = apply_shrinkage(df)
 
+    # Normalize ump id dtype (Int64 survives fillna(0) and works as LGBM
+    # categorical) and seed the factor column as league-average so the
+    # feature-availability filter below doesn't drop it. Real factors get
+    # injected after the train/calib split via _apply_ump_factor().
+    if "hp_ump_id" in df.columns:
+        df["hp_ump_id"] = df["hp_ump_id"].astype("Int64")
+    df["hp_ump_hr_factor"] = 1.0
+
     feature_cols = [
         "b_hr_rate_14", "b_barrel_rate_14", "b_ev_mean_14", "b_la_mean_14",
         "b_hardhit_rate_14", "b_fb_rate_14", "b_k_rate_14", "b_bb_rate_14",
@@ -810,6 +891,15 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         "team_hr_x_batter_barrel", "team_hr_x_sweet_spot",
         # Ballpark direction factor
         "park_pull_factor", "pull_x_park_direction",
+        # HP umpire features — disabled 2026-04-26 after smoke runs.
+        # Both raw hp_ump_id (LGBM categorical) and target-encoded
+        # hp_ump_hr_factor underperformed the no-ump baseline on the
+        # 2024-09 → 2025-09 test window (ROC-AUC −0.003, top-1% lift −0.15).
+        # Data is still collected (hp_ump_id column populated on every parquet
+        # row) and the factor lookup / merge code is left intact, so flipping
+        # this back on is one line. Re-evaluate after a longer test window
+        # accumulates 2026 data.
+        # "hp_ump_hr_factor",
     ]
 
     available = set(df.columns)
@@ -867,6 +957,18 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
 
     train_core_df, calib_df = pct_time_split(train_df, test_size=0.2)
 
+    # Target-encode HP ump HR factor from train_core only to keep calib/test
+    # leakage-free, then inject into every split and persist the lookup for
+    # inference (build_today_features.py reads the same JSON).
+    ump_factor_lookup = _compute_ump_factor_lookup(train_core_df)
+    train_core_df     = _apply_ump_factor(train_core_df, ump_factor_lookup)
+    calib_df          = _apply_ump_factor(calib_df,      ump_factor_lookup)
+    test_df           = _apply_ump_factor(test_df,       ump_factor_lookup)
+    _save_ump_factor_lookup(ump_factor_lookup)
+
+    # LGBM categoricals (empty if hp_ump_id wasn't present / was filtered out)
+    lgbm_categorical = [c for c in ["hp_ump_id"] if c in feature_cols]
+
     X_train_core = train_core_df[feature_cols].fillna(0.0)
     y_train_core = train_core_df["hr_hit"].astype(int)
     X_calib      = calib_df[feature_cols].fillna(0.0)
@@ -906,12 +1008,14 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         )
 
     lgbm = LGBMClassifier(**lgbm_params)
-    lgbm.fit(
-        X_train_core, y_train_core,
+    lgbm_fit_kwargs = dict(
         eval_set=[(X_calib, y_calib)],
         eval_metric="auc",
         callbacks=[early_stopping(50, verbose=False), log_evaluation(period=-1)],
     )
+    if lgbm_categorical:
+        lgbm_fit_kwargs["categorical_feature"] = lgbm_categorical
+    lgbm.fit(X_train_core, y_train_core, **lgbm_fit_kwargs)
     logger.info("LightGBM best iteration: %d", lgbm.best_iteration_)
     p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
     roc_lgbm_raw    = float(roc_auc_score(y_test, p_test_lgbm_raw))
@@ -928,17 +1032,20 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
             len(zero_imp), zero_imp,
         )
         feature_cols = [c for c in feature_cols if c not in zero_imp]
+        lgbm_categorical = [c for c in lgbm_categorical if c in feature_cols]
         X_train_core = train_core_df[feature_cols].fillna(0.0)
         X_calib      = calib_df[feature_cols].fillna(0.0)
         X_test       = test_df[feature_cols].fillna(0.0)
 
         lgbm = LGBMClassifier(**lgbm_params)
-        lgbm.fit(
-            X_train_core, y_train_core,
+        lgbm_fit_kwargs = dict(
             eval_set=[(X_calib, y_calib)],
             eval_metric="auc",
             callbacks=[early_stopping(50, verbose=False), log_evaluation(period=-1)],
         )
+        if lgbm_categorical:
+            lgbm_fit_kwargs["categorical_feature"] = lgbm_categorical
+        lgbm.fit(X_train_core, y_train_core, **lgbm_fit_kwargs)
         p_test_lgbm_raw = lgbm.predict_proba(X_test)[:, 1]
         roc_lgbm_pruned = float(roc_auc_score(y_test, p_test_lgbm_raw))
         logger.info(

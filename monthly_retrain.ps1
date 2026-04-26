@@ -155,6 +155,12 @@ if (-not $DryRun) {
         Run "git add models\last_trained_game_date.txt" "Stage train marker"
     }
 
+    # Stage the HP ump target-encoding lookup so VPS inference can apply
+    # the same hp_ump_hr_factor used at train time.
+    if (Test-Path "models\ump_factor_lookup.json") {
+        Run "git add models\ump_factor_lookup.json" "Stage ump factor lookup"
+    }
+
     # Also stage any modified source files
     $changed = git diff --name-only 2>$null
     if ($changed) {
