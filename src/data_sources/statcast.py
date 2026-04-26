@@ -44,6 +44,13 @@ REQUIRED_CACHE_COLS = {
 REGULAR_SEASON_GAME_TYPE = "R"
 
 
+# Default freshness window — Statcast revises pitch classifications and
+# batted-ball outcomes for ~1-2 days after a game, and late West Coast games
+# may not be fully ingested until ~6am ET the next day. Within this window
+# we always re-fetch and overwrite the cache; older dates are trusted.
+DEFAULT_FRESH_WINDOW_DAYS = 3
+
+
 def fetch_statcast_events(
     start_date: str,
     end_date: str,
@@ -51,29 +58,115 @@ def fetch_statcast_events(
     force_refresh: bool = False,
     columns: Optional[list[str]] = None,
     regular_season_only: bool = True,
+    fresh_window_days: int = DEFAULT_FRESH_WINDOW_DAYS,
 ) -> StatcastFetchResult:
     """
     Download Statcast events between start_date and end_date (inclusive),
     cache the results, and return a DataFrame.
+
+    Freshness handling
+    ------------------
+    Recent dates (within `fresh_window_days` of today) are always re-fetched
+    and the cache for those dates is overwritten on every call. Older dates
+    are trusted from cache. When the requested range straddles the cutoff,
+    the call is split: an "old" sub-range (cached) plus a "fresh" sub-range
+    (re-downloaded), each written to its own range-keyed cache file. The
+    existing cache layout is preserved — we just may produce two files
+    instead of one for straddling requests.
+
+    Set `fresh_window_days=0` to fully trust cache (useful for backfills /
+    reproducible runs). `force_refresh=True` overrides everything and
+    re-downloads the entire requested range as a single file.
 
     Parameters
     ----------
     start_date : str  YYYY-MM-DD
     end_date   : str  YYYY-MM-DD
     force_refresh : bool
-        If True, re-download even if cached file exists.
+        If True, re-download the full requested range as a single file,
+        bypassing the freshness split.
     columns : Optional[list[str]]
         If provided, returns only these columns (if they exist).
     regular_season_only : bool  (default True)
         If True, filter to game_type == 'R' before returning.
-        This excludes spring training (S), postseason (F/D/L/W),
-        All-Star (A), and exhibition (E) games.
-        The full dataset is still cached so the filter can be changed
-        without re-downloading.
+        Full unfiltered dataset is still cached.
+    fresh_window_days : int  (default 3)
+        Days back from today that are always re-fetched. 0 = trust cache.
     """
     start_date = _normalize_date(start_date)
     end_date   = _normalize_date(end_date)
 
+    if force_refresh or fresh_window_days <= 0:
+        # No split — single-range path with whatever force_refresh the
+        # caller asked for. This is also the recursive base case.
+        return _fetch_single_range(
+            start_date, end_date,
+            force_refresh=force_refresh,
+            columns=columns,
+            regular_season_only=regular_season_only,
+        )
+
+    today  = pd.Timestamp.today().normalize()
+    cutoff = (today - pd.Timedelta(days=fresh_window_days)).strftime("%Y-%m-%d")
+    # `cutoff` is the first day we no longer trust the cache for.
+
+    if end_date < cutoff:
+        logger.info(
+            "Statcast cache: trusting [%s, %s] (all older than %s)",
+            start_date, end_date, cutoff,
+        )
+        return _fetch_single_range(
+            start_date, end_date,
+            force_refresh=False,
+            columns=columns,
+            regular_season_only=regular_season_only,
+        )
+
+    if start_date >= cutoff:
+        logger.info(
+            "Statcast cache: refreshing [%s, %s] (within %d-day fresh window)",
+            start_date, end_date, fresh_window_days,
+        )
+        return _fetch_single_range(
+            start_date, end_date,
+            force_refresh=True,
+            columns=columns,
+            regular_season_only=regular_season_only,
+        )
+
+    # Straddle: split at the cutoff.
+    older_end = (pd.to_datetime(cutoff) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    logger.info(
+        "Statcast cache: trusting [%s, %s], refreshing [%s, %s]",
+        start_date, older_end, cutoff, end_date,
+    )
+    older = _fetch_single_range(
+        start_date, older_end,
+        force_refresh=False,
+        columns=columns,
+        regular_season_only=regular_season_only,
+    )
+    fresh = _fetch_single_range(
+        cutoff, end_date,
+        force_refresh=True,
+        columns=columns,
+        regular_season_only=regular_season_only,
+    )
+    df = pd.concat([older.df, fresh.df], ignore_index=True)
+    # Report the fresh-side cache_path (more useful for debugging recent issues)
+    # and from_cache=False because at least part of the result was re-fetched.
+    return StatcastFetchResult(df=df, cache_path=fresh.cache_path, from_cache=False)
+
+
+def _fetch_single_range(
+    start_date: str,
+    end_date: str,
+    *,
+    force_refresh: bool,
+    columns: Optional[list[str]],
+    regular_season_only: bool,
+) -> StatcastFetchResult:
+    """Single (start, end) range fetch with the original cache logic."""
     cache_path = CACHE_DIR / _cache_filename(start_date, end_date)
 
     if cache_path.exists() and not force_refresh:
