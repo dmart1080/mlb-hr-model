@@ -73,6 +73,28 @@ _VIG_PCT         = 0.035
 _FUZZY_THRESHOLD = 85
 _DEFAULT_BOOK    = "draftkings"
 
+# Books the user actually has accounts at — best-line shopping only
+# considers these. Anything else returned by the Odds API is skipped at
+# parse time (avoids the case where an inflated outlier price from a book
+# you can't actually use makes a fake edge look real).
+#
+# Keys must match The Odds API's bookmaker keys exactly (lowercase). To
+# verify what your plan returns, inspect a fresh fetch's `all_books` field.
+# Empty set / None disables the filter (consider all books).
+_PREFERRED_BOOKMAKERS: set[str] = {
+    "fanduel",
+    "draftkings",
+    "betrivers",
+    "betparx",
+    "fanatics",
+    "bet365",
+    "prophetx",
+    # Caesars uses the legacy 'williamhill_us' key on some plans;
+    # include both so renames don't silently drop it.
+    "williamhill_us",
+    "caesars",
+}
+
 # Odds API returns 401 for quota-exhausted and 429 for rate-limit.
 _QUOTA_STATUSES = {401, 429}
 
@@ -297,8 +319,12 @@ def _parse_bookmaker_props(
     # Structure: {batter_name: {book_key: {"over": int, "under": int, "line": float}}}
     all_prices: dict[str, dict[str, dict]] = {}
 
+    skipped_keys: set[str] = set()
     for book in bookmakers:
         book_key = book.get("key", "unknown")
+        if _PREFERRED_BOOKMAKERS and book_key not in _PREFERRED_BOOKMAKERS:
+            skipped_keys.add(book_key)
+            continue
         for market in book.get("markets", []):
             if market.get("key") != _MARKET:
                 continue
@@ -380,6 +406,11 @@ def _parse_bookmaker_props(
                          best["over"] - min(bp["over"] for bp in book_prices.values()),
                          prices_str)
 
+    if skipped_keys:
+        logger.debug(
+            "Skipped %d non-preferred books: %s",
+            len(skipped_keys), sorted(skipped_keys),
+        )
     return rows
 
 
