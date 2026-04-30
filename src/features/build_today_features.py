@@ -471,10 +471,14 @@ def build_today_features(
             rows.append({
                 "game_date":              target_ts,
                 "game_pk":                gp,
+                # ISO UTC start time — used to disambiguate doubleheader
+                # games when joining odds.
+                "game_datetime":          game.get("game_datetime"),
                 "batter":                 batter_id,
                 "pitcher":                int(pitcher_id) if pitcher_id is not None else None,
                 "probable_pitcher_name":  pitcher_name,
                 "home_team":              home,
+                "away_team":              away,
                 "batter_team":            home if is_home else away,
                 "is_home_game":           is_home,
                 "batting_order_pos":      bat_order,

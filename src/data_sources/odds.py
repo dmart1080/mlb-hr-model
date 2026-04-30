@@ -95,7 +95,25 @@ def _cache_is_fresh(date_str: str) -> bool:
         return False
     mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
     age_h = (datetime.now(tz=timezone.utc) - mtime).total_seconds() / 3600
-    return age_h < _CACHE_TTL_HOURS
+    if age_h >= _CACHE_TTL_HOURS:
+        return False
+    # Format check: caches written before event-metadata stamping have no
+    # `commence_time` on their props, which means doubleheader matching
+    # would silently fall back to name-only and pick the wrong game's
+    # price. Treat those as stale so they get re-fetched once.
+    try:
+        with open(p) as f:
+            stored = json.load(f)
+        props = stored.get("props", [])
+        if props and "commence_time" not in props[0]:
+            logger.info(
+                "Odds cache for %s is pre-event-metadata format — re-fetching",
+                date_str,
+            )
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def _load_stale_fallback(date_str: str) -> list[dict]:
@@ -249,7 +267,10 @@ def _fetch_props_for_event(event_id: str, api_key: str) -> list[dict]:
         return []
 
 
-def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
+def _parse_bookmaker_props(
+    bookmakers: list[dict],
+    event: Optional[dict] = None,
+) -> list[dict]:
     """
     Extract HR prop rows from the bookmakers list.
 
@@ -260,8 +281,17 @@ def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
     reference and debugging.
 
     Uses the updated _VIG_PCT (3.5%) for fair probability calculation.
+
+    `event` carries the Odds API event metadata (id, commence_time, home_team,
+    away_team) so each prop can be tied back to its specific game — required
+    to keep doubleheader pricing distinct.
     """
     now_iso = datetime.now(tz=timezone.utc).isoformat()
+    event = event or {}
+    event_id        = event.get("id")
+    commence_time   = event.get("commence_time")
+    event_home_team = event.get("home_team")
+    event_away_team = event.get("away_team")
 
     # Collect all prices per batter across all books
     # Structure: {batter_name: {book_key: {"over": int, "under": int, "line": float}}}
@@ -334,6 +364,11 @@ def _parse_bookmaker_props(bookmakers: list[dict]) -> list[dict]:
             "bookmaker":         best_book,
             "fetched_at":        now_iso,
             "all_books":         book_prices,  # full breakdown stored for reference
+            # Event metadata — propagate so doubleheader games stay distinct.
+            "event_id":          event_id,
+            "commence_time":     commence_time,
+            "event_home_team":   event_home_team,
+            "event_away_team":   event_away_team,
         })
 
         if len(book_prices) > 1:
@@ -404,7 +439,7 @@ def fetch_hr_props(
             )
             quota_hit = True
             break
-        props = _parse_bookmaker_props(bookmakers)
+        props = _parse_bookmaker_props(bookmakers, event=event)
         all_props.extend(props)
         logger.debug("Event %s (%s vs %s): %d props",
                      event_id,
@@ -432,35 +467,89 @@ def fetch_hr_props(
     return all_props
 
 
-def build_odds_lookup(props: list[dict]) -> dict[str, dict]:
-    return {p["batter_name"].lower().strip(): p for p in props}
+def _hour_bucket(iso_ts: Optional[str]) -> Optional[str]:
+    """Truncate an ISO 8601 UTC timestamp to YYYY-MM-DDTHH for matching.
+
+    Doubleheader games are typically 3+ hours apart, so an hour-level bucket
+    cleanly separates them while tolerating a few minutes of drift between
+    MLB Stats API gameDate and Odds API commence_time.
+    """
+    if not iso_ts:
+        return None
+    try:
+        # Accept both 'Z' and '+00:00' suffixes. We only need the prefix.
+        return str(iso_ts)[:13]
+    except Exception:
+        return None
+
+
+def build_odds_lookup(props: list[dict]) -> dict:
+    """Build (name, hour_bucket) -> prop lookup, falling back to name-only.
+
+    When props carry `commence_time`, the lookup is keyed by
+    `(batter_name_lower, hour_bucket)` so doubleheader pricing stays distinct.
+    Each prop is also indexed under just `batter_name_lower` (legacy / single-
+    game fallback) — the time-aware key is preferred when present.
+    """
+    out: dict = {}
+    for p in props:
+        name = p.get("batter_name", "").lower().strip()
+        if not name:
+            continue
+        bucket = _hour_bucket(p.get("commence_time"))
+        if bucket is not None:
+            out[(name, bucket)] = p
+        # Legacy / no-event-metadata fallback (only used when caller
+        # doesn't pass a game_datetime — single-game disambiguation only).
+        out.setdefault(name, p)
+    return out
 
 
 def match_odds(
     batter_name: str,
-    odds_lookup: dict[str, dict],
+    odds_lookup: dict,
     threshold: int = _FUZZY_THRESHOLD,
+    *,
+    game_datetime: Optional[str] = None,
 ) -> Optional[dict]:
+    """Look up a prop for `batter_name`, preferring the (name, hour_bucket)
+    key when `game_datetime` is provided. This is what disambiguates
+    doubleheader games — without it, both games of a doubleheader collapse
+    to whichever event was iterated last.
+    """
     if not batter_name or not odds_lookup:
         return None
 
-    query = batter_name.lower().strip()
+    query  = batter_name.lower().strip()
+    bucket = _hour_bucket(game_datetime)
 
-    if query in odds_lookup:
-        return odds_lookup[query]
+    # Time-aware exact match (preferred path)
+    if bucket is not None and (query, bucket) in odds_lookup:
+        return odds_lookup[(query, bucket)]
+
+    # Name-only string keys (legacy fallback for non-DH days or
+    # caches written before event metadata was stamped on props)
+    name_only = {k: v for k, v in odds_lookup.items() if isinstance(k, str)}
+
+    if query in name_only:
+        return name_only[query]
 
     try:
         from rapidfuzz import process as fuzz_process
-        result = fuzz_process.extractOne(query, odds_lookup.keys(), score_cutoff=threshold)
+        result = fuzz_process.extractOne(query, name_only.keys(), score_cutoff=threshold)
         if result:
             matched_key, score, _ = result
             logger.debug("Fuzzy match: '%s' -> '%s' (score=%d)", query, matched_key, score)
-            return odds_lookup[matched_key]
+            # If a time bucket is known, see if there's a tighter match
+            # under (matched_key, bucket) — picks the right DH game.
+            if bucket is not None and (matched_key, bucket) in odds_lookup:
+                return odds_lookup[(matched_key, bucket)]
+            return name_only[matched_key]
     except ImportError:
-        for key in odds_lookup:
+        for key in name_only:
             last_name = query.split()[-1] if query else ""
             if last_name and last_name in key:
-                return odds_lookup[key]
+                return name_only[key]
 
     return None
 
@@ -536,11 +625,24 @@ def enrich_predictions_with_odds(
         result[col] = float("nan")
     result["odds_bookmaker"] = None
 
+    # Track when the time-aware match path actually fires — if game_datetime
+    # is missing on every row we silently fall back to name-only matching,
+    # which would re-introduce the doubleheader bug.
+    has_game_datetime = "game_datetime" in result.columns
+    if not has_game_datetime:
+        logger.warning(
+            "ranked DataFrame lacks game_datetime — odds matching will use "
+            "name-only fallback. Doubleheader games may get the wrong price."
+        )
+
     for idx, row in result.iterrows():
         name = row.get(name_col)
         if not name or (isinstance(name, float)):
             continue
-        prop = match_odds(str(name), lookup)
+        gdt = row.get("game_datetime") if has_game_datetime else None
+        if isinstance(gdt, float):  # NaN
+            gdt = None
+        prop = match_odds(str(name), lookup, game_datetime=gdt)
         if prop is None:
             continue
         result.at[idx, "market_line"]         = prop["line"]

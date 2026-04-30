@@ -69,7 +69,8 @@ def fetch_probable_starters_for_date(
     except Exception as e:
         logger.error("Failed to fetch schedule for %s: %s", date_str, e)
         return pd.DataFrame(columns=["game_pk", "home_team", "away_team",
-                                     "home_starter_id", "away_starter_id"])
+                                     "home_starter_id", "away_starter_id",
+                                     "game_datetime"])
 
     rows = []
     for date_entry in data.get("dates", []):
@@ -86,6 +87,10 @@ def fetch_probable_starters_for_date(
                 "away_team":        away_team,
                 "home_starter_id":  int(home_prob["id"]) if home_prob else None,
                 "away_starter_id":  int(away_prob["id"]) if away_prob else None,
+                # ISO UTC start time — needed to disambiguate doubleheader
+                # games when joining odds (Odds API returns commence_time
+                # in the same format).
+                "game_datetime":    game.get("gameDate"),
             })
 
     df = pd.DataFrame(rows)
