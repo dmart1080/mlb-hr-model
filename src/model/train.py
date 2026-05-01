@@ -17,7 +17,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -44,6 +44,13 @@ TRAIN_MARKER  = MODELS_DIR / "last_trained_game_date.txt"
 # build_today_features.py reads the same file at inference time so unseen umps
 # default to factor=1.0 (league-average).
 UMP_FACTOR_LOOKUP    = MODELS_DIR / "ump_factor_lookup.json"
+
+# Baseline evaluation metrics — written every train. Includes both the
+# standard time-split test set AND a never-trained-on holdout of the last
+# HOLDOUT_DAYS days. Used as the trustworthy yardstick for any future
+# feature/model changes.
+BASELINE_METRICS_PATH = MODELS_DIR / "baseline_metrics.json"
+HOLDOUT_DAYS          = 30
 # Smoothing constant for the ump HR factor (pseudo-PAs of prior at league avg).
 # With ~3k PAs per season per full-time ump, k=500 gives real umps most of
 # their signal while pulling 1-game umps firmly toward 1.0.
@@ -305,6 +312,44 @@ def _apply_ump_factor(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
     id_to_factor = {k: v for k, v in lookup.items() if isinstance(k, int)}
     df["hp_ump_hr_factor"] = id_series.map(id_to_factor).astype(float).fillna(1.0)
     return df
+
+
+def _compute_eval_metrics(y_true: pd.Series, y_prob: np.ndarray) -> dict:
+    """Standard evaluation bundle: ROC-AUC, log loss, Brier, top-N% lifts.
+
+    `y_true` is the binary HR label (0/1). `y_prob` is the model's predicted
+    probability. Top-N% lift = HR rate among the top N% of predictions
+    divided by the overall HR rate. n_top_X reports the bin sizes so we can
+    judge sample sufficiency from the JSON without re-deriving them.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob)
+    n = int(len(y_true))
+    baseline = float(y_true.mean()) if n else float("nan")
+
+    metrics: dict = {
+        "n":         n,
+        "baseline_hr_rate": baseline,
+        "roc_auc":   float(roc_auc_score(y_true, y_prob)) if n and len(set(y_true)) > 1 else float("nan"),
+        "log_loss":  float(log_loss(y_true, y_prob, labels=[0, 1])) if n else float("nan"),
+        "brier":     float(brier_score_loss(y_true, y_prob)) if n else float("nan"),
+        "avg_pred":  float(y_prob.mean()) if n else float("nan"),
+        "max_pred":  float(y_prob.max())  if n else float("nan"),
+    }
+
+    for pct in (1, 5, 10):
+        if not n:
+            metrics[f"top{pct}_hr_rate"] = float("nan")
+            metrics[f"top{pct}_lift"]    = float("nan")
+            metrics[f"top{pct}_n"]       = 0
+            continue
+        q       = np.quantile(y_prob, 1 - pct / 100.0)
+        mask    = y_prob >= q
+        rate    = float(y_true[mask].mean()) if mask.any() else float("nan")
+        metrics[f"top{pct}_hr_rate"] = rate
+        metrics[f"top{pct}_lift"]    = (rate / baseline) if baseline > 0 else float("nan")
+        metrics[f"top{pct}_n"]       = int(mask.sum())
+    return metrics
 
 
 def _save_ump_factor_lookup(lookup: dict) -> None:
@@ -786,13 +831,36 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
     logger.info("Applying empirical Bayes shrinkage to rate features ...")
     df = apply_shrinkage(df)
 
+    # ------------------------------------------------------------------
+    # 30-day holdout — never trained on, never calibrated on. Sliced off
+    # BEFORE any train/test/calib split so its rows don't leak into any
+    # downstream pipeline step. Scored once at the end with the final
+    # calibrated model and written to baseline_metrics.json as a stable
+    # yardstick for future model/feature changes.
+    # ------------------------------------------------------------------
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    max_date    = df["game_date"].max()
+    holdout_cut = max_date - pd.Timedelta(days=HOLDOUT_DAYS)
+    holdout_df  = df[df["game_date"] > holdout_cut].copy()
+    df          = df[df["game_date"] <= holdout_cut].copy()
+    logger.info(
+        "Holdout: last %d days held out (%s -> %s, %d rows). Training on %d rows up to %s.",
+        HOLDOUT_DAYS,
+        holdout_df["game_date"].min().date() if len(holdout_df) else None,
+        holdout_df["game_date"].max().date() if len(holdout_df) else None,
+        len(holdout_df), len(df),
+        df["game_date"].max().date() if len(df) else None,
+    )
+
     # Normalize ump id dtype (Int64 survives fillna(0) and works as LGBM
     # categorical) and seed the factor column as league-average so the
     # feature-availability filter below doesn't drop it. Real factors get
     # injected after the train/calib split via _apply_ump_factor().
     if "hp_ump_id" in df.columns:
-        df["hp_ump_id"] = df["hp_ump_id"].astype("Int64")
-    df["hp_ump_hr_factor"] = 1.0
+        df["hp_ump_id"]         = df["hp_ump_id"].astype("Int64")
+        holdout_df["hp_ump_id"] = holdout_df["hp_ump_id"].astype("Int64")
+    df["hp_ump_hr_factor"]         = 1.0
+    holdout_df["hp_ump_hr_factor"] = 1.0
 
     feature_cols = [
         "b_hr_rate_14", "b_barrel_rate_14", "b_ev_mean_14", "b_la_mean_14",
@@ -1159,6 +1227,63 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         "split_type":    split_type,
         **recal_stats,  # recal_samples, recal_mae_before, recal_mae_after, recal_improvement
     }
+
+    # ------------------------------------------------------------------
+    # Baseline metrics — stable yardstick for future feature/model changes.
+    # Score on BOTH the existing time-split test set AND the never-trained-
+    # on 30-day holdout. Persist top-20 importances alongside.
+    # ------------------------------------------------------------------
+    test_metrics = _compute_eval_metrics(y_test, p_test)
+
+    holdout_metrics: dict
+    if len(holdout_df):
+        holdout_df_eval = _apply_ump_factor(holdout_df, ump_factor_lookup)
+        X_holdout = holdout_df_eval[feature_cols].fillna(0.0)
+        y_holdout = holdout_df_eval["hr_hit"].astype(int)
+        p_holdout = model.predict_proba(X_holdout)[:, 1]
+        holdout_metrics = _compute_eval_metrics(y_holdout, p_holdout)
+        holdout_metrics["start_date"] = str(holdout_df_eval["game_date"].min().date())
+        holdout_metrics["end_date"]   = str(holdout_df_eval["game_date"].max().date())
+        logger.info(
+            "Holdout (%d days, %d rows, %s -> %s): ROC-AUC=%.4f  Brier=%.5f  top1_lift=%.2fx  top5_lift=%.2fx",
+            HOLDOUT_DAYS, holdout_metrics["n"],
+            holdout_metrics["start_date"], holdout_metrics["end_date"],
+            holdout_metrics["roc_auc"], holdout_metrics["brier"],
+            holdout_metrics["top1_lift"], holdout_metrics["top5_lift"],
+        )
+    else:
+        logger.warning("Holdout is empty — baseline_metrics.json will only have test-set metrics.")
+        holdout_metrics = {"n": 0}
+
+    if hasattr(lgbm, "feature_importances_"):
+        imp_series = pd.Series(lgbm.feature_importances_, index=feature_cols)
+        top20_importances = {
+            k: int(v) for k, v in imp_series.sort_values(ascending=False).head(20).items()
+        }
+    else:
+        top20_importances = {}
+
+    baseline_payload = {
+        "run_time":      datetime.now().isoformat(timespec="seconds"),
+        "train_path":    str(train_path.name),
+        "chosen_model":  chosen_name,
+        "n_features":    len(feature_cols),
+        "split_type":    split_type,
+        "train_rows":    int(len(train_df)),
+        "test_rows":     int(len(test_df)),
+        "train_dates":   {"start": train_start, "end": train_end},
+        "test_dates":    {"start": test_start,  "end": test_end},
+        "test_metrics":  test_metrics,
+        "holdout_days":  HOLDOUT_DAYS,
+        "holdout_metrics": holdout_metrics,
+        "top20_feature_importances": top20_importances,
+    }
+    try:
+        with open(BASELINE_METRICS_PATH, "w") as f:
+            json.dump(baseline_payload, f, indent=2)
+        logger.info("Baseline metrics saved: %s", BASELINE_METRICS_PATH.name)
+    except Exception as e:
+        logger.warning("Could not write %s: %s", BASELINE_METRICS_PATH.name, e)
 
     # Save — single file, same name as before, predict.py unchanged
     model_path = MODELS_DIR / f"hr_model_{chosen_name}_2021_2026.joblib"
