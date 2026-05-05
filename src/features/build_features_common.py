@@ -45,6 +45,30 @@ def _safe_mean(s: pd.Series) -> float:
     return np.nan if pd.isna(m) else float(m)
 
 
+# Hard cap applied to estimated_woba_using_speedangle before averaging.
+# Statcast occasionally emits values >2 on freak contact (e.g., inside-the-park
+# HR with launch speed model overflow). Capping prevents one extreme PA from
+# dominating a small-sample window mean. 2.0 is well above league-average
+# xwOBAcon (~0.37) and individual elite-batter values (~0.50-0.55).
+_XWOBACON_CAP = 2.0
+
+
+def _safe_xwobacon_mean(series: pd.Series, min_n: int) -> float:
+    """Mean of estimated_woba_using_speedangle on batted-ball events.
+
+    `series` is expected to be the raw column at PA-level (NaN for non-contact
+    PAs since those pitches never produced a launch_speed-driven xwOBA value).
+    Outlier values are capped at _XWOBACON_CAP before averaging. Returns NaN
+    if fewer than `min_n` non-null BBEs are present.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < min_n:
+        return np.nan
+    s = s.clip(upper=_XWOBACON_CAP)
+    m = s.mean()
+    return np.nan if pd.isna(m) else float(m)
+
+
 def _is_barrel(launch_speed: pd.Series, launch_angle: pd.Series) -> pd.Series:
     """
     Statcast barrel approximation (Baseball Savant definition).

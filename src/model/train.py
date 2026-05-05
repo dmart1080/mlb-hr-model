@@ -869,6 +869,12 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         "b_ev_trend", "b_hardhit_trend", "b_barrel_trend", "b_hr_trend",
         "b_hr_rate_szn", "b_barrel_rate_szn", "b_ev_mean_szn", "b_la_mean_szn",
         "b_hardhit_rate_szn", "b_fb_rate_szn",
+        # Batch 1 (2026-05-04): xwOBAcon + 7-game brl/BBE
+        # xwOBAcon (mean of estimated_woba_using_speedangle on contact, capped
+        # at 2.0). 14d uses MIN_BBE=10 in fast path; 30d uses MIN_BBE=15 in
+        # _compute_batter_30d. 7-game brl/BBE uses MIN_BBE=8 over the last
+        # seven distinct game_dates.
+        "b_xwobacon_14", "b_xwobacon_30", "b_brl_per_bbe_7",
         "b_hr_rate_14_vsL", "b_hr_rate_14_vsR",
         "b_hardhit_rate_14_vsL", "b_hardhit_rate_14_vsR",
         "b_barrel_rate_14_vsL", "b_barrel_rate_14_vsR",

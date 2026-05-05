@@ -76,6 +76,7 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "release_spin_rate",              # pitcher stuff quality
             "release_extension",              # extension toward plate
             "pfx_x", "pfx_z",                # horizontal + vertical movement
+            "estimated_woba_using_speedangle",  # xwOBAcon source
         ],
         regular_season_only=True,
     ).df.copy()
@@ -130,6 +131,12 @@ def _load_and_clean_events(start_date: str, end_date: str) -> tuple[pd.DataFrame
             "is_hr":        "max",
             "launch_speed": "mean",
             "launch_angle": "mean",
+            # Statcast's expected wOBA on contact (xwOBAcon). Per-pitch
+            # values are NaN on non-contact pitches, so the per-PA mean is
+            # NaN for K/BB/HBP and a real value for batted-ball events
+            # (BBE). Downstream rolling features use _safe_xwobacon_mean to
+            # average across BBEs in a window with a 2.0 outlier cap.
+            "estimated_woba_using_speedangle": "mean",
             "p_throws":     "last",
             "stand":        "last",
         })
@@ -461,8 +468,10 @@ def _compute_batter_30d(
         batter, game_date,
         b_hr_rate_30, b_barrel_rate_30, b_ev_mean_30,
         b_hardhit_rate_30, b_k_rate_30, b_bb_rate_30,
-        b_pa_30
+        b_pa_30, b_xwobacon_30
     """
+    from src.features.build_features_common import _safe_xwobacon_mean
+
     pa = pa_df.copy()
     pa["game_date"] = pd.to_datetime(pa["game_date"])
     ev_num = pd.to_numeric(pa["launch_speed"], errors="coerce")
@@ -477,7 +486,8 @@ def _compute_batter_30d(
     need["game_date"] = pd.to_datetime(need["game_date"])
 
     batter_pa = {pid: grp for pid, grp in pa.groupby("batter", sort=False)}
-    MIN_PA = 10
+    MIN_PA       = 10
+    MIN_BBE_XW30 = 15  # min batted-ball events in the 30d window for xwOBAcon
 
     rows = []
     for _, r in need.iterrows():
@@ -493,6 +503,7 @@ def _compute_batter_30d(
             "b_hardhit_rate_30":np.nan,
             "b_k_rate_30":      np.nan,
             "b_bb_rate_30":     np.nan,
+            "b_xwobacon_30":    np.nan,
         }
 
         grp = batter_pa.get(bid)
@@ -518,6 +529,82 @@ def _compute_batter_30d(
         base["b_hardhit_rate_30"] = float((ev >= 95).mean()) if len(ev) > 0 else np.nan
         base["b_k_rate_30"]       = float(w30["is_so_"].sum()) / pa_count
         base["b_bb_rate_30"]      = float(w30["is_bb_"].sum()) / pa_count
+        if "estimated_woba_using_speedangle" in w30.columns:
+            base["b_xwobacon_30"] = _safe_xwobacon_mean(
+                w30["estimated_woba_using_speedangle"], min_n=MIN_BBE_XW30,
+            )
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+def _compute_brl_per_bbe_7g(
+    pa_df: pd.DataFrame,
+    target_dates: pd.DataFrame,  # columns: batter, game_date
+) -> pd.DataFrame:
+    """
+    Barrel rate per batted-ball event over the last 7 GAMES (not days).
+
+    'Game' = a distinct game_date in this batter's PA history. The window is
+    the seven most-recent prior game_dates (irrespective of calendar gap),
+    so a batter who plays every other day still gets exactly 7 games of
+    history. NaN until at least MIN_BBE BBEs are accumulated across those
+    games.
+
+    Returns DataFrame with columns: batter, game_date, b_brl_per_bbe_7
+    """
+    pa = pa_df.copy()
+    pa["game_date"]   = pd.to_datetime(pa["game_date"])
+    pa["launch_speed"] = pd.to_numeric(pa["launch_speed"], errors="coerce")
+
+    need = target_dates[["batter", "game_date"]].drop_duplicates().copy()
+    need["game_date"] = pd.to_datetime(need["game_date"])
+
+    batter_pa = {
+        pid: grp.sort_values("game_date")
+        for pid, grp in pa.groupby("batter", sort=False)
+    }
+    GAMES_BACK = 7
+    MIN_BBE    = 8   # min batted-ball events in the 7-game window
+
+    rows = []
+    for _, r in need.iterrows():
+        bid   = int(r["batter"])
+        gdate = r["game_date"]
+        base  = {
+            "batter":          bid,
+            "game_date":       gdate,
+            "b_brl_per_bbe_7": np.nan,
+        }
+
+        grp = batter_pa.get(bid)
+        if grp is None:
+            rows.append(base)
+            continue
+
+        prior = grp[grp["game_date"] < gdate]
+        if prior.empty:
+            rows.append(base)
+            continue
+
+        # Take the last 7 distinct game_dates this batter played BEFORE today.
+        recent_dates = prior["game_date"].drop_duplicates().nlargest(GAMES_BACK)
+        if len(recent_dates) == 0:
+            rows.append(base)
+            continue
+
+        w7g = prior[prior["game_date"].isin(recent_dates)]
+        bbe_mask = w7g["launch_speed"].notna()
+        bbe_n    = int(bbe_mask.sum())
+        if bbe_n < MIN_BBE:
+            rows.append(base)
+            continue
+
+        # is_barrel is set at PA-load time on every PA; only the contact ones
+        # ever evaluate to 1, so summing across BBEs (or all PAs) gives the
+        # same numerator.
+        barrels = int(w7g.loc[bbe_mask, "is_barrel"].sum()) if "is_barrel" in w7g.columns else 0
+        base["b_brl_per_bbe_7"] = barrels / bbe_n
         rows.append(base)
 
     return pd.DataFrame(rows)
@@ -1700,6 +1787,15 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     )
 
     # ------------------------------------------------------------------
+    # 7-game barrel-per-BBE rate
+    # ------------------------------------------------------------------
+    logger.info("Computing 7-game barrel-per-BBE rate ...")
+    batter_brl_7g = _compute_brl_per_bbe_7g(
+        pa_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
     # Pitcher command metric (K% - BB%)
     # ------------------------------------------------------------------
     logger.info("Computing pitcher command metrics ...")
@@ -1785,6 +1881,7 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(sweet_spot_stats, on=["batter", "game_date"], how="left")
         .merge(batter_30d,      on=["batter", "game_date"], how="left")
         .merge(batter_gamelog,  on=["batter", "game_date"], how="left")
+        .merge(batter_brl_7g,   on=["batter", "game_date"], how="left")
         .merge(batter_streaks,  on=["batter", "game_date"], how="left")
         .merge(lineup_context,  on=["batter", "game_date"], how="left")
         .merge(pull_stats,      on=["batter", "game_date"], how="left")

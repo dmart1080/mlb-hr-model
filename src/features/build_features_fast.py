@@ -24,10 +24,16 @@ from src.features.build_features_common import (
     PITCH_GROUP_OFFSPEED,
     MIN_PA_PITCH_TYPE,
     MIN_PITCHES_PITCH_TYPE,
+    _XWOBACON_CAP,
     _safe_mean,
     _batter_trend_stats,
     _is_pulled_airball,
 )
+
+# Min BBE counts for the rolling xwOBAcon features. Higher than MIN_PA_WINDOW
+# because xwOBAcon is computed only on contact and small samples produce
+# noisy means that get over-rewarded by LGBM splits.
+MIN_BBE_XWOBA_14 = 10
 
 _PITCHER_VELO_COLS = [
     "p_fb_velo_30", "p_fb_pct_30", "p_offspeed_pct_30", "p_fb_velo_trend"
@@ -90,10 +96,18 @@ def _agg_pa_stats(
     min_pa: int,
     prefix: str,
     drop_means: bool = False,
+    include_xwobacon: bool = False,
+    min_bbe_xwobacon: int = MIN_BBE_XWOBA_14,
 ) -> pd.DataFrame:
     """
     Aggregate PA-level stats.  Returns one row per group.
     Rates are NaN when PA < min_pa (cold-start guard).
+
+    `include_xwobacon`: when True, also output `{prefix}xwobacon` =
+        capped(estimated_woba_using_speedangle).mean() over BBEs in the
+        window. NaN when fewer than `min_bbe_xwobacon` non-null xwOBA
+        values are present. Only enable on caller-by-caller basis (e.g.,
+        batter 14d window) to avoid bloating other outputs.
     """
     windowed = windowed.copy()
     ev = windowed["launch_speed"]
@@ -101,9 +115,17 @@ def _agg_pa_stats(
     windowed["_ev_gte95"] = (ev >= 95).astype(float)
     windowed["_fb"]       = la.between(20, 40).astype(float)
 
+    if include_xwobacon:
+        # Cap before summing so a single freak >2.0 PA can't dominate a
+        # small-sample window mean.
+        xw = pd.to_numeric(
+            windowed.get("estimated_woba_using_speedangle"), errors="coerce",
+        )
+        windowed["_xw_capped"] = xw.clip(upper=_XWOBACON_CAP)
+
     pa_src = "pitcher" if ("pitcher" in windowed.columns and prefix.startswith("p")) else "is_hr"
 
-    agg = windowed.groupby(group_cols, sort=False).agg(
+    agg_kwargs = dict(
         _pa         =(pa_src,        "size"),
         _hr         =("is_hr",       "sum"),
         _ev_sum     =("launch_speed","sum"),
@@ -115,7 +137,12 @@ def _agg_pa_stats(
         _barrel     =("is_barrel",   "sum"),
         _so         =("is_so",       "sum"),
         _bb         =("is_bb",       "sum"),
-    ).reset_index()
+    )
+    if include_xwobacon:
+        agg_kwargs["_xw_sum"]   = ("_xw_capped", "sum")
+        agg_kwargs["_xw_count"] = ("_xw_capped", "count")
+
+    agg = windowed.groupby(group_cols, sort=False).agg(**agg_kwargs).reset_index()
 
     agg["_pa"] = agg["_pa"].astype(int)
     mask_ok = agg["_pa"] >= min_pa
@@ -144,6 +171,14 @@ def _agg_pa_stats(
         out[f"{p}la_mean"] = np.where(mask_ok & (la_c > 0),
                                        agg["_la_sum"] / la_c.replace(0, np.nan), np.nan)
 
+    if include_xwobacon:
+        xw_c = agg["_xw_count"]
+        out[f"{p}xwobacon"] = np.where(
+            (xw_c >= min_bbe_xwobacon),
+            agg["_xw_sum"] / xw_c.replace(0, np.nan),
+            np.nan,
+        )
+
     return out
 
 
@@ -167,7 +202,9 @@ def precompute_batter_windows_fast(
     # ── 14-day overall ──────────────────────────────────────────────────────
     w14 = _window_merge(pa_df, need, "batter", days_back=14)
     stats_14 = _agg_pa_stats(
-        w14, ["batter", "target_date"], min_pa=MIN_PA_WINDOW, prefix="b_"
+        w14, ["batter", "target_date"],
+        min_pa=MIN_PA_WINDOW, prefix="b_",
+        include_xwobacon=True, min_bbe_xwobacon=MIN_BBE_XWOBA_14,
     ).rename(columns={
         "b_pa":           "b_pa_14",
         "b_hr":           "b_hr_14",
@@ -179,6 +216,7 @@ def precompute_batter_windows_fast(
         "b_fb_rate":      "b_fb_rate_14",
         "b_k_rate":       "b_k_rate_14",
         "b_bb_rate":      "b_bb_rate_14",
+        "b_xwobacon":     "b_xwobacon_14",
         "target_date":    "game_date",
     })
 
