@@ -65,12 +65,28 @@ MIN_BET_PROB = 0.10
 # across probability buckets.
 MIN_REL_EDGE = 0.30  # 30% relative edge
 
-# Hard ceiling on predicted HR probability. Weekly-recap calibration on 780
-# batter-games shows the top bucket (pred 0.17–0.58) converts at 20.0% actual
-# vs 25.4% predicted — a 5pp overshoot at the high end. Even the best power
-# hitter in MLB (Judge) tops out around 0.20 HR/game in practice. Cap at the
-# empirical ceiling so edge calculations stay honest.
-MAX_PRED_PROB = 0.20
+# Hard ceiling on predicted HR probability. Loosened 2026-05-05 from 0.20
+# to 0.35 after a historical-odds backtest on the 30-day OOS holdout
+# (6,725 batter-games, real closing-line sportsbook prices) showed the
+# 0.20 cap was systematically under-predicting elite hitters:
+#   - At cap=0.20, top bucket (0.18-0.20] pinned at 19.5% pred vs 26.2%
+#     actual — a 6.6pp UNDERSHOOT caused by 321 predictions clipping
+#     against the wall.
+#   - At cap=0.35, all calibration buckets with n>=100 land within 1.3pp,
+#     and buckets above 0.235 actually under-predict (model says 25-29%,
+#     actual 35-39%) — opposite direction from the original concern.
+# Effect on the holdout: bet counts at every threshold >=2pp increase
+# (~50% more bets at the recommended threshold), flat ROI either matches
+# or improves, Kelly ROI rises from +1.1% to +6.6%.
+# Bucket (0.17-0.58) overshoot from the earlier recap analysis was an
+# artifact of a too-wide bucket and only 780 batter-games of training-set
+# predictions — current backtest dataset has ~9x more samples and uses
+# actual sportsbook closing lines.
+# 0.35 captures essentially all the no-cap holdout edge (P&L identical
+# between cap=0.35 / 0.40 / no-cap; only Kelly stake sizing differs by
+# ~1.4pp). The remaining cap serves as a guardrail for the rare 0.40+
+# predictions where calibration data is thin.
+MAX_PRED_PROB = 0.35
 
 # Hard ceiling on edge (hr_prob - market_fair_prob). Edges above this are
 # almost always calibration noise — the market prices HR props efficiently,

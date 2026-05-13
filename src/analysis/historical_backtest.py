@@ -102,8 +102,12 @@ def load_model_bundle() -> tuple:
     return bundle["model"], bundle["feature_cols"], bundle.get("apply_shrinkage", True)
 
 
-def score_window(start: str, end: str) -> pd.DataFrame:
+def score_window(start: str, end: str, prob_cap: float | None = None) -> pd.DataFrame:
     """Load train_table rows in [start, end] and score them with the model.
+
+    `prob_cap` mirrors predict.py's MAX_PRED_PROB clip. None = no cap (raw
+    model output); 0.20 reproduces current production behavior; raising it
+    frees the model's upper tail.
 
     Returns a DataFrame with: game_date, game_pk, batter, batter_name,
     hr_prob, hr_hit (= actual_hr from the train_table labels).
@@ -134,6 +138,14 @@ def score_window(start: str, end: str) -> pd.DataFrame:
 
     X = window[feature_cols].fillna(0.0)
     probs = model.predict_proba(X)[:, 1]
+    if prob_cap is not None:
+        n_capped = int((probs > prob_cap).sum())
+        max_raw  = float(probs.max())
+        probs    = np.clip(probs, a_min=None, a_max=prob_cap)
+        logger.info(
+            "Applied prob_cap=%.3f: %d/%d rows clipped (raw max was %.4f)",
+            prob_cap, n_capped, len(probs), max_raw,
+        )
     window["hr_prob"] = probs
 
     # Resolve batter names (single MLB lookup batched per backtest run)
@@ -285,6 +297,10 @@ def main() -> None:
                         help="Write merged results to data/backtest/historical_results.csv")
     parser.add_argument("--kelly-mult", type=float, default=KELLY_FRACTION,
                         help=f"Fractional Kelly multiplier (default {KELLY_FRACTION})")
+    parser.add_argument("--prob-cap", type=float, default=None,
+                        help="Hard ceiling on hr_prob (mirrors predict.py MAX_PRED_PROB). "
+                             "Default None = no cap (raw model output). "
+                             "Use 0.20 to reproduce current production.")
     args = parser.parse_args()
 
     configure_logging()
@@ -303,7 +319,7 @@ def main() -> None:
              for i in range((ed - sd).days + 1)]
 
     # 1. Score model on the window
-    scored = score_window(start, end)
+    scored = score_window(start, end, prob_cap=args.prob_cap)
 
     # 2. Pull historical odds
     odds_by_date = collect_historical_odds(
