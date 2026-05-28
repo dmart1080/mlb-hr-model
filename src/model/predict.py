@@ -587,14 +587,29 @@ if __name__ == "__main__":
     _days_into_season = (_pred_date - _season_start).days
     _windows_ready = _days_into_season >= _ROLLING_WINDOW_DAYS
 
-    odds_api_key = os.environ.get("ODDS_API_KEY")
-    # Skip odds fetch on morning pass to conserve free-tier API credits
-    # (500/mo budget — one full fetch/day is all we can afford). Lineups
-    # aren't confirmed that early anyway, so edge calc would be unreliable.
-    _skip_odds_morning = args.run_type == "morning"
-    if _skip_odds_morning:
+    # Gate odds enrichment behind key presence. Empty / missing key means
+    # skip entirely — has_odds stays False and all downstream paths (display,
+    # CSV, Discord) already degrade gracefully to model-only mode.
+    odds_api_key = os.environ.get("ODDS_API_KEY", "").strip()
+
+    if not odds_api_key:
+        print(
+            "ℹ️  ODDS_API_KEY not set — running without odds data.\n"
+            "   Set the env var to enable edge detection:\n"
+            "     export ODDS_API_KEY=your_key_here"
+        )
+    elif args.run_type == "morning":
+        # Skip odds on morning pass to conserve free-tier API credits
+        # (500/mo budget — one full fetch/day is all we can afford). Lineups
+        # aren't confirmed that early anyway, so edge calc would be unreliable.
         print("ℹ️  Morning pass — skipping odds fetch (conserves API budget).")
-    if odds_api_key and _windows_ready and not _skip_odds_morning:
+    elif not _windows_ready:
+        print(
+            f"ℹ️  Skipping odds enrichment — only {_days_into_season}d into season "
+            f"(need {_ROLLING_WINDOW_DAYS}d for rolling windows to fill).\n"
+            "   Odds API tokens will be conserved until features are reliable."
+        )
+    else:
         try:
             from src.data_sources.odds import enrich_predictions_with_odds
             ranked = enrich_predictions_with_odds(
@@ -612,18 +627,6 @@ if __name__ == "__main__":
             )
         except Exception as e:
             print(f"⚠️  Odds enrichment failed: {e}")
-    elif odds_api_key and not _windows_ready:
-        print(
-            f"ℹ️  Skipping odds enrichment — only {_days_into_season}d into season "
-            f"(need {_ROLLING_WINDOW_DAYS}d for rolling windows to fill).\n"
-            "   Odds API tokens will be conserved until features are reliable."
-        )
-    else:
-        print(
-            "ℹ️  No ODDS_API_KEY found — running without odds data.\n"
-            "   Set the env var to enable edge detection:\n"
-            "     export ODDS_API_KEY=your_key_here"
-        )
 
     # ------------------------------------------------------------------
     # Display

@@ -128,6 +128,10 @@ _LEAGUE_FILL = {
     "wind_hr_factor":             0.0,
     "b_days_rest":                4.0,
     "p_days_rest":                4.0,
+    # Batch 1 features — xwOBAcon (league avg ~0.37) and brl/BBE (league avg ~7.3%)
+    "b_xwobacon_14":              0.370,
+    "b_xwobacon_30":              0.370,
+    "b_brl_per_bbe_7":            0.073,
 }
 
 
