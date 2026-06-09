@@ -32,6 +32,19 @@ MIN_PITCHES_PITCH_TYPE = 20
 # Minimum PA to trust a batter's HR rate vs a pitch group
 MIN_PA_PITCH_TYPE = 10
 
+# Minimum pitches in window for reliable discipline rates (chase / whiff)
+MIN_PITCHES_DISCIPLINE = 20
+
+# Pitch description sets — used by precompute_batter_discipline_fast.
+# Swing = any pitch where the batter offered (includes fouls, contact, misses).
+# Whiff = swing-and-miss only.
+_SWING_DESCS = frozenset({
+    "swinging_strike", "swinging_strike_blocked",
+    "foul", "foul_tip", "foul_bunt", "missed_bunt",
+    "hit_into_play", "hit_into_play_no_out", "hit_into_play_score",
+})
+_WHIFF_DESCS = frozenset({"swinging_strike", "swinging_strike_blocked"})
+
 
 # ---------------------------------------------------------------------------
 # Pure numeric helpers

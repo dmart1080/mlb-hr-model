@@ -875,6 +875,11 @@ def train_baseline(train_path: Path, *, tune: bool = False) -> TrainResult:
         # _compute_batter_30d. 7-game brl/BBE uses MIN_BBE=8 over the last
         # seven distinct game_dates.
         "b_xwobacon_14", "b_xwobacon_30", "b_brl_per_bbe_7",
+        # Batch 2 (2026-06-09): pitch-mix vulnerability — O-swing% and whiff rate
+        # chase = swings on OOZ pitches / total OOZ pitches; whiff = misses / swings
+        # Both computed on pitch-level Statcast (plate_x/z + sz_top/bot).
+        "b_chase_rate_14", "b_chase_rate_szn",
+        "b_whiff_rate_14", "b_whiff_rate_szn",
         "b_hr_rate_14_vsL", "b_hr_rate_14_vsR",
         "b_hardhit_rate_14_vsL", "b_hardhit_rate_14_vsR",
         "b_barrel_rate_14_vsL", "b_barrel_rate_14_vsR",
