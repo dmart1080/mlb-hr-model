@@ -29,6 +29,7 @@ from src.features.build_features_fast import (
     precompute_pitcher_velo_fast,
     precompute_batter_pull_fast,
     precompute_pitch_matchup_fast,
+    precompute_batter_discipline_fast,
 )
 
 logger = logging.getLogger(__name__)
@@ -1838,6 +1839,15 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
     )
 
     # ------------------------------------------------------------------
+    # Batch 2: batter discipline (chase rate / whiff rate)
+    # ------------------------------------------------------------------
+    logger.info("Precomputing batter discipline features ...")
+    discipline_stats = precompute_batter_discipline_fast(
+        pitches_df,
+        labels[["batter", "game_date"]],
+    )
+
+    # ------------------------------------------------------------------
     # Pitch-type matchup features
     # ------------------------------------------------------------------
     logger.info("Precomputing pitch-type matchup features ...")
@@ -1884,7 +1894,8 @@ def build_features_for_range(start_date: str, end_date: str) -> FeaturesBuildRes
         .merge(batter_brl_7g,   on=["batter", "game_date"], how="left")
         .merge(batter_streaks,  on=["batter", "game_date"], how="left")
         .merge(lineup_context,  on=["batter", "game_date"], how="left")
-        .merge(pull_stats,      on=["batter", "game_date"], how="left")
+        .merge(pull_stats,       on=["batter", "game_date"], how="left")
+        .merge(discipline_stats, on=["batter", "game_date"], how="left")
         .merge(
             pitch_matchup.rename(columns={"pitcher": merge_pitcher_col}),
             on=[merge_pitcher_col, "batter", "game_date"], how="left",

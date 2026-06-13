@@ -24,7 +24,10 @@ from src.features.build_features_common import (
     PITCH_GROUP_OFFSPEED,
     MIN_PA_PITCH_TYPE,
     MIN_PITCHES_PITCH_TYPE,
+    MIN_PITCHES_DISCIPLINE,
     _XWOBACON_CAP,
+    _SWING_DESCS,
+    _WHIFF_DESCS,
     _safe_mean,
     _batter_trend_stats,
     _is_pulled_airball,
@@ -949,5 +952,131 @@ def precompute_pitch_matchup_fast(
         base["matchup_best_30"] = base[avail_matchup].max(axis=1)
     else:
         base["matchup_best_30"] = np.nan
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Batter discipline windows — chase rate & whiff rate  (Batch 2)
+# ---------------------------------------------------------------------------
+
+def precompute_batter_discipline_fast(
+    pitches_df: pd.DataFrame,
+    target_dates: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    O-swing% (chase rate) and whiff rate over 14-day and season windows.
+
+    b_chase_rate_14 / _szn  = swings on OOZ pitches / total OOZ pitches seen
+    b_whiff_rate_14  / _szn = swinging strikes / total swings
+
+    Required columns in pitches_df: batter, game_date, description,
+    plate_x, plate_z. sz_top / sz_bot are optional; fall back to
+    3.5 / 1.5 ft when missing (typical MLB strike zone).
+
+    The minimum count gate (MIN_PITCHES_DISCIPLINE = 20) applies
+    independently to each denominator: OOZ pitches for chase rate,
+    swings for whiff rate.
+    """
+    empty_cols = [
+        "batter", "game_date",
+        "b_chase_rate_14", "b_chase_rate_szn",
+        "b_whiff_rate_14", "b_whiff_rate_szn",
+    ]
+
+    need = (
+        target_dates
+        .drop_duplicates(subset=["batter", "game_date"])
+        .reset_index(drop=True)
+    )
+
+    if need.empty or pitches_df.empty:
+        df = pd.DataFrame(columns=empty_cols)
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        return df
+
+    # Require pitch-location columns — absent in very old cache files
+    for req in ("description", "plate_x", "plate_z"):
+        if req not in pitches_df.columns:
+            logger.warning(
+                "precompute_batter_discipline_fast: '%s' missing from pitches_df. "
+                "Delete Statcast cache files and re-download to enable discipline features.",
+                req,
+            )
+            df = pd.DataFrame(columns=empty_cols)
+            df["game_date"] = pd.to_datetime(df["game_date"])
+            return df
+
+    p = pitches_df.copy()
+    desc = p["description"].astype("string").str.lower().str.strip()
+    p["_is_swing"] = desc.isin(_SWING_DESCS).fillna(False).astype("int8")
+    p["_is_whiff"] = desc.isin(_WHIFF_DESCS).fillna(False).astype("int8")
+
+    # Strike-zone boundaries (per-pitch batter box when available)
+    px = pd.to_numeric(p["plate_x"], errors="coerce")
+    pz = pd.to_numeric(p["plate_z"], errors="coerce")
+    sz_top = (
+        pd.to_numeric(p["sz_top"], errors="coerce").fillna(3.5)
+        if "sz_top" in p.columns
+        else pd.Series(3.5, index=p.index)
+    )
+    sz_bot = (
+        pd.to_numeric(p["sz_bot"], errors="coerce").fillna(1.5)
+        if "sz_bot" in p.columns
+        else pd.Series(1.5, index=p.index)
+    )
+
+    # Out-of-zone: outside 17-inch plate (±0.833 ft) OR above/below batter sz
+    _ZONE_EDGE_X = 0.833
+    ooz = (
+        px.notna() & pz.notna()
+        & ((px.abs() > _ZONE_EDGE_X) | (pz > sz_top) | (pz < sz_bot))
+    )
+    p["_is_ooz"]   = ooz.fillna(False).astype("int8")
+    p["_is_chase"] = (p["_is_swing"] & p["_is_ooz"]).astype("int8")
+
+    def _agg_discipline(windowed: pd.DataFrame, suffix: str) -> pd.DataFrame:
+        if windowed.empty:
+            return pd.DataFrame(columns=[
+                "batter", "game_date",
+                f"b_chase_rate_{suffix}", f"b_whiff_rate_{suffix}",
+            ])
+        agg = windowed.groupby(["batter", "target_date"], sort=False).agg(
+            _swings      =("_is_swing", "sum"),
+            _whiffs      =("_is_whiff", "sum"),
+            _ooz_pitches =("_is_ooz",   "sum"),
+            _chases      =("_is_chase", "sum"),
+        ).reset_index()
+
+        agg[f"b_whiff_rate_{suffix}"] = np.where(
+            agg["_swings"] >= MIN_PITCHES_DISCIPLINE,
+            agg["_whiffs"] / agg["_swings"].replace(0, np.nan),
+            np.nan,
+        )
+        agg[f"b_chase_rate_{suffix}"] = np.where(
+            agg["_ooz_pitches"] >= MIN_PITCHES_DISCIPLINE,
+            agg["_chases"] / agg["_ooz_pitches"].replace(0, np.nan),
+            np.nan,
+        )
+        return agg[
+            ["batter", "target_date",
+             f"b_chase_rate_{suffix}", f"b_whiff_rate_{suffix}"]
+        ].rename(columns={"target_date": "game_date"})
+
+    w14  = _window_merge(p, need, "batter", days_back=14)
+    wszn = _window_merge(p, need, "batter", days_back=0, season_window=True)
+
+    disc_14  = _agg_discipline(w14,  "14")
+    disc_szn = _agg_discipline(wszn, "szn")
+
+    base = need[["batter", "game_date"]].copy()
+    base["game_date"] = pd.to_datetime(base["game_date"])
+
+    for df_part in [disc_14, disc_szn]:
+        if df_part.empty or "game_date" not in df_part.columns:
+            continue
+        df_part = df_part.copy()
+        df_part["game_date"] = pd.to_datetime(df_part["game_date"])
+        base = base.merge(df_part, on=["batter", "game_date"], how="left")
 
     return base
