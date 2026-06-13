@@ -1,0 +1,50 @@
+name: Nightly Isotonic Recalibration
+
+# Runs at 4:00 AM ET (08:00 UTC) every day.
+# Re-fits only the isotonic calibration layer on the current season's
+# prediction history without a full LightGBM retrain (~seconds, not minutes).
+# Commits the updated model back to the repo.
+#
+# Requirements:
+#   - A trained model must already be committed in models/
+#   - Prediction CSVs must be present in data/predictions/ (committed by the
+#     morning/final workflows above)
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  nightly-recal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Re-fit isotonic calibration layer
+        run: python -m src.model.train --recal-only
+
+      - name: Commit updated model
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/
+          if git diff --cached --quiet; then
+            echo "Recalibration produced no changes (not enough matched samples yet)."
+          else
+            git commit -m "chore: nightly isotonic recal $(date -u +%Y-%m-%d)"
+            git push
+          fi

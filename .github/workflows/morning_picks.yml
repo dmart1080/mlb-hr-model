@@ -1,0 +1,62 @@
+name: Morning Picks
+
+# Runs at 10:00 AM ET (14:00 UTC) every day.
+# Fetches yesterday's Statcast data, builds today's features, and generates
+# morning HR predictions (probable starters, early lines).
+# Prediction CSV is committed back to the repo so the nightly recal can read it.
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:          # allow manual trigger from Actions UI
+    inputs:
+      date:
+        description: "Date to predict (YYYY-MM-DD). Leave blank for today."
+        required: false
+        default: ""
+
+jobs:
+  morning-picks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect yesterday's Statcast data
+        run: python -m src.data_sources.collect_daily_statcast
+
+      - name: Run morning prediction pass
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python -m src.model.predict --run-type morning --date "${{ github.event.inputs.date }}"
+          else
+            python -m src.model.predict --run-type morning
+          fi
+
+      - name: Commit prediction CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/predictions/
+          # Only commit if there's something new
+          if git diff --cached --quiet; then
+            echo "No new prediction file to commit."
+          else
+            git commit -m "chore: morning predictions $(date -u +%Y-%m-%d)"
+            git push
+          fi

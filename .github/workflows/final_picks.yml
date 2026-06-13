@@ -1,0 +1,63 @@
+name: Final Picks
+
+# Runs every 30 minutes from 1:00 PM – midnight ET (17:00–04:00 UTC).
+# Generates final predictions with confirmed lineups and latest odds lines.
+# Each run overwrites the day's final CSV so only the latest pass is kept.
+#
+# Two cron expressions are needed because cron doesn't support OR across
+# day-boundary hour ranges in a single expression:
+#   - 17:00–23:30 UTC  (1:00 PM – 7:30 PM ET, pre-midnight)
+#   - 00:00–04:00 UTC  (8:00 PM – 12:00 AM ET, post-midnight)
+on:
+  schedule:
+    - cron: "*/30 17-23 * * *"    # 1:00 PM – 7:30 PM ET
+    - cron: "*/30 0-4  * * *"     # 7:30 PM – 12:00 AM ET
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Date to predict (YYYY-MM-DD). Leave blank for today."
+        required: false
+        default: ""
+
+jobs:
+  final-picks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run final prediction pass
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python -m src.model.predict --run-type final --date "${{ github.event.inputs.date }}"
+          else
+            python -m src.model.predict --run-type final
+          fi
+
+      - name: Commit prediction CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/predictions/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: final predictions $(date -u +%Y-%m-%d %H:%M UTC)"
+            git push
+          fi

@@ -706,6 +706,55 @@ def _fit_isotonic_recalibrator(
     return iso, stats
 
 
+def recalibrate_model() -> None:
+    """
+    Re-fit the isotonic calibration layer on this season's predictions
+    without running a full retrain.
+
+    Loads the current model bundle, strips any existing isotonic wrapper,
+    re-fits a fresh IsotonicRegression on accumulated (prediction → outcome)
+    pairs, and saves the updated bundle back to the same .joblib file.
+
+    Exits cleanly if there are not enough samples to recalibrate (the
+    _IsotonicWrappedModel safely falls back to base-model probs in that case).
+    """
+    model_files = sorted(MODELS_DIR.glob("hr_model_lightgbm_calibrated_*.joblib"))
+    if not model_files:
+        logger.error("No model file found in %s — run full train first.", MODELS_DIR)
+        sys.exit(1)
+    model_path = model_files[-1]
+
+    logger.info("Loading model for recalibration: %s", model_path.name)
+    bundle       = joblib.load(model_path)
+    model        = bundle["model"]
+    feature_cols = bundle["feature_cols"]
+    apply_shrink = bundle.get("apply_shrinkage", False)
+
+    # Strip existing isotonic wrapper so we re-fit on raw base-model probs
+    base_model = model.base_model if isinstance(model, _IsotonicWrappedModel) else model
+
+    logger.info("Building recalibration dataset for %d ...", _RECAL_SEASON)
+    y_pred, y_true = _build_recal_dataset(_RECAL_SEASON)
+    if y_pred is None:
+        logger.info("Recalibration skipped — not enough matched samples. Model unchanged.")
+        return
+
+    iso, recal_stats = _fit_isotonic_recalibrator(y_pred, y_true)
+    joblib.dump({
+        "model":           _IsotonicWrappedModel(base_model, iso),
+        "feature_cols":    feature_cols,
+        "apply_shrinkage": apply_shrink,
+    }, model_path)
+    logger.info(
+        "Recalibration saved: %d samples | MAE %.2fpp → %.2fpp (Δ%+.2fpp) | %s",
+        recal_stats["recal_samples"],
+        recal_stats["recal_mae_before"],
+        recal_stats["recal_mae_after"],
+        recal_stats["recal_improvement"],
+        model_path.name,
+    )
+
+
 class _IsotonicWrappedModel:
     """
     Thin wrapper that applies a fitted isotonic recalibrator on top of an
@@ -1324,7 +1373,19 @@ if __name__ == "__main__":
                         help=f"Optuna timeout in seconds (default {_TUNE_TIMEOUT})")
     parser.add_argument("--force", action="store_true",
                         help="Bypass the retrain guard and always retrain")
+    parser.add_argument(
+        "--recal-only", action="store_true",
+        help=(
+            "Re-fit isotonic calibration layer only (no full retrain). "
+            "Requires prediction CSVs in data/predictions/ for current season."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.recal_only:
+        configure_logging()
+        recalibrate_model()
+        sys.exit(0)
 
     if args.tune:
         _TUNE_N_TRIALS = args.tune_trials

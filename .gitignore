@@ -161,13 +161,17 @@ cython_debug/
 
 # Project data + outputs (don't commit large/generated files)
 data/cache/
-data/processed/
-data/backtest/*_results.csv
-data/predictions/
+data/processed/*
+data/backtest/
 logs/
-patch_*\.py
-debug_*\.py
-data/predictions/
-data/**/*.csv
-models/train_runs.csv
+
+# Prediction CSVs ARE tracked — the nightly isotonic recalibrator reads them.
+# Each file is ~50 KB; a full season accumulates ~15 MB.
+# (no ignore rule for data/predictions/)
+
+# Slim carry-forward train table IS tracked — generated locally after each
+# monthly retrain (run scripts/export_slim_table.py) so GitHub Actions can
+# run build_today_features without the full multi-GB history file.
+!data/processed/train_table_slim_90d.parquet
+
 models/train_runs.csv
